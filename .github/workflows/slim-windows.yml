@@ -1,0 +1,99 @@
+name: Slim Build (Windows x64)
+
+# 仅用于开发期验证：只编 Windows x64 的 MaaCore + WPF GUI，跳过 arm64 与其它平台。
+# 上游合并前应删除此文件（正式的 Release Pipeline 见 ci.yml）。
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "feat/spa-badge-farm"
+    paths:
+      - "src/**"
+      - "resource/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - ".github/workflows/slim-windows.yml"
+
+concurrency:
+  group: slim-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows x64
+    runs-on: windows-2025-vs2026
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          show-progress: false
+
+      - name: Fetch submodules
+        shell: bash
+        run: bash ./.github/scripts/sync-optional-submodules.sh --init --depth 1 src/MaaUtils 3rdparty/EmulatorExtras
+
+      - name: Cache MaaDeps
+        id: cache-maadeps
+        uses: actions/cache@v6
+        continue-on-error: true
+        with:
+          path: ./src/MaaUtils/MaaDeps
+          key: ${{ runner.os }}-x64-maadeps-${{ hashFiles('tools/maadeps-download.py') }}
+
+      - name: Bootstrap MaaDeps
+        if: steps.cache-maadeps.outputs.cache-hit != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 tools/maadeps-download.py x64-windows
+
+      - name: Configure CMake
+        run: cmake -B build --preset windows-publish-x64 -DMAA_HASH_VERSION='0.0.1'
+
+      - name: Build MaaCore
+        run: cmake --build build --config RelWithDebInfo --target MaaCore --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Build apphost and updater
+        run: |
+          cmake --build build --config RelWithDebInfo --target MaaAppHostStub --parallel $env:NUMBER_OF_PROCESSORS
+          cmake --build build --config RelWithDebInfo --target MAA.Updater --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: Generate global.json
+        shell: bash
+        run: echo '{"sdk":{"version":"10.0.302","rollForward":"disable"}}' > global.json
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v6
+        continue-on-error: true
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-x64-nuget-${{ hashFiles('**/*.csproj', 'global.json') }}
+
+      - name: Restore WPF GUI
+        run: dotnet restore src/MaaWpfGui/MaaWpfGui.csproj
+
+      - name: Publish WPF GUI
+        run: dotnet publish src/MaaWpfGui/MaaWpfGui.csproj -c Release -p:Platform=x64 -o install
+
+      - name: Install MaaCore
+        run: cmake --install build --config RelWithDebInfo
+
+      - name: Replace apphost
+        shell: bash
+        run: cp build/bin/RelWithDebInfo/MaaAppHostStub.exe install/MAA.exe
+
+      - name: Upload install folder
+        uses: actions/upload-artifact@v7
+        with:
+          name: MAA-slim-win-x64
+          path: |
+            install/**
+            !install/*.pdb
+            !install/**/*.pdb
+            !install/msvc-debug/**
+            !install/*.h
+          compression-level: 6
