@@ -732,28 +732,30 @@ std::optional<int> SPAFarmTaskPlugin::read_number_rec(const cv::Mat& image, Box 
         return std::nullopt;
     }
 
-    // 金币/费用数字是图上最小的字号，两位数（10/11）紧贴且旁边有菱形图标与边框，
-    // fastdeploy 的 rec 直接 Predict 这类带噪声的小图时，会把「11」读成「1」。
-    // MAA 内部读数字的标准做法（Vision/RegionOCRer）是：先灰度二值化、裁掉左右
-    // 空白、按精确边界裁出数字再喂 rec。这里沿用同样预处理，判定阈值不变。
-    cv::Mat gray;
-    cv::cvtColor(image(roi), gray, cv::COLOR_BGR2GRAY);
-    cv::Mat bin;
-    cv::inRange(gray, 0, 120, bin); // 数字为深色（近黑），底为浅色
-
-    cv::Rect bound = cv::boundingRect(bin);
-    if (bound.width <= 0 || bound.height <= 0) {
-        return read_number(image, box);
+    // 金币/费用数字是图上最小的字号（约 20px 高），PP-OCR rec 对 48px 高的图
+    // 识别最稳。原实现用 RapidOCR，其纯识别内部会把小图 resize 到固定高度；
+    // fastdeploy 的 Recognizer::Predict 对小图不做同等放大，导致「11」读成「1」。
+    // 这里显式放大到 rec 模型的舒适高度再识别，判定阈值不变。
+    cv::Mat up;
+    constexpr double TargetHeight = 48.0;
+    const double scale = std::max(1.0, TargetHeight / static_cast<double>(roi.height));
+    if (scale > 1.0) {
+        cv::resize(
+            image(roi),
+            up,
+            cv::Size(std::max(1, static_cast<int>(std::lround(roi.width * scale))),
+                     std::max(1, static_cast<int>(std::lround(roi.height * scale)))),
+            0,
+            0,
+            cv::INTER_CUBIC);
     }
-    // 边界外扩一点，避免把数字笔画贴边切掉
-    bound.x = std::max(0, bound.x - 2);
-    bound.y = std::max(0, bound.y - 2);
-    bound.width = std::min(gray.cols - bound.x, bound.width + 4);
-    bound.height = std::min(gray.rows - bound.y, bound.height + 4);
+    else {
+        up = image(roi);
+    }
 
     std::string text;
     double score = 0.0;
-    const auto results = WordOcr::get_instance().recognize(bin(bound), true, std::nullopt);
+    const auto results = WordOcr::get_instance().recognize(up, true, std::nullopt);
     if (!results.empty()) {
         text = results.front().text;
         score = results.front().score;
