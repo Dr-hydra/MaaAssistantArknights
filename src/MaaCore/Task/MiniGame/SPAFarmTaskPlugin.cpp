@@ -732,9 +732,28 @@ std::optional<int> SPAFarmTaskPlugin::read_number_rec(const cv::Mat& image, Box 
         return std::nullopt;
     }
 
+    // 金币/费用数字是图上最小的字号，两位数（10/11）紧贴且旁边有菱形图标与边框，
+    // fastdeploy 的 rec 直接 Predict 这类带噪声的小图时，会把「11」读成「1」。
+    // MAA 内部读数字的标准做法（Vision/RegionOCRer）是：先灰度二值化、裁掉左右
+    // 空白、按精确边界裁出数字再喂 rec。这里沿用同样预处理，判定阈值不变。
+    cv::Mat gray;
+    cv::cvtColor(image(roi), gray, cv::COLOR_BGR2GRAY);
+    cv::Mat bin;
+    cv::inRange(gray, 0, 120, bin); // 数字为深色（近黑），底为浅色
+
+    cv::Rect bound = cv::boundingRect(bin);
+    if (bound.width <= 0 || bound.height <= 0) {
+        return read_number(image, box);
+    }
+    // 边界外扩一点，避免把数字笔画贴边切掉
+    bound.x = std::max(0, bound.x - 2);
+    bound.y = std::max(0, bound.y - 2);
+    bound.width = std::min(gray.cols - bound.x, bound.width + 4);
+    bound.height = std::min(gray.rows - bound.y, bound.height + 4);
+
     std::string text;
     double score = 0.0;
-    const auto results = WordOcr::get_instance().recognize(image(roi), true, std::nullopt);
+    const auto results = WordOcr::get_instance().recognize(bin(bound), true, std::nullopt);
     if (!results.empty()) {
         text = results.front().text;
         score = results.front().score;
