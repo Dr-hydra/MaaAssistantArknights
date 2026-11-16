@@ -521,7 +521,9 @@ int SPAFarmTaskPlugin::rank_operator(const std::string& name, int tier) const
 cv::Mat SPAFarmTaskPlugin::capture() const
 {
     for (int i = 0; i < 3; ++i) {
-        cv::Mat image = ctrler()->get_image();
+        // 取原始分辨率截图：MAA 逻辑画布固定 1280x720，直接用它会放大 1.5 倍，
+        // 小字号（金币、卡牌费用）会被插值糊掉，导致同一帧两次识别结果不一致。
+        cv::Mat image = ctrler()->get_image(true);
         if (image.empty()) {
             if (!sleep(300)) {
                 return {};
@@ -532,7 +534,13 @@ cv::Mat SPAFarmTaskPlugin::capture() const
             return image;
         }
         cv::Mat resized;
-        cv::resize(image, resized, cv::Size(DesignWidth, DesignHeight), 0, 0, cv::INTER_LINEAR);
+        cv::resize(
+            image,
+            resized,
+            cv::Size(DesignWidth, DesignHeight),
+            0,
+            0,
+            image.cols > DesignWidth ? cv::INTER_AREA : cv::INTER_LINEAR);
         return resized;
     }
     return {};
@@ -1958,6 +1966,14 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& image_in)
         " 满级" + (maxed ? "True" : "False"));
     save_snapshot(image, "shop_r" + std::to_string(round));
     report_progress();
+
+    // 诊断日志：本回合卡牌解析结果（费用/高星/是否干员/名字），便于对照识别是否正常
+    std::string card_dump;
+    for (const auto& card : shop_cards(image)) {
+        card_dump += "[" + std::to_string(card.index) + (card.empty ? "空" : "") + " 费" + opt_str(card.cost) +
+                     (card.high_tier ? " 高" : "") + (card.is_operator ? " 人" : " 备") + " " + card.name + "]";
+    }
+    report_log("卡牌: " + card_dump);
 
     // 第一阶段：Round 1 先买 2 个干员
     if (board.round_done < 0 && round == 1) {
