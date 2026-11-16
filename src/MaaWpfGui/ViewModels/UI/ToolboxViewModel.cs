@@ -2809,7 +2809,7 @@ public class ToolboxViewModel : Screen
     public static void UpdateMiniGameTaskList()
     {
         var categorizedItems = Instances.StageManager.MiniGameEntries
-            .Select(t => {
+            .SelectMany(t => {
                 var isCurrentEvent = t.UtcStartTime != DateTime.MinValue || t.UtcExpireTime != DateTime.MinValue;
                 var defaultCategoryKey = isCurrentEvent ? "Toolbox.MiniGame.Category.CurrentEvent" : "Toolbox.MiniGame.Category.Permanent";
                 var category = !string.IsNullOrEmpty(t.CategoryKey)
@@ -2821,13 +2821,26 @@ public class ToolboxViewModel : Screen
                     category = LocalizationHelper.GetString(defaultCategoryKey);
                 }
 
-                return new MiniGameCategoryItem {
+                var entry = new MiniGameCategoryItem {
                     Display = string.IsNullOrEmpty(t.DisplayKey)
                         ? t.Display
                         : (LocalizationHelper.TryGetString(t.DisplayKey, out var loc) ? loc : t.Display),
                     Value = t.Value,
                     Category = category,
                 };
+
+                if (t.Value == "MiniGame@SPA@Begin")
+                {
+                    return new[] {
+                        entry,
+                        new MiniGameCategoryItem { Display = $"{entry.Display}（刷奖励·标准·金标）", Value = "MiniGame@SPA@Begin@FarmFull3", Category = category },
+                        new MiniGameCategoryItem { Display = $"{entry.Display}（刷奖励·标准·彩标）", Value = "MiniGame@SPA@Begin@FarmFull6", Category = category },
+                        new MiniGameCategoryItem { Display = $"{entry.Display}（刷奖励·低配·金标）", Value = "MiniGame@SPA@Begin@FarmLow3", Category = category },
+                        new MiniGameCategoryItem { Display = $"{entry.Display}（刷奖励·低配·彩标）", Value = "MiniGame@SPA@Begin@FarmLow6", Category = category },
+                    };
+                }
+
+                return new[] { entry };
             })
             .ToList();
 
