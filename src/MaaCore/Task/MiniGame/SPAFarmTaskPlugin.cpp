@@ -64,12 +64,14 @@ constexpr std::pair<int, int> ReadyPoint { 1780, 170 };
 constexpr int LeaveTimeoutSec = 30;
 constexpr int StallTimeoutSec = 600;
 
-// Win32 注入是异步投递、没有内置节拍：按下后立刻移动、整段 move 在毫秒级发完时，
-// 游戏按帧采样不到中间轨迹，会把「按住拖拽」判成一次点击。原实现走 adb
-// `input motionevent`，每条命令本身就有几十到上百毫秒开销，天然满足节拍。
-// 这里显式补回等价时序，判定逻辑不变。
-constexpr int DragDownHoldMs = 300;
-constexpr int DragMoveStepMs = 50;
+// 拖拽时序。原实现每条 adb `input motionevent` 都是独立进程，天然有几十毫秒间隔；
+// 换成 MAA 的 inject_input_event 后若不给节拍，整段 move 会在毫秒级发完，
+// 游戏按帧采样不到中间轨迹，会把「按住拖拽」判成一次点击（干员拿不起来）。
+// 数值取自两处可对照的既有实现，PC(Win32) 与模拟器(ADB/Minitouch) 都适用：
+//  - 开源版 MaaCtl.drag: 每步 step_sleep=0.012；PCWin 在 DOWN 前 sleep 0.03
+//  - MaaCore Win32Controller::swipe: AnchoredTouch 按 13ms/步 的绝对节拍插值
+constexpr int DragDownHoldMs = 30;
+constexpr int DragMoveStepMs = 12;
 
 constexpr int TouchDown = static_cast<int>(InputEvent::Type::TOUCH_DOWN);
 constexpr int TouchUp = static_cast<int>(InputEvent::Type::TOUCH_UP);
@@ -77,9 +79,9 @@ constexpr int TouchMove = static_cast<int>(InputEvent::Type::TOUCH_MOVE);
 
 using Point2 = std::pair<int, int>;
 
-const std::array<const char*, 13> GarrisonKeywords {
-    "极速模拟", "卫戍", "STRONGHOLD", "确认准备", "资金将在", "选择策略", "确认本局信息",
-    "确定自选编队", "返回主页", "模拟完成", "模拟中断", "COUNTDOWN", "断线重连"
+const std::array<const char*, 16> GarrisonKeywords {
+    "极速模拟", "卫戍",     "STRONGHOLD", "同盟模拟", "个人模拟", "确认准备", "资金将在", "选择策略",
+    "确认本局信息", "确定自选编队", "返回主页",   "模拟完成", "模拟中断", "COUNTDOWN", "断线重连", "放弃模拟"
 };
 
 const std::array<const char*, 8> GenericKeywords { "点击任意", "继续", "返回", "确认", "确定", "领取", "下一步", "完成" };
@@ -962,7 +964,7 @@ std::vector<std::pair<int, int>>
     cv::inRange(hsv, cv::Scalar(35, 100, 100), cv::Scalar(85, 255, 255), mask);
     for (int y = 0; y < mask.rows; ++y) {
         for (int x = 0; x < mask.cols; ++x) {
-            if (y < 120 || y >= 760 || x >= 1650) {
+            if (y < 120 || y >= 760 || x < 180 || x >= 1650) {
                 mask.at<uint8_t>(y, x) = 0;
             }
         }
@@ -1579,11 +1581,20 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
             break;
         }
     }
-    if (!has_operator_tab) {
+    const std::string held_early = drag_name(image);
+    bool quoted_name = false;
+    if (!held_early.empty()) {
+        const auto codepoints = decode_utf8(held_early);
+        if (!codepoints.empty()) {
+            const char32_t first = codepoints.front();
+            // 原实现：名字以 “ " 「 『 开头也视为装备
+            quoted_name = first == U'\u201C' || first == U'"' || first == U'\u300C' || first == U'\u300E';
+        }
+    }
+    if (!has_operator_tab || quoted_name) {
         touch_event(TouchUp, lx, ly);
         sleep(800);
-        const std::string held = drag_name(image);
-        report_log("拿起的是装备，放回: " + (held.empty() ? std::string("?") : held));
+        report_log("拿起的是装备，放回: " + (held_early.empty() ? std::string("?") : held_early));
         return std::nullopt;
     }
 
@@ -1658,8 +1669,13 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
         std::vector<std::tuple<int, int, std::string>> candidates;
         for (size_t index = 0; index < group.size(); ++index) {
             const std::string& tile_name = group[index];
-            const auto& occ = *occupants[tile_name];
-            if (occ.second < 5 || (occ.first != "?" && value(tile_name, occ) < my_rank)) {
+            const auto& occ_opt = occupants[tile_name];
+            if (!occ_opt.has_value()) {
+                continue;
+            }
+            const auto& occ = *occ_opt;
+            // 原实现：等阶<5 且 不是未知占位 且 价值低于自己，三者必须同时满足
+            if (occ.second < 5 && occ.first != "?" && value(tile_name, occ) < my_rank) {
                 candidates.emplace_back(value(tile_name, occ), static_cast<int>(index), tile_name);
             }
         }
@@ -2467,6 +2483,14 @@ bool SPAFarmTaskPlugin::_run()
             report_log("检测到未完成的对局，断线重连");
             click_at(hit.has_value() ? static_cast<int>(hit->x) : 1660, hit.has_value() ? static_cast<int>(hit->y) : 970, 5.0);
             board = Board();
+        }
+        else if (
+            (text.find("同盟模拟") != std::string::npos || text.find("搜寻队友") != std::string::npos) &&
+            text.find("个人模拟") != std::string::npos) {
+            report_log("卫戍协议主界面在「联合模拟」页，切换到「个人模拟」");
+            if (const auto hit = find(items, { "个人模拟" }); hit.has_value()) {
+                click_at(static_cast<int>(hit->x), static_cast<int>(hit->y), 2.5);
+            }
         }
         else if (text.find("独立模拟") != std::string::npos && text.find("极速模拟") != std::string::npos) {
             const auto hit = find(items, { "极速模拟" });
