@@ -28,6 +28,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "Config/Miscellaneous/OcrPack.h"
+#include "Vision/RegionOCRer.h"
 #include "Controller/Controller.h"
 #include "Controller/ControllerAPI.h"
 #include "MaaUtils/NoWarningCV.hpp"
@@ -732,36 +733,17 @@ std::optional<int> SPAFarmTaskPlugin::read_number_rec(const cv::Mat& image, Box 
         return std::nullopt;
     }
 
-    // 金币/费用数字是图上最小的字号（约 20px 高），PP-OCR rec 对 48px 高的图
-    // 识别最稳。原实现用 RapidOCR，其纯识别内部会把小图 resize 到固定高度；
-    // fastdeploy 的 Recognizer::Predict 对小图不做同等放大，导致「11」读成「1」。
-    // 这里显式放大到 rec 模型的舒适高度再识别，判定阈值不变。
-    cv::Mat up;
-    constexpr double TargetHeight = 48.0;
-    const double scale = std::max(1.0, TargetHeight / static_cast<double>(roi.height));
-    if (scale > 1.0) {
-        cv::resize(
-            image(roi),
-            up,
-            cv::Size(std::max(1, static_cast<int>(std::lround(roi.width * scale))),
-                     std::max(1, static_cast<int>(std::lround(roi.height * scale)))),
-            0,
-            0,
-            cv::INTER_CUBIC);
+    // 金币/费用数字是亮青蓝色(约 0,186,255)在黑色胶囊底上，字号小、紧贴。
+    // 用 MAA 自己的 RegionOCRer 读：它内部先灰度二值化(默认取 140..255 亮像素，
+    // 正好命中亮数字、忽略黑底)、裁掉左右空白、按精确边界定位，再走纯 rec，
+    // 是对小字号数字最稳的既有封装（MedicineCounter 等读数字都走它）。
+    RegionOCRer ocr(image, asst::Rect(roi.x, roi.y, roi.width, roi.height));
+    const auto result = ocr.analyze();
+    if (!result.has_value()) {
+        return read_number(image, box);
     }
-    else {
-        up = image(roi);
-    }
-
-    std::string text;
-    double score = 0.0;
-    const auto results = WordOcr::get_instance().recognize(up, true, std::nullopt);
-    if (!results.empty()) {
-        text = results.front().text;
-        score = results.front().score;
-    }
-    const std::string digits = extract_digits(text);
-    if (!digits.empty() && score >= 0.4) {
+    const std::string digits = extract_digits(result->text);
+    if (!digits.empty() && result->score >= 0.4) {
         return std::atoi(digits.c_str());
     }
     return read_number(image, box);
