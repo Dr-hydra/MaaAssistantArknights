@@ -1178,21 +1178,10 @@ void SPAFarmTaskPlugin::pick_squad()
 std::tuple<std::optional<int>, std::optional<int>, bool, std::optional<int>>
     SPAFarmTaskPlugin::read_shop(const cv::Mat& image)
 {
-    const auto gold = read_gold(&image);
+    const auto gold = read_number_rec(image, Box { GoldBoxX1, GoldBoxY1, GoldBoxX2, GoldBoxY2 });
     const auto bottom = ocr(image, Box { 0, 820, 760, 1010 });
-
-    // 「升级/满级」面板在左侧，取最左侧的命中项：右侧卡牌区域偶尔会识别出同名文本，
-    // 一旦取错，UPX 偏大既会裁掉右侧卡牌，也会把升级点击挪到卡牌上
-    std::optional<int> upgrade_x;
-    for (const auto& item : bottom) {
-        if (item.text.find("满级") != std::string::npos || item.text.find("升级") != std::string::npos) {
-            const int x = static_cast<int>(item.x);
-            if (!upgrade_x.has_value() || x < *upgrade_x) {
-                upgrade_x = x;
-            }
-        }
-    }
-    m_up_x = upgrade_x.value_or(100);
+    const auto upgrade_hit = find(bottom, { "满级", "升级" });
+    m_up_x = upgrade_hit.has_value() ? static_cast<int>(upgrade_hit->x) : 100;
 
     m_cards.clear();
     for (const int x : CardX) {
@@ -1288,11 +1277,11 @@ std::vector<SPAFarmTaskPlugin::ShopCard> SPAFarmTaskPlugin::shop_cards(const cv:
 
 bool SPAFarmTaskPlugin::buy(int index, std::optional<int> cost)
 {
-    (void)cost;
     if (index < 0 || index >= static_cast<int>(m_cards.size())) {
         return false;
     }
     const int x = m_cards[static_cast<size_t>(index)];
+    const auto gold_before = read_number_rec(capture(), Box { GoldBoxX1, GoldBoxY1, GoldBoxX2, GoldBoxY2 });
 
     click_at(x, CardY, 0.8);
     const cv::Mat image = capture();
@@ -1311,9 +1300,12 @@ bool SPAFarmTaskPlugin::buy(int index, std::optional<int> cost)
     }
 
     click_at(x, CardY + 106, 1.2);
-    // 原实现用金币差值复核，但金币数字是图上最小的字号，识别抖动会把成功购买判成失败
-    // （干员买到了却留在备战席不部署）。这里改为只做弹窗/干员面板校验，
-    // 实际是否到手交给调用方用备战席差分确认。
+    const auto gold_after = read_number_rec(capture(), Box { GoldBoxX1, GoldBoxY1, GoldBoxX2, GoldBoxY2 });
+    if ((!cost.has_value() || *cost != 0) && gold_before.has_value() && gold_after.has_value() &&
+        *gold_after >= *gold_before) {
+        click_at(960, 600, 0.4);
+        return false;
+    }
     return true;
 }
 
@@ -1321,15 +1313,12 @@ std::optional<int> SPAFarmTaskPlugin::read_gold(const cv::Mat* image, int tries)
 {
     for (int attempt = 0; attempt < tries; ++attempt) {
         const cv::Mat target = (attempt == 0 && image != nullptr) ? *image : capture();
-        // 徽章数字很小，单次识别容易抖动（实测同一帧读出 10 和 0）。
-        // 识别模型与检测模型各读一次，一致才采信，避免把"买得起"误判成"买不起"。
-        const auto by_rec = read_number_rec(target, Box { GoldBoxX1, GoldBoxY1, GoldBoxX2, GoldBoxY2 });
-        const auto by_det = read_number(target, Box { 1760, 760, 1880, 825 });
-        if (by_rec.has_value() && by_det.has_value() && *by_rec == *by_det && *by_rec >= 0 && *by_rec <= 99) {
-            return by_rec;
+        auto gold = read_number_rec(target, Box { GoldBoxX1, GoldBoxY1, GoldBoxX2, GoldBoxY2 });
+        if (!gold.has_value()) {
+            gold = read_number(target, Box { 1760, 760, 1880, 825 });
         }
-        if (attempt + 1 >= tries && by_rec.has_value() && *by_rec >= 0 && *by_rec <= 99) {
-            return by_rec; // 两种识别无法互证时退回识别模型的结果，保持与原实现一致
+        if (gold.has_value() && *gold >= 0 && *gold <= 99) {
+            return gold;
         }
         sleep(400);
     }
