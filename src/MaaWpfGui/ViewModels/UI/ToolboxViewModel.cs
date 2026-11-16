@@ -3023,11 +3023,17 @@ public class ToolboxViewModel : Screen
 
     #region SPA
 
+    private string _spaMode = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMode;
+
+    private bool _spaLowProfile = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPALowProfile;
+
+    private bool _spaColorfulBadge = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPATargetClears >= 6;
+
+    private int _spaMaxRuns = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMaxRuns;
+
     public LocalizedObservableList<string> SPAModeList { get; } = new(
         ("level", "Toolbox.MiniGame.SPA.Mode.Level"),
         ("badge", "Toolbox.MiniGame.SPA.Mode.Badge"));
-
-    private string _spaMode = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMode;
 
     /// <summary>Gets or sets 卫戍协议运行模式：level 刷等级（原有实现），badge 刷角标。</summary>
     public string SPAMode
@@ -3047,8 +3053,6 @@ public class ToolboxViewModel : Screen
     [PropertyDependsOn(nameof(SPAMode))]
     public bool IsSPABadgeMode => SPAMode == "badge";
 
-    private bool _spaLowProfile = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPALowProfile;
-
     /// <summary>Gets or sets a value indicating whether 刷角标使用低配模式（不需要自选编队）。</summary>
     public bool SPALowProfile
     {
@@ -3063,8 +3067,6 @@ public class ToolboxViewModel : Screen
         }
     }
 
-    private bool _spaColorfulBadge = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPATargetClears >= 6;
-
     /// <summary>Gets or sets a value indicating whether 刷彩色角标（同一策略通关 6 次）。</summary>
     public bool SPAColorfulBadge
     {
@@ -3078,8 +3080,6 @@ public class ToolboxViewModel : Screen
             ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPATargetClears = value ? 6 : 3;
         }
     }
-
-    private int _spaMaxRuns = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMaxRuns;
 
     /// <summary>Gets or sets 刷角标最多通关局数。</summary>
     public int SPAMaxRuns
