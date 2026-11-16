@@ -2978,6 +2978,19 @@ public class AsstProxy
                 ProcMaterialSynthesisMsg(what, subTaskDetails);
                 break;
 
+            case "SPAFarmLog":
+                {
+                    var message = (string?)subTaskDetails?["message"] ?? string.Empty;
+                    var level = (string?)subTaskDetails?["level"] ?? "info";
+                    var color = level switch {
+                        "error" => UiLogColor.Error,
+                        "warn" => UiLogColor.Warning,
+                        _ => UiLogColor.Info,
+                    };
+                    Instances.TaskQueueViewModel.AddLog(message, color);
+                    break;
+                }
+
             case "PixelPaintProgress":
                 {
                     var done = (int)(subTaskDetails?["done"] ?? 0);
@@ -4001,6 +4014,29 @@ public class AsstProxy
                         color = g.Color,
                         points = g.Points,
                     }).ToList(),
+                },
+            }),
+        };
+        var (type, param) = task.Serialize();
+        return AsstAppendTaskWithEncoding(TaskType.MiniGame, type, param) && AsstStart();
+    }
+
+    /// <summary>
+    /// 卫戍协议刷角标（牛杂）。整段极速模拟流程由 SPAFarmTaskPlugin 接管。
+    /// </summary>
+    /// <param name="lowProfile">低配模式（不需要自选编队）。</param>
+    /// <param name="targetClears">单个策略需要通关的次数，3 = 金色角标，6 = 彩色角标。</param>
+    /// <param name="maxRuns">最多通关局数。</param>
+    /// <returns>是否成功启动。</returns>
+    public bool AsstSPAFarm(bool lowProfile, int targetClears, int maxRuns)
+    {
+        var task = new AsstCustomTask {
+            CustomTasks = ["MiniGame@SPA@BadgeFarm"],
+            Params = JObject.FromObject(new {
+                spa_farm = new {
+                    low_profile = lowProfile,
+                    target_clears = targetClears,
+                    max_runs = maxRuns,
                 },
             }),
         };

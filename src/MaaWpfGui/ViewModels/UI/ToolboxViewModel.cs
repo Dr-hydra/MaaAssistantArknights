@@ -2760,6 +2760,8 @@ public class ToolboxViewModel : Screen
 
         public bool IsSecretFront => Value == "MiniGame@SecretFront";
 
+        public bool IsSPA => Value is "MiniGame@SPA" or "MiniGame@SPA@Begin";
+
         public bool IsPixelPaint => Value is "MiniGame@PixelPaint" or "MiniGame@PixelPaint@Begin";
 
         public bool IsAutoRaisePotential => Value == "MiniGame@AutoRaisePotential@Begin";
@@ -3018,6 +3020,83 @@ public class ToolboxViewModel : Screen
             ConfigFactory.CurrentConfig.Toolbox.MiniGame.EventShopBlackList = value;
         }
     } = ConfigFactory.CurrentConfig.Toolbox.MiniGame.EventShopBlackList;
+
+    #region SPA
+
+    public LocalizedObservableList<string> SPAModeList { get; } = new(
+        ("level", "Toolbox.MiniGame.SPA.Mode.Level"),
+        ("badge", "Toolbox.MiniGame.SPA.Mode.Badge"));
+
+    private string _spaMode = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMode;
+
+    /// <summary>Gets or sets 卫戍协议运行模式：level 刷等级（原有实现），badge 刷角标。</summary>
+    public string SPAMode
+    {
+        get => _spaMode;
+        set {
+            if (!SetAndNotify(ref _spaMode, value))
+            {
+                return;
+            }
+
+            ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMode = value;
+        }
+    }
+
+    /// <summary>Gets a value indicating whether 当前为刷角标模式。</summary>
+    [PropertyDependsOn(nameof(SPAMode))]
+    public bool IsSPABadgeMode => SPAMode == "badge";
+
+    private bool _spaLowProfile = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPALowProfile;
+
+    /// <summary>Gets or sets a value indicating whether 刷角标使用低配模式（不需要自选编队）。</summary>
+    public bool SPALowProfile
+    {
+        get => _spaLowProfile;
+        set {
+            if (!SetAndNotify(ref _spaLowProfile, value))
+            {
+                return;
+            }
+
+            ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPALowProfile = value;
+        }
+    }
+
+    private bool _spaColorfulBadge = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPATargetClears >= 6;
+
+    /// <summary>Gets or sets a value indicating whether 刷彩色角标（同一策略通关 6 次）。</summary>
+    public bool SPAColorfulBadge
+    {
+        get => _spaColorfulBadge;
+        set {
+            if (!SetAndNotify(ref _spaColorfulBadge, value))
+            {
+                return;
+            }
+
+            ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPATargetClears = value ? 6 : 3;
+        }
+    }
+
+    private int _spaMaxRuns = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMaxRuns;
+
+    /// <summary>Gets or sets 刷角标最多通关局数。</summary>
+    public int SPAMaxRuns
+    {
+        get => _spaMaxRuns;
+        set {
+            value = Math.Clamp(value, 1, 999);
+            if (!SetAndNotify(ref _spaMaxRuns, value))
+            {
+                return;
+            }
+
+            ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMaxRuns = value;
+        }
+    }
+
+    #endregion
 
     #region PixelPaint
 
@@ -3621,7 +3700,24 @@ public class ToolboxViewModel : Screen
             return StartEventShop();
         }
 
+        if (SelectedMiniGameItem?.IsSPA == true)
+        {
+            return StartSPA();
+        }
+
         return Instances.AsstProxy.AsstMiniGame(GetMiniGameTask());
+    }
+
+    /// <summary>卫戍协议启动：刷等级沿用原有实现，刷角标交给 SPAFarmTaskPlugin。</summary>
+    /// <returns>任务是否成功提交。</returns>
+    private bool StartSPA()
+    {
+        if (!IsSPABadgeMode)
+        {
+            return Instances.AsstProxy.AsstMiniGame(GetMiniGameTask());
+        }
+
+        return Instances.AsstProxy.AsstSPAFarm(SPALowProfile, SPAColorfulBadge ? 6 : 3, SPAMaxRuns);
     }
 
     /// <summary>活动商店启动：提交自定义及游戏客户端语言下的预设黑名单关键词。</summary>

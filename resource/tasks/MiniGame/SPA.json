@@ -4,6 +4,12 @@
         "algorithm": "JustReturn",
         "next": ["MiniGame@SPA@EnterIndependentQuickly", "MiniGame@SPA@EnterIndependent"]
     },
+    "MiniGame@SPA@BadgeFarm": {
+        "doc": "卫戍协议极速模拟：自动刷策略角标（由 SPAFarmTaskPlugin 接管，需从极速模拟界面开始）",
+        "algorithm": "JustReturn",
+        "action": "DoNothing",
+        "next": []
+    },
     "MiniGame@SPA@EnterIndependentQuickly": {
         "doc": "三期新增极速模拟模式",
         "action": "ClickSelf",

@@ -2539,6 +2539,12 @@ HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Notifications\Settin
 기본 스킨을 사용해야 합니다
 저장 데이터가 있는 경우 먼저 수동으로 포기해야 합니다
 레벨 보상만 획득 가능하며, 조각 메달을 얻으려면 모든 ｢주요 목표｣를 완료해야 합니다</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Mode">모드</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Mode.Level">레벨 파밍</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Mode.Badge">배지 파밍</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.LowProfile">저등급 모드</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Colorful">컬러 배지</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.MaxRuns">최대 클리어 횟수</system:String>
     <system:String x:Key="Toolbox.MiniGame.SecretFront">비밀 전선</system:String>
     <system:String x:Key="Toolbox.MiniGame.SecretFront.Ending">엔딩</system:String>
     <system:String x:Key="Toolbox.MiniGame.SecretFront.Event">우선 시리즈 사건</system:String>

@@ -2539,6 +2539,12 @@ Task flow: Use the Gold from Strategy Business Management to unlock areas, and u
 Default outfits must be used
 If there is a saved game, you need to manually abandon it first
 Only level rewards can be farmed; to get the Engraved Medal, all ｢Key Objectives｣ must be completed</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Mode">Mode</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Mode.Level">Level farm</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Mode.Badge">Badge farm</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.LowProfile">Low-rarity mode</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.Colorful">Colorful badge</system:String>
+    <system:String x:Key="Toolbox.MiniGame.SPA.MaxRuns">Max cleared runs</system:String>
     <system:String x:Key="Toolbox.MiniGame.SecretFront">Hidden Front</system:String>
     <system:String x:Key="Toolbox.MiniGame.SecretFront.Ending">Ending</system:String>
     <system:String x:Key="Toolbox.MiniGame.SecretFront.Event">Priority for Series of Events</system:String>
