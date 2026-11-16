@@ -28,7 +28,6 @@
 #include <opencv2/imgproc.hpp>
 
 #include "Config/Miscellaneous/OcrPack.h"
-#include "Vision/RegionOCRer.h"
 #include "Controller/Controller.h"
 #include "Controller/ControllerAPI.h"
 #include "MaaUtils/NoWarningCV.hpp"
@@ -733,17 +732,17 @@ std::optional<int> SPAFarmTaskPlugin::read_number_rec(const cv::Mat& image, Box 
         return std::nullopt;
     }
 
-    // 金币/费用数字是亮青蓝色(约 0,186,255)在黑色胶囊底上，字号小、紧贴。
-    // 用 MAA 自己的 RegionOCRer 读：它内部先灰度二值化(默认取 140..255 亮像素，
-    // 正好命中亮数字、忽略黑底)、裁掉左右空白、按精确边界定位，再走纯 rec，
-    // 是对小字号数字最稳的既有封装（MedicineCounter 等读数字都走它）。
-    RegionOCRer ocr(image, asst::Rect(roi.x, roi.y, roi.width, roi.height));
-    const auto result = ocr.analyze();
-    if (!result.has_value()) {
-        return read_number(image, box);
+    // 与原实现 numrec 一致：只用识别模型读固定位置的数字，conf>=0.4 才采信，
+    // 失败退回检测+识别（read_number）。不做二值化/放大等额外预处理。
+    std::string text;
+    double score = 0.0;
+    const auto results = WordOcr::get_instance().recognize(image(roi), true, std::nullopt);
+    if (!results.empty()) {
+        text = results.front().text;
+        score = results.front().score;
     }
-    const std::string digits = extract_digits(result->text);
-    if (!digits.empty() && result->score >= 0.4) {
+    const std::string digits = extract_digits(text);
+    if (!digits.empty() && score >= 0.4) {
         return std::atoi(digits.c_str());
     }
     return read_number(image, box);
