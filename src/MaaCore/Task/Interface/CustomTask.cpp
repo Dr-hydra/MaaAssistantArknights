@@ -5,7 +5,6 @@
 #include "Task/MiniGame/EventShopTaskPlugin.h"
 #include "Task/MiniGame/MaterialSynthesisTaskPlugin.h"
 #include "Task/MiniGame/PixelPaintTaskPlugin.h"
-#include "Task/MiniGame/SPAFarmTaskPlugin.h"
 #include "Task/MiniGame/SecretFrontTaskPlugin.h"
 #include "Task/Miscellaneous/ScreenshotTaskPlugin.h"
 #include "Task/ProcessTask.h"
@@ -39,10 +38,7 @@ bool asst::CustomTask::set_params(const json::value& params)
         std::string task_name = t.as_string();
         std::string resolved_task = task_name;
 
-        if (parse_and_register_spa_farm(task_name, resolved_task)) {
-            Log.info("Parsed and registered SPA farm task: ", task_name, " -> ", resolved_task);
-        }
-        else if (parse_and_register_secretfront(task_name, resolved_task)) {
+        if (parse_and_register_secretfront(task_name, resolved_task)) {
             Log.info("Parsed and registered SecretFront task: ", task_name, " -> ", resolved_task);
         }
         else if (parse_and_register_auto_raise_potential(task_name, params)) {
@@ -67,35 +63,6 @@ bool asst::CustomTask::set_params(const json::value& params)
     }
     m_custom_task_ptr->set_tasks(std::move(tasks));
     m_subtasks.emplace_back(m_custom_task_ptr);
-    return true;
-}
-
-bool asst::CustomTask::parse_and_register_spa_farm(const std::string& task_name, std::string& resolved_task)
-{
-    constexpr std::string_view prefix = "MiniGame@SPA@Begin@Farm";
-    if (!task_name.starts_with(prefix)) {
-        return false;
-    }
-    const auto mode = std::string_view(task_name).substr(prefix.size());
-    if (mode != "Full3" && mode != "Full6" && mode != "Low3" && mode != "Low6") {
-        Log.error("Unsupported SPA farm mode: ", task_name);
-        return false;
-    }
-
-    auto plugin = m_custom_task_ptr->register_plugin<SPAFarmTaskPlugin>();
-    if (!plugin) {
-        Log.error("Failed to register SPAFarmTaskPlugin");
-        return false;
-    }
-    plugin->set_retry_times(0);
-    plugin->set_mode(mode == "Low3" || mode == "Low6", mode == "Full6" || mode == "Low6" ? 6 : 3);
-
-    constexpr std::string_view base = "MiniGame@SPA@Begin";
-    if (!m_custom_task_ptr->override_next(base, {})) {
-        Log.error("Failed to take over SPA entry pipeline");
-        return false;
-    }
-    resolved_task = std::string(base);
     return true;
 }
 

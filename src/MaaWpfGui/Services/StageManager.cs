@@ -307,16 +307,6 @@ public class StageManager
         // parse mini-game tasks from activity json if provided (use helper to populate temp list)
         var tempMiniGames = InitializeDefaultMiniGameEntries();
         ParseMiniGameEntries(activity?[clientType], tempMiniGames, curVerParsed, curVersionObj, isDebugVersion);
-        if (!tempMiniGames.Any(entry => entry.Value == "MiniGame@SPA@Begin"))
-        {
-            tempMiniGames.Add(new MiniGameEntry {
-                Display = LocalizationHelper.GetString("Toolbox.MiniGame.SPA"),
-                DisplayKey = "Toolbox.MiniGame.SPA",
-                Value = "MiniGame@SPA@Begin",
-                TipKey = "Toolbox.MiniGame.SPA.Tip",
-                CategoryKey = "Toolbox.MiniGame.Category.PermanentFeature",
-            });
-        }
         _miniGameEntries = tempMiniGames;
 
         StageDataChanged?.Invoke(this, EventArgs.Empty);
