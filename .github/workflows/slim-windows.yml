@@ -22,9 +22,6 @@ jobs:
   build:
     name: Windows x64
     runs-on: windows-2025-vs2026
-    env:
-      # sccache 走 GitHub Actions 缓存后端，跨 run 复用目标文件
-      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -49,27 +46,31 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/maadeps-download.py x64-windows
 
-      - name: Setup sccache
-        id: sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Restore build cache
+        id: cache-build
+        uses: actions/cache@v6
         continue-on-error: true
+        with:
+          # VS 生成器 + MSBuild 支持增量编译：缓存 build/ 里的目标文件。
+          # key 用源文件 hash（改动即失效），restore-keys 前缀匹配最近一次缓存，
+          # 让「只改一个 .cpp」时其余 .obj 复用，MSBuild 只重编改动文件并重链接。
+          path: |
+            build/**/*.obj
+            build/**/*.lib
+            build/**/*.dll
+            build/**/*.exe
+            build/**/*.tlog
+          key: ${{ runner.os }}-x64-build-${{ hashFiles('src/MaaCore/**') }}
+          restore-keys: |
+            ${{ runner.os }}-x64-build-
 
       - name: Configure CMake
         shell: bash
         run: |
-          launcher=""
-          if command -v sccache >/dev/null 2>&1; then
-            launcher="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
-            echo "sccache: $(sccache --version | head -1)"
-          else
-            echo "::warning::sccache 不可用，本次为全量编译"
-          fi
-          # RelWithDebInfo 默认 /Zi，sccache 无法安全缓存；改 /Z7（Embedded）后目标文件可复用。
-          # 产物不含 pdb，对 drop-in 包无影响。
+          # /Z7（Embedded）让调试信息进 .obj，避免 .pdb 参与增量判断、加快重编译
           cmake -B build --preset windows-publish-x64 \
             -DMAA_HASH_VERSION='0.0.1' \
-            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
-            $launcher
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded
 
       - name: Build MaaCore
         run: cmake --build build --config RelWithDebInfo --target MaaCore --parallel $env:NUMBER_OF_PROCESSORS
@@ -78,12 +79,6 @@ jobs:
         run: |
           cmake --build build --config RelWithDebInfo --target MaaAppHostStub --parallel $env:NUMBER_OF_PROCESSORS
           cmake --build build --config RelWithDebInfo --target MAA.Updater --parallel $env:NUMBER_OF_PROCESSORS
-
-      - name: sccache stats
-        if: always()
-        continue-on-error: true
-        shell: bash
-        run: sccache --show-stats || true
 
       - name: Generate global.json
         shell: bash
