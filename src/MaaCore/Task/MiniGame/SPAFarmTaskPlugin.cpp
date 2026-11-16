@@ -1709,7 +1709,7 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
     auto& used = board != nullptr ? board->used : local_used;
     auto& hi_tiles = board != nullptr ? board->hi_tiles : local_hi;
 
-    const auto near = [](std::pair<int, int> point, const std::vector<std::pair<int, int>>& list, int distance = 95) {
+    const auto is_near = [](std::pair<int, int> point, const std::vector<std::pair<int, int>>& list, int distance = 95) {
         for (const auto& [x, y] : list) {
             if (std::abs(point.first - x) <= distance && std::abs(point.second - y) <= distance) {
                 return true;
@@ -1729,7 +1729,7 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
         const auto candidates = right3(green_tiles(image), image);
         std::vector<std::pair<int, int>> free_tiles;
         for (const auto& tile : candidates) {
-            if (!near(tile, used)) {
+            if (!is_near(tile, used)) {
                 free_tiles.push_back(tile);
             }
         }
@@ -1745,12 +1745,12 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
             std::vector<std::pair<int, int>> targets;
             if (is_hi) {
                 for (const auto& tile : used) {
-                    if (!near(tile, hi_tiles)) {
+                    if (!is_near(tile, hi_tiles)) {
                         targets.push_back(tile);
                     }
                 }
                 for (const auto& tile : candidates) {
-                    if (!near(tile, hi_tiles)) {
+                    if (!is_near(tile, hi_tiles)) {
                         targets.push_back(tile);
                     }
                 }
@@ -1779,7 +1779,7 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
             m_last_tile = Point2 { tx, ty };
             set_facing(tx, ty);
             const cv::Mat after = capture();
-            if (!near({ tx, ty }, used)) {
+            if (!is_near({ tx, ty }, used)) {
                 used.push_back({ tx, ty });
             }
             const auto slots_after = slots_left(after);
