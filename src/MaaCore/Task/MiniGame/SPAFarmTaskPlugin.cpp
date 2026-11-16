@@ -28,6 +28,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include "Config/Miscellaneous/OcrPack.h"
+#include "Config/OnnxSessions.h"
 #include "Controller/Controller.h"
 #include "Controller/ControllerAPI.h"
 #include "MaaUtils/NoWarningCV.hpp"
@@ -429,6 +430,180 @@ std::filesystem::path done_file_path()
     }
     return UserDir.get() / "config" / "SPAFarmStrategies.txt";
 }
+
+// ----------------------------------------------------------------------------
+// RapidOCR 纯识别（rec）：复刻原实现 garrison_farm.py 的 ocr_engine(use_det=False)。
+// 模型就是 MAA 自带的 PaddleOCR/rec/inference.onnx + keys.txt（与原实现同一套），
+// 但推理走 onnxruntime（RapidOCR 的引擎），而非 MAA 的 fastdeploy —— 两者对
+// 小字号数字的预处理不同，这是 fastdeploy 把「11」读成「1」的根因。
+// 预处理/后处理逐行对齐 RapidOCR：
+//   resize_norm_img: resize 到 (48, 按比例宽), HWC->CHW, /255, -0.5, /0.5, pad 到 320
+//   CTCLabelDecode: argmax -> 相邻去重 -> 去 blank(0) -> keys.txt 映射 -> 置信度取均值
+// ----------------------------------------------------------------------------
+class RapidRecEngine
+{
+public:
+    static RapidRecEngine& instance()
+    {
+        static RapidRecEngine eng;
+        return eng;
+    }
+
+    // 返回 (文本, 置信度)；引擎不可用时返回 nullopt，调用方回退 MAA OCR
+    std::optional<std::pair<std::string, double>> recognize(const cv::Mat& crop)
+    {
+        auto* session = get_session();
+        if (session == nullptr || m_keys.empty() || crop.empty()) {
+            return std::nullopt;
+        }
+
+        constexpr int ImgH = 48;
+        constexpr int ImgW = 320;
+        constexpr int ImgC = 3;
+
+        // ---- 预处理 resize_norm_img ----
+        const double ratio = static_cast<double>(crop.cols) / static_cast<double>(crop.rows);
+        const int resized_w = std::min(ImgW, static_cast<int>(std::ceil(ImgH * ratio)));
+        cv::Mat resized;
+        cv::resize(crop, resized, cv::Size(resized_w, ImgH), 0, 0, cv::INTER_LINEAR);
+
+        std::vector<float> input_tensor(static_cast<size_t>(ImgC * ImgH * ImgW), 0.0F);
+        // HWC -> CHW，/255，(x-0.5)/0.5
+        for (int y = 0; y < ImgH; ++y) {
+            for (int x = 0; x < resized_w; ++x) {
+                const auto& px = resized.at<cv::Vec3b>(y, x); // BGR
+                for (int c = 0; c < ImgC; ++c) {
+                    const float val = static_cast<float>(px[2 - c]) / 255.0F; // BGR -> RGB
+                    input_tensor[static_cast<size_t>(c * ImgH * ImgW + y * ImgW + x)] = (val - 0.5F) / 0.5F;
+                }
+            }
+        }
+
+        // ---- 推理 ----
+        Ort::AllocatorWithDefaultOptions allocator;
+        const auto input_name = session->GetInputNameAllocated(0, allocator);
+        const auto output_name = session->GetOutputNameAllocated(0, allocator);
+        const std::array<int64_t, 4> shape { 1, ImgC, ImgH, ImgW };
+        Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeDefault);
+        Ort::Value input = Ort::Value::CreateTensor<float>(
+            mem_info, input_tensor.data(), input_tensor.size(), shape.data(), shape.size());
+        const char* input_names[] { input_name.get() };
+        const char* output_names[] { output_name.get() };
+        auto output = session->Run(Ort::RunOptions { nullptr }, input_names, &input, 1, output_names, 1);
+
+        // ---- 后处理 CTC decode ----
+        float* logits = output[0].GetTensorMutableData<float>();
+        const auto type_info = output[0].GetTensorTypeAndShapeInfo();
+        const auto out_shape = type_info.GetShape();
+        // 典型输出 [1, T, C+1]
+        const int64_t time_steps = out_shape.size() >= 2 ? out_shape[out_shape.size() - 2] : 0;
+        const int64_t num_classes = out_shape.size() >= 1 ? out_shape[out_shape.size() - 1] : 0;
+        if (time_steps <= 0 || num_classes <= 0) {
+            return std::nullopt;
+        }
+        // 输出类别数应与 keys.txt 字符数大致吻合（允许 blank/space 的 1~2 个差异）；
+        // 差太多说明模型字符表与本地 keys 不一致，解码无意义，回退 MAA OCR
+        const int64_t key_count = static_cast<int64_t>(m_keys.size());
+        if (num_classes < key_count - 2 || num_classes > key_count + 2) {
+            LogWarn << "SPA | RapidRec class mismatch:" << num_classes << "vs keys" << key_count;
+            return std::nullopt;
+        }
+
+        std::string text;
+        std::vector<float> probs;
+        int prev = -1;
+        for (int64_t t = 0; t < time_steps; ++t) {
+            const float* row = logits + t * num_classes;
+            int best = 0;
+            float best_val = row[0];
+            for (int64_t c = 1; c < num_classes; ++c) {
+                if (row[c] > best_val) {
+                    best_val = row[c];
+                    best = static_cast<int>(c);
+                }
+            }
+            if (best == prev) { // CTC 相邻去重
+                continue;
+            }
+            prev = best;
+            if (best == 0) { // blank
+                continue;
+            }
+            if (best < static_cast<int>(m_keys.size())) {
+                text += m_keys[static_cast<size_t>(best)];
+                probs.push_back(best_val);
+            }
+        }
+        if (text.empty()) {
+            return std::make_pair(std::string(), 0.0);
+        }
+        double conf = 0.0;
+        for (float p : probs) {
+            conf += p;
+        }
+        conf /= static_cast<double>(probs.size());
+        return std::make_pair(text, conf);
+    }
+
+private:
+    RapidRecEngine() = default;
+
+    bool ensure_loaded()
+    {
+        if (m_tried) {
+            return m_session != nullptr;
+        }
+        m_tried = true;
+        const auto& res = ResDir.get();
+        if (res.empty()) {
+            LogWarn << "SPA | RapidRec: resource dir empty";
+            return false;
+        }
+        const auto rec_dir = res / std::filesystem::path("PaddleOCR") / std::filesystem::path("rec");
+        const auto model = rec_dir / std::filesystem::path("inference.onnx");
+        const auto keys = rec_dir / std::filesystem::path("keys.txt");
+        if (!std::filesystem::exists(model) || !std::filesystem::exists(keys)) {
+            LogWarn << "SPA | RapidRec: model or keys not found:" << model;
+            return false;
+        }
+
+        // keys.txt：逐行字符，前面插入 blank(占位) 和 space（对齐 CTCLabelDecode:
+        // character.insert(0,"blank"); character.insert(len," ")）
+        std::ifstream ifs(keys, std::ios::binary);
+        if (!ifs) {
+            return false;
+        }
+        m_keys.emplace_back(""); // blank -> index 0（不会被映射成字符）
+        std::string line;
+        while (std::getline(ifs, line)) {
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+            m_keys.push_back(line);
+        }
+        m_keys.emplace_back(" "); // space -> 末尾
+
+        // 用 MAA 的 OnnxSessions 建会话（已处理 Ort::Env / SessionOptions / CPU-GPU）
+        auto& sessions = OnnxSessions::get_instance();
+        sessions.load(model);
+        m_session = &sessions.acquire(m_session_name);
+        LogInfo << "SPA | RapidRec: loaded" << model.lexically_relative(res);
+        return m_session != nullptr;
+    }
+
+    Ort::Session* get_session()
+    {
+        if (!ensure_loaded()) {
+            return nullptr;
+        }
+        return m_session;
+    }
+
+    bool m_tried = false;
+    Ort::Session* m_session = nullptr;
+    std::string m_session_name = "inference";
+    std::vector<std::string> m_keys;
+};
 } // namespace
 
 // ============================================================================
@@ -732,8 +907,16 @@ std::optional<int> SPAFarmTaskPlugin::read_number_rec(const cv::Mat& image, Box 
         return std::nullopt;
     }
 
-    // 与原实现 numrec 一致：只用识别模型读固定位置的数字，conf>=0.4 才采信，
-    // 失败退回检测+识别（read_number）。不做二值化/放大等额外预处理。
+    // 用原实现同款 RapidOCR(rec/onnxruntime) 读数字，模型与原实现一致
+    // （MAA 自带的 PaddleOCR rec）。引擎不可用时回退 MAA 的 fastdeploy rec。
+    const auto rapid = RapidRecEngine::instance().recognize(image(roi));
+    if (rapid.has_value() && rapid->second >= 0.4) {
+        const std::string digits = extract_digits(rapid->first);
+        if (!digits.empty()) {
+            return std::atoi(digits.c_str());
+        }
+    }
+
     std::string text;
     double score = 0.0;
     const auto results = WordOcr::get_instance().recognize(image(roi), true, std::nullopt);

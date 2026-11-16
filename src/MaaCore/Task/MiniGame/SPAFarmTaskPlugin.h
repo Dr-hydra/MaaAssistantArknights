@@ -117,6 +117,8 @@ private:
     std::optional<OcrItem> find(const std::vector<OcrItem>& items, const std::vector<std::string>& keywords) const;
     std::optional<int> read_number(const cv::Mat& image, Box box) const;
     std::optional<int> read_number_rec(const cv::Mat& image, Box box) const;
+    // 用原实现同款 RapidOCR(rec/onnxruntime) 读小图数字，返回 (文本, 置信度)
+    std::optional<std::pair<std::string, double>> rapid_rec_text(const cv::Mat& crop) const;
     int passed_count(const std::vector<OcrItem>& panel) const;
     std::string strategy_name(const std::vector<OcrItem>& panel) const;
     static std::string join_text(const std::vector<OcrItem>& items);
