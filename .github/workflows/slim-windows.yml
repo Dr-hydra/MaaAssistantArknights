@@ -22,6 +22,9 @@ jobs:
   build:
     name: Windows x64
     runs-on: windows-2025-vs2026
+    env:
+      # sccache 走 GitHub Actions 缓存后端，跨 run 复用目标文件
+      SCCACHE_GHA_ENABLED: "true"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -46,16 +49,39 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: python3 tools/maadeps-download.py x64-windows
 
+      - name: Setup sccache
+        id: sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+        continue-on-error: true
+
       - name: Configure CMake
-        run: cmake -B build --preset windows-publish-x64 -DMAA_HASH_VERSION='0.0.1'
+        shell: bash
+        run: |
+          launcher=""
+          if command -v sccache >/dev/null 2>&1; then
+            launcher="-DCMAKE_C_COMPILER_LAUNCHER=sccache -DCMAKE_CXX_COMPILER_LAUNCHER=sccache"
+            echo "sccache: $(sccache --version | head -1)"
+          else
+            echo "::warning::sccache 不可用，本次为全量编译"
+          fi
+          # RelWithDebInfo 默认 /Zi，sccache 无法安全缓存；改 /Z7（Embedded）后目标文件可复用。
+          # 产物不含 pdb，对 drop-in 包无影响。
+          cmake -B build --preset windows-publish-x64 \
+            -DMAA_HASH_VERSION='0.0.1' \
+            -DCMAKE_MSVC_DEBUG_INFORMATION_FORMAT=Embedded \
+            $launcher
 
       - name: Build MaaCore
         run: cmake --build build --config RelWithDebInfo --target MaaCore --parallel $env:NUMBER_OF_PROCESSORS
 
-      - name: Build apphost and updater
-        run: |
-          cmake --build build --config RelWithDebInfo --target MaaAppHostStub --parallel $env:NUMBER_OF_PROCESSORS
-          cmake --build build --config RelWithDebInfo --target MAA.Updater --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Build apphost
+        run: cmake --build build --config RelWithDebInfo --target MaaAppHostStub --parallel $env:NUMBER_OF_PROCESSORS
+
+      - name: sccache stats
+        if: always()
+        continue-on-error: true
+        shell: bash
+        run: sccache --show-stats || true
 
       - name: Generate global.json
         shell: bash

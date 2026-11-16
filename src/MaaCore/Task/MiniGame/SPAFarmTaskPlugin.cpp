@@ -17,6 +17,7 @@
 #include <set>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
@@ -62,6 +63,13 @@ constexpr std::pair<int, int> ReadyPoint { 1780, 170 };
 
 constexpr int LeaveTimeoutSec = 30;
 constexpr int StallTimeoutSec = 600;
+
+// Win32 注入是异步投递、没有内置节拍：按下后立刻移动、整段 move 在毫秒级发完时，
+// 游戏按帧采样不到中间轨迹，会把「按住拖拽」判成一次点击。原实现走 adb
+// `input motionevent`，每条命令本身就有几十到上百毫秒开销，天然满足节拍。
+// 这里显式补回等价时序，判定逻辑不变。
+constexpr int DragDownHoldMs = 300;
+constexpr int DragMoveStepMs = 50;
 
 constexpr int TouchDown = static_cast<int>(InputEvent::Type::TOUCH_DOWN);
 constexpr int TouchUp = static_cast<int>(InputEvent::Type::TOUCH_UP);
@@ -559,6 +567,10 @@ void SPAFarmTaskPlugin::touch_event(int type, int x, int y) const
     InputEvent commit;
     commit.type = InputEvent::Type::COMMIT;
     ctrler()->inject_input_event(commit);
+
+    if (type == TouchDown) {
+        sleep(DragDownHoldMs);
+    }
 }
 
 void SPAFarmTaskPlugin::click_at(int x, int y, double wait_sec) const
@@ -575,11 +587,13 @@ void SPAFarmTaskPlugin::swipe_to(int x1, int y1, int x2, int y2, int duration_ms
 
 void SPAFarmTaskPlugin::drag_path(int x1, int y1, int x2, int y2, int steps) const
 {
+    const auto start = std::chrono::steady_clock::now();
     for (int k = 1; k <= steps; ++k) {
         const double ratio = static_cast<double>(k) / steps;
         const int cx = static_cast<int>(x1 + (x2 - x1) * ratio);
         const int cy = static_cast<int>(y1 + (y2 - y1) * ratio);
         touch_event(TouchMove, cx, cy);
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(DragMoveStepMs * k));
     }
 }
 
@@ -1984,7 +1998,7 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& image_in)
         card_dump += "[" + std::to_string(card.index) + (card.empty ? "空" : "") + " 费" + opt_str(card.cost) +
                      (card.high_tier ? " 高" : "") + (card.is_operator ? " 人" : " 备") + " " + card.name + "]";
     }
-    report_log("卡牌: " + card_dump);
+    report_log("卡牌(UPX=" + std::to_string(m_up_x) + "): " + card_dump);
 
     // 第一阶段：Round 1 先买 2 个干员
     if (board.round_done < 0 && round == 1) {
