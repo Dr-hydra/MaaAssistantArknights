@@ -86,14 +86,19 @@ jobs:
         shell: bash
         run: cp build/bin/RelWithDebInfo/MaaAppHostStub.exe install/MAA.exe
 
-      - name: Upload install folder
+      - name: Prepare drop-in files
+        shell: bash
+        run: |
+          mkdir -p dropin/resource/tasks/MiniGame
+          cp install/MaaCore.dll dropin/
+          cp install/MAA.dll dropin/
+          cp install/MAA.exe dropin/
+          cp install/resource/tasks/MiniGame/SPA.json dropin/resource/tasks/MiniGame/
+          ls -l dropin
+
+      - name: Upload drop-in files
         uses: actions/upload-artifact@v7
         with:
-          name: MAA-slim-win-x64
-          path: |
-            install/**
-            !install/*.pdb
-            !install/**/*.pdb
-            !install/msvc-debug/**
-            !install/*.h
-          compression-level: 6
+          name: MAA-spa-dropin-win-x64
+          path: dropin/**
+          compression-level: 9
