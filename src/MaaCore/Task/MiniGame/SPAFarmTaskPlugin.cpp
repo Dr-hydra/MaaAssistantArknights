@@ -1545,8 +1545,12 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
         }
     }
 
-    const bool picked = !tabs.empty() || !drag_name(image).empty() ||
-                        find(ocr(image, Box { 0, 262, 330, 380 }), { "LV" }).has_value() || any_green;
+    const std::string drag_label = drag_name(image);
+    const bool has_lv = find(ocr(image, Box { 0, 262, 330, 380 }), { "LV" }).has_value();
+    const bool picked = !tabs.empty() || !drag_label.empty() || has_lv || any_green;
+    report_log(
+        "拿起判定: tabs=" + std::to_string(tabs.size()) + " 名称=" + (drag_label.empty() ? "-" : drag_label) +
+        " LV=" + (has_lv ? "1" : "0") + " 绿格=" + (any_green ? "1" : "0") + " -> " + (picked ? "已拿起" : "未拿起"));
     if (!picked) {
         touch_event(TouchUp, lx, ly);
         sleep(800);
@@ -1659,6 +1663,9 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
         report_log("没有可用位置，留在备战席: " + (name.empty() ? std::string("?") : name));
         return std::nullopt;
     }
+    report_log(
+        "目标格: " + target + " 换下=" + (swap_out.has_value() ? swap_out->first : std::string("-")) + " 可放置数=" +
+        (slots_before.has_value() ? std::to_string(*slots_before) : std::string("?")));
 
     const auto [tx, ty] = tile_xy(target);
     drag_path(lx, ly, tx, ty, 10);
@@ -1885,6 +1892,10 @@ bool SPAFarmTaskPlugin::buy_and_deploy(Board& board, int index, int tier, std::o
     }
     const cv::Mat after = capture();
     const auto slot = new_bench_slot(before, after);
+    report_log(
+        "购买[" + std::to_string(index) + "] 备战席差分: " +
+        (slot.has_value() ? ("(" + std::to_string(slot->first) + ", " + std::to_string(slot->second) + ")")
+                          : std::string("未检测到")));
     if (!slot.has_value()) {
         report_log("没找到新买的干员（可能合成晋升了）");
         handle_popups();
