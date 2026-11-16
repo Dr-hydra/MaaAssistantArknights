@@ -74,8 +74,10 @@ jobs:
       - name: Build MaaCore
         run: cmake --build build --config RelWithDebInfo --target MaaCore --parallel $env:NUMBER_OF_PROCESSORS
 
-      - name: Build apphost
-        run: cmake --build build --config RelWithDebInfo --target MaaAppHostStub --parallel $env:NUMBER_OF_PROCESSORS
+      - name: Build apphost and updater
+        run: |
+          cmake --build build --config RelWithDebInfo --target MaaAppHostStub --parallel $env:NUMBER_OF_PROCESSORS
+          cmake --build build --config RelWithDebInfo --target MAA.Updater --parallel $env:NUMBER_OF_PROCESSORS
 
       - name: sccache stats
         if: always()
