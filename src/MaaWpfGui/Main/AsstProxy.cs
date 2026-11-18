@@ -4043,8 +4043,10 @@ public class AsstProxy
     /// <param name="lowProfile">低配模式（不需要自选编队）。</param>
     /// <param name="targetClears">单个策略需要通关的次数，3 = 金色角标，6 = 彩色角标。</param>
     /// <param name="maxRuns">最多通关局数。</param>
+    /// <param name="goal">目标："medal" 刷策略徽章，"task-1".."task-7" 对应七条任务线。</param>
+    /// <param name="mode">对局模式："quick" 极速模拟，"standard" 标准模拟（medal 目标由插件强制 quick）。</param>
     /// <returns>是否成功启动。</returns>
-    public bool AsstSPAFarm(bool lowProfile, int targetClears, int maxRuns)
+    public bool AsstSPAFarm(bool lowProfile, int targetClears, int maxRuns, string goal = "medal", string mode = "quick")
     {
         var task = new AsstCustomTask {
             CustomTasks = ["MiniGame@SPA@BadgeFarm"],
@@ -4053,6 +4055,8 @@ public class AsstProxy
                     low_profile = lowProfile,
                     target_clears = targetClears,
                     max_runs = maxRuns,
+                    goal,
+                    mode,
                 },
             }),
         };

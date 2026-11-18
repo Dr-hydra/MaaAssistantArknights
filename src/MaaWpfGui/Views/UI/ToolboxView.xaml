@@ -1370,6 +1370,23 @@
                                         ItemsSource="{Binding SPAModeList}"
                                         SelectedValue="{Binding SPAMode}"
                                         SelectedValuePath="Value" />
+                                    <ComboBox
+                                        Margin="0,10,0,0"
+                                        hc:TitleElement.Title="{DynamicResource Toolbox.MiniGame.SPA.Goal}"
+                                        DisplayMemberPath="Display"
+                                        ItemsSource="{Binding SPAGoalList}"
+                                        SelectedValue="{Binding SPAGoal}"
+                                        SelectedValuePath="Value"
+                                        Visibility="{c:Binding IsSPABadgeMode}" />
+                                    <ComboBox
+                                        Margin="0,10,0,0"
+                                        hc:TitleElement.Title="{DynamicResource Toolbox.MiniGame.SPA.SimMode}"
+                                        DisplayMemberPath="Display"
+                                        IsEnabled="{c:Binding CanChooseSPASimMode}"
+                                        ItemsSource="{Binding SPASimModeList}"
+                                        SelectedValue="{Binding SPASimMode}"
+                                        SelectedValuePath="Value"
+                                        Visibility="{c:Binding IsSPABadgeMode}" />
                                     <CheckBox
                                         Margin="0,10,0,0"
                                         Content="{DynamicResource Toolbox.MiniGame.SPA.LowProfile}"

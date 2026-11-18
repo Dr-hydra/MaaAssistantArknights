@@ -4,9 +4,11 @@
 #include <chrono>
 #include <cmath>
 #include <fstream>
+#include <functional>
 #include <numeric>
 #include <queue>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <thread>
 
@@ -17,6 +19,7 @@
 #include "Controller/Controller.h"
 #include "Status.h"
 #include "Utils/Logger.hpp"
+#include "Vision/MaskedCcoeffMatcher.h"
 
 namespace asst
 {
@@ -27,18 +30,12 @@ namespace
 constexpr double kLeaveTimeoutSec = 30.0;
 constexpr double kStallTimeoutSec = 600.0;
 
-// Authoritative medal stackers (`ht` in service.pretty.mjs lines 7855-7869) + quick stackers
-const std::vector<std::string> kQuickStackers = {
-    "伺夜", "空弦", "黑键", "雪猎", "旅骨", "霍尔海雅",
-    "迷迭香", "鸿雪", "Miss.Christine", "溯光星源", "逻各斯", "夕",
-    "巡林者", "克洛丝", "安德切尔", "蓝毒", "守林人", "寒芒克洛丝",
-    "史都华德", "远山", "天火", "夜烟", "莫斯提马", "特米米"
-};
+// `ht` in service.pretty.mjs L7855-7868 —— 严格 12 个，不得增补。
+// `en()` 在 goal=="medal" 时直接取 `ua.stackers`，多出来的名字会改变选人与刷新判断。
 
-// Authoritative medal finishers (`er` in service.pretty.mjs lines 7870-7875) + quick finishers
+// `er` in service.pretty.mjs L7869-7870 —— 严格 4 个
 const std::vector<std::string> kQuickFinishers = {
-    "蕾缪安", "塔露拉", "艾雅法拉", "维伊",
-    "维什戴尔", "逻各斯", "迷迭香", "澄闪"
+    "蕾缪安", "塔露拉", "艾雅法拉", "维伊"
 };
 
 const std::vector<std::string> kAuxiliaryNames = {
@@ -186,6 +183,304 @@ std::string extract_digits_mapped(std::string_view s)
     return out;
 }
 
+// ===========================================================================
+// 图像原语 —— 严格对齐 service.pretty.mjs 里 sharp 的语义
+//   qe(x).extract({left,top,width,height})          -> img_crop
+//   .resize(w,h,{kernel:"cubic"})                   -> img_resize_cubic
+//   .resize({height, kernel:"cubic"})               -> img_resize_h_cubic
+//   .extend({top,bottom,left,right,bg:"#000"})      -> img_extend_black
+//   .grayscale() / .greyscale()                     -> img_gray
+//   .clahe({width,height,maxSlope})                 -> img_clahe
+//   .extractChannel("red").linear(a,b).toColourspace("srgb") -> img_red_linear
+//   .removeAlpha().raw().toBuffer()                 -> img_to_rgb（RGB 通道序，与 JS 一致）
+// 说明：参考实现所有坐标基准都是 1920x1080，本层只负责像素，不做任何坐标换算。
+// ===========================================================================
+
+struct RawRgb
+{
+    std::vector<uint8_t> data;
+    int width = 0;
+    int height = 0;
+    int channels = 3;
+};
+
+cv::Mat img_crop(const cv::Mat& img, int left, int top, int width, int height)
+{
+    if (img.empty() || width <= 0 || height <= 0) {
+        return {};
+    }
+    const int x = std::clamp(left, 0, std::max(0, img.cols - 1));
+    const int y = std::clamp(top, 0, std::max(0, img.rows - 1));
+    const int w = std::min(width, img.cols - x);
+    const int h = std::min(height, img.rows - y);
+    if (w <= 0 || h <= 0) {
+        return {};
+    }
+    return img(cv::Rect(x, y, w, h)).clone();
+}
+
+cv::Mat img_resize_cubic(const cv::Mat& img, int width, int height)
+{
+    if (img.empty() || width <= 0 || height <= 0) {
+        return {};
+    }
+    if (img.cols == width && img.rows == height) {
+        return img.clone();
+    }
+    cv::Mat out;
+    cv::resize(img, out, cv::Size(width, height), 0.0, 0.0, cv::INTER_CUBIC);
+    return out;
+}
+
+cv::Mat img_resize_h_cubic(const cv::Mat& img, int height)
+{
+    if (img.empty() || height <= 0) {
+        return {};
+    }
+    const double scale = static_cast<double>(height) / static_cast<double>(img.rows);
+    const int width = std::max(1, static_cast<int>(std::lround(static_cast<double>(img.cols) * scale)));
+    return img_resize_cubic(img, width, height);
+}
+
+cv::Mat img_extend_black(const cv::Mat& img, int top, int bottom, int left, int right)
+{
+    if (img.empty()) {
+        return {};
+    }
+    cv::Mat out;
+    cv::copyMakeBorder(img, out, top, bottom, left, right, cv::BORDER_CONSTANT, cv::Scalar(0, 0, 0));
+    return out;
+}
+
+cv::Mat img_gray(const cv::Mat& img)
+{
+    if (img.empty()) {
+        return {};
+    }
+    if (img.channels() == 1) {
+        return img.clone();
+    }
+    cv::Mat out;
+    cv::cvtColor(img, out, img.channels() == 4 ? cv::COLOR_BGRA2GRAY : cv::COLOR_BGR2GRAY);
+    return out;
+}
+
+cv::Mat img_gray_to_bgr(const cv::Mat& gray)
+{
+    if (gray.empty()) {
+        return {};
+    }
+    if (gray.channels() == 3) {
+        return gray.clone();
+    }
+    cv::Mat out;
+    cv::cvtColor(gray, out, cv::COLOR_GRAY2BGR);
+    return out;
+}
+
+cv::Mat img_clahe(const cv::Mat& gray, int tile_w, int tile_h, double max_slope)
+{
+    if (gray.empty()) {
+        return {};
+    }
+    cv::Mat g = img_gray(gray);
+    // sharp 的 clahe({width,height}) 是**瓦片像素尺寸**；OpenCV 的 tileGridSize 是**瓦片个数**
+    const int grid_x = std::max(1, g.cols / std::max(1, tile_w));
+    const int grid_y = std::max(1, g.rows / std::max(1, tile_h));
+    cv::Ptr<cv::CLAHE> clahe = cv::createCLAHE(max_slope, cv::Size(grid_x, grid_y));
+    cv::Mat out;
+    clahe->apply(g, out);
+    return img_gray_to_bgr(out);
+}
+
+// sharp 的 extractChannel("red").linear(a, b)：单通道 out = clamp(a*R + b)
+cv::Mat img_red_linear(const cv::Mat& img, double a, double b)
+{
+    if (img.empty()) {
+        return {};
+    }
+    cv::Mat bgr;
+    if (img.channels() == 4) {
+        cv::cvtColor(img, bgr, cv::COLOR_BGRA2BGR);
+    }
+    else if (img.channels() == 1) {
+        cv::cvtColor(img, bgr, cv::COLOR_GRAY2BGR);
+    }
+    else {
+        bgr = img;
+    }
+    cv::Mat out(bgr.rows, bgr.cols, CV_8UC3);
+    for (int y = 0; y < bgr.rows; ++y) {
+        const auto* src = bgr.ptr<cv::Vec3b>(y);
+        auto* dst = out.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; ++x) {
+            const int r = src[x][2];
+            const int v = std::clamp(static_cast<int>(std::lround(a * r + b)), 0, 255);
+            dst[x] = cv::Vec3b(static_cast<uint8_t>(v), static_cast<uint8_t>(v), static_cast<uint8_t>(v));
+        }
+    }
+    return out;
+}
+
+// .removeAlpha().raw()：输出 RGB 序（JS 侧 R,G,B 就是 data[i], data[i+1], data[i+2]）
+RawRgb img_to_rgb(const cv::Mat& img)
+{
+    RawRgb out;
+    if (img.empty()) {
+        return out;
+    }
+    cv::Mat bgr;
+    if (img.channels() == 4) {
+        cv::cvtColor(img, bgr, cv::COLOR_BGRA2BGR);
+    }
+    else if (img.channels() == 1) {
+        cv::cvtColor(img, bgr, cv::COLOR_GRAY2BGR);
+    }
+    else {
+        bgr = img;
+    }
+    out.width = bgr.cols;
+    out.height = bgr.rows;
+    out.channels = 3;
+    out.data.resize(static_cast<size_t>(bgr.cols) * bgr.rows * 3);
+    for (int y = 0; y < bgr.rows; ++y) {
+        const auto* row = bgr.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < bgr.cols; ++x) {
+            const size_t o = (static_cast<size_t>(y) * bgr.cols + x) * 3;
+            out.data[o + 0] = row[x][2];
+            out.data[o + 1] = row[x][1];
+            out.data[o + 2] = row[x][0];
+        }
+    }
+    return out;
+}
+
+// ===========================================================================
+// 文本原语 —— 严格对齐 service.pretty.mjs
+//   rt(a)      L5055  去掉空白与标点，其余字符全部保留（不做繁简转换）
+//   Jr(a)      L5063  去重 + 按长度降序
+//   Fi(a,s)    L5074  字符袋交集 / max(len)
+//   vi(a,s)    L5080  整串模糊匹配（长度差<=1，>=0.66，并列视为歧义）
+//   xr(a,s)    L5087  按 token 贪心前缀匹配 + 兜底 vi
+//   yi(a,s)    L5139  覆盖率
+// ===========================================================================
+
+bool is_rt_punct(const std::string& ch)
+{
+    if (ch.size() == 1) {
+        const unsigned char c = static_cast<unsigned char>(ch[0]);
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+            return true;
+        }
+    }
+    static const std::unordered_set<std::string> kPunct = {
+        "·", "・", ".", "。", ",", "，", ":", "：", "'", "\"", "“", "”", "‘", "’",
+        "(", ")", "（", "）", "【", "】", "[", "]", "<", ">", "《", "》", "|", "\\",
+        "/", "_", "-", "—", "~", "～", "!", "！", "?", "？", "\u3000"
+    };
+    return kPunct.count(ch) > 0;
+}
+
+// `rt`：只删标点/空白，其余原样保留
+std::string strip_punct(std::string_view s)
+{
+    std::string out;
+    for (const auto& ch : split_utf8_chars(s)) {
+        if (!is_rt_punct(ch)) {
+            out += ch;
+        }
+    }
+    return out;
+}
+
+// `.replace(/\s/g, "")`：只删空白
+std::string strip_ws(std::string_view s)
+{
+    std::string out;
+    for (const auto& ch : split_utf8_chars(s)) {
+        if (ch.size() == 1) {
+            const unsigned char c = static_cast<unsigned char>(ch[0]);
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v') {
+                continue;
+            }
+        }
+        if (ch == "\u3000") {
+            continue;
+        }
+        out += ch;
+    }
+    return out;
+}
+
+int utf8_len(std::string_view s)
+{
+    int n = 0;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char c = static_cast<unsigned char>(s[i]);
+        size_t len = 1;
+        if ((c & 0x80) == 0) {
+            len = 1;
+        }
+        else if ((c & 0xE0) == 0xC0) {
+            len = 2;
+        }
+        else if ((c & 0xF0) == 0xE0) {
+            len = 3;
+        }
+        else if ((c & 0xF8) == 0xF0) {
+            len = 4;
+        }
+        i += std::min(len, s.size() - i);
+        ++n;
+    }
+    return n;
+}
+
+bool regex_test(const std::string& text, const std::string& pattern)
+{
+    try {
+        const std::regex re(pattern, std::regex::ECMAScript);
+        return std::regex_search(text, re);
+    }
+    catch (const std::regex_error&) {
+        Log.error("SPAFarm | 非法正则", pattern);
+        return false;
+    }
+}
+
+// 返回第一个整体匹配；对应 JS 的 `s.match(/re/)?.[0]`
+std::optional<std::string> regex_first(const std::string& text, const std::string& pattern)
+{
+    try {
+        const std::regex re(pattern, std::regex::ECMAScript);
+        std::smatch m;
+        if (std::regex_search(text, m, re) && !m.empty()) {
+            return m[0].str();
+        }
+    }
+    catch (const std::regex_error&) {
+        Log.error("SPAFarm | 非法正则", pattern);
+    }
+    return std::nullopt;
+}
+
+// 返回第一个捕获组；对应 JS 的 `m[1]`
+std::optional<std::string> regex_first_group(const std::string& text, const std::string& pattern)
+{
+    try {
+        const std::regex re(pattern, std::regex::ECMAScript);
+        std::smatch m;
+        if (std::regex_search(text, m, re) && m.size() > 1) {
+            return m[1].str();
+        }
+    }
+    catch (const std::regex_error&) {
+        Log.error("SPAFarm | 非法正则", pattern);
+    }
+    return std::nullopt;
+}
+
+
 } // namespace
 
 // ============================================================================
@@ -210,13 +505,125 @@ bool SPAFarmTaskPlugin::set_params(const json::value& params)
         m_profile = *lp ? "low" : "full";
     }
     if (auto g = params.find<std::string>("goal"); g && !g->empty()) {
-        m_goal = *g;
+        // 只接受 `pr` 里存在的 id，其余回落 medal（`Bs` 的 `pr.some(...) ? goal : "medal"`）
+        const bool known = (*g == "medal")
+            || std::any_of(kGoalTasks.begin(), kGoalTasks.end(), [&](const GoalTaskSpec& t) { return t.id == *g; });
+        m_goal = known ? *g : "medal";
     }
-    int target_val = params.get("target", params.get("target_clears", 3));
-    m_target = (target_val >= 6) ? 6 : 3;
+    apply_goal_bonds();
+    // `Bs`：`Number(medalWins) === 6 ? 6 : 3`
+    int target_val = params.get("medalWins", params.get("target", params.get("target_clears", 3)));
+    m_target = (target_val == 6) ? 6 : 3;
+    m_verify_upgrade = params.get("verifyUpgrade", params.get("verify_upgrade", false));
     m_runs = std::max(1, params.get("runs", params.get("max_runs", 20)));
+    if (auto mode = params.find<std::string>("mode"); mode && !mode->empty()) {
+        set_mode(*mode);
+    }
+    else {
+        set_mode(m_goal == "medal" ? "quick" : m_mode); // `Bs` L8541：medal 强制 quick
+    }
     m_attempts = std::max(0, params.get("attempts", 0));
     return true;
+}
+
+void SPAFarmTaskPlugin::apply_goal_bonds()
+{
+    // `en(goal, ...)`：medal → {精准, 奥术}；task-N → `pr` 里的 bonds（L7864-7916）
+    if (m_goal == "medal") {
+        m_active_core_bonds = { "精准", "奥术" };
+        rebuild_stacker_names();
+        return;
+    }
+    for (const auto& t : kGoalTasks) {
+        if (t.id == m_goal) {
+            m_active_core_bonds = t.bonds;
+            rebuild_stacker_names();
+            return;
+        }
+    }
+    m_active_core_bonds = { "精准", "奥术" };
+}
+
+// `la(a, s)` —— service.pretty.mjs L7914-7923
+//   名单 = 特质里同时满足「含 层数+N」与下列任一条件的干员（保持 chess 原序）：
+//     · 文本里出现 `【目标盟约】`
+//     · 通用表述：层数最多的盟约 / 所有已激活盟约 / 已激活盟约层数 / 身前一格 / 身后一格 / 整备区每名干员已激活的盟约
+//     · 「自身已激活的盟约」且该干员自己带目标盟约（`w`）
+bool SPAFarmTaskPlugin::trait_mentions_stacking(
+    const OperatorInfo& op,
+    const std::vector<std::string>& bonds)
+{
+    const bool has_goal_bond = std::any_of(bonds.begin(), bonds.end(), [&](const std::string& b) {
+        return std::find(op.bond_names.begin(), op.bond_names.end(), b) != op.bond_names.end();
+    });
+    for (const auto& tr : op.traits) {
+        const std::string t = strip_ws(tr.text);
+        if (!std::regex_search(t, std::regex(R"(层数\+\d)", std::regex::ECMAScript))) {
+            continue;
+        }
+        bool hit = false;
+        for (const auto& b : bonds) {
+            if (t.find("【" + b + "】") != std::string::npos) {
+                hit = true;
+                break;
+            }
+        }
+        if (!hit) {
+            static const std::vector<std::string> kGeneric = {
+                "层数最多的盟约", "所有已激活盟约", "已激活盟约层数",
+                "身前一格", "身后一格", "整备区每名干员已激活的盟约"
+            };
+            for (const auto& g : kGeneric) {
+                if (t.find(g) != std::string::npos) {
+                    hit = true;
+                    break;
+                }
+            }
+        }
+        if (!hit && t.find("自身已激活的盟约") != std::string::npos && has_goal_bond) {
+            hit = true;
+        }
+        if (hit) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void SPAFarmTaskPlugin::rebuild_stacker_names()
+{
+    // `en(a, s)` L7955-7963：`ht` = medal ? `ua.stackers` : `la(目标盟约, chess)`
+    static const std::vector<std::string> kMedalStackers = {
+        "伺夜", "空弦", "黑键", "雪猎", "旅骨", "霍尔海雅",
+        "迷迭香", "鸿雪", "Miss.Christine", "溯光星源", "逻各斯", "夕"
+    };
+    m_stacker_list.clear();
+    if (m_goal == "medal" || m_operators.empty()) {
+        m_stacker_list = kMedalStackers;
+    }
+    else {
+        for (const auto& op : m_operators) {
+            if (trait_mentions_stacking(op, m_active_core_bonds)) {
+                m_stacker_list.push_back(op.name);
+            }
+        }
+    }
+    m_stacker_names.clear();
+    for (const auto& n : m_stacker_list) {
+        m_stacker_names.insert(n);
+    }
+}
+
+bool SPAFarmTaskPlugin::in_stacker_list(std::string_view name) const
+{
+    if (m_stacker_names.empty()) {
+        static const std::unordered_set<std::string> kFallback = {
+            "伺夜", "空弦", "黑键", "雪猎", "旅骨", "霍尔海雅",
+            "迷迭香", "鸿雪", "Miss.Christine", "溯光星源", "逻各斯", "夕"
+        };
+        return kFallback.count(std::string(name)) > 0;
+    }
+    return m_stacker_names.count(std::string(name)) > 0;
 }
 
 void SPAFarmTaskPlugin::set_profile(bool low_profile)
@@ -255,12 +662,15 @@ void SPAFarmTaskPlugin::reset_match_state()
     m_recent_bought_names.clear();
     m_bought_items.clear();
     m_current_boss.clear();
-    m_equip_slots.clear();
-    m_unit_equipped_bond.clear();
+    m_equip_patch_cache.clear();
+    m_equip_name_cache.clear();
+    m_overflow_equip_units.clear();
+    m_equip_drag_missed = false;
     m_unit_equipped_count.clear();
     m_mob_used_this_round = false;
     m_pager_used_round = -1;
     m_active_core_bonds = { "精准", "奥术" };
+    apply_goal_bonds();
 }
 
 // ============================================================================
@@ -583,36 +993,24 @@ void SPAFarmTaskPlugin::report_task_summary(const std::string& stop_reason, bool
 std::vector<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::ocr(
     const cv::Mat& img,
     const std::optional<std::array<int, 4>>& roi_xywh,
-    bool pad_replicate) const
+    bool /*pad_replicate*/) const
 {
+    // `bt(a) = post_recognition("OCR", s ? {roi:s} : {}, png)` —— 带检测的全图识别。
+    // 参考实现从不做边界 padding：需要留白的地方（`Jn`/`Mt`/`Bi`）都是自己 extend 黑边。
     if (img.empty()) {
         return {};
     }
     cv::Mat work;
     int ox = 0;
     int oy = 0;
-
     if (roi_xywh.has_value()) {
         auto [rx, ry, rw, rh] = *roi_xywh;
-        int x1 = std::clamp(rx, 0, img.cols);
-        int y1 = std::clamp(ry, 0, img.rows);
-        int x2 = std::clamp(rx + rw, 0, img.cols);
-        int y2 = std::clamp(ry + rh, 0, img.rows);
-        if (x2 <= x1 || y2 <= y1) {
+        work = img_crop(img, rx, ry, rw, rh);
+        if (work.empty()) {
             return {};
         }
-        cv::Mat crop = img(cv::Rect(x1, y1, x2 - x1, y2 - y1));
-        if (pad_replicate) {
-            constexpr int P = 40;
-            cv::copyMakeBorder(crop, work, P, P, P, P, cv::BORDER_REPLICATE);
-            ox = x1 - P;
-            oy = y1 - P;
-        }
-        else {
-            work = crop.clone();
-            ox = x1;
-            oy = y1;
-        }
+        ox = std::clamp(rx, 0, img.cols);
+        oy = std::clamp(ry, 0, img.rows);
     }
     else {
         work = img;
@@ -622,12 +1020,17 @@ std::vector<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::ocr(
     std::vector<OcrItem> out;
     out.reserve(raw_res.size());
     for (const auto& it : raw_res) {
-        std::string txt = normalize_variants(it.text);
-        int bx = ox + it.rect.x;
-        int by = oy + it.rect.y;
-        double cx = bx + it.rect.width * 0.5;
-        double cy = by + it.rect.height * 0.5;
-        out.push_back(OcrItem { cx, cy, bx, by, it.rect.width, it.rect.height, std::move(txt), it.score });
+        const int bx = ox + it.rect.x;
+        const int by = oy + it.rect.y;
+        out.push_back(OcrItem {
+            bx + it.rect.width * 0.5,
+            by + it.rect.height * 0.5,
+            bx,
+            by,
+            it.rect.width,
+            it.rect.height,
+            it.text,
+            it.score });
     }
     return out;
 }
@@ -638,63 +1041,67 @@ std::vector<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::ocr_rec_only(
     int upscale,
     int black_border) const
 {
+    // `yr(a, roi)` = post_recognition("OCR", {roi, only_rec:true}) —— 只跑识别、不做检测。
+    // 注意：返回的 rect 必须是**文本框**（原实现错误地填成了整个 ROI）。
     if (img.empty()) {
         return {};
     }
     auto [rx, ry, rw, rh] = roi_xywh;
-    int x1 = std::clamp(rx, 0, img.cols);
-    int y1 = std::clamp(ry, 0, img.rows);
-    int x2 = std::clamp(rx + rw, 0, img.cols);
-    int y2 = std::clamp(ry + rh, 0, img.rows);
-    if (x2 <= x1 || y2 <= y1) {
+    cv::Mat crop = img_crop(img, rx, ry, rw, rh);
+    if (crop.empty()) {
         return {};
     }
-    cv::Mat crop = img(cv::Rect(x1, y1, x2 - x1, y2 - y1)).clone();
+    const int x1 = std::clamp(rx, 0, img.cols);
+    const int y1 = std::clamp(ry, 0, img.rows);
+    cv::Mat work = crop;
     if (upscale > 1) {
-        cv::resize(crop, crop, cv::Size((x2 - x1) * upscale, (y2 - y1) * upscale), 0.0, 0.0, cv::INTER_CUBIC);
+        work = img_resize_cubic(work, work.cols * upscale, work.rows * upscale);
     }
     if (black_border > 0) {
-        cv::copyMakeBorder(
-            crop,
-            crop,
-            black_border,
-            black_border,
-            black_border,
-            black_border,
-            cv::BORDER_CONSTANT,
-            cv::Scalar(0, 0, 0));
+        work = img_extend_black(work, black_border, black_border, black_border, black_border);
     }
-    auto raw_res = WordOcr::get_instance().recognize(crop, true);
+    const double inv = (upscale > 1) ? (1.0 / upscale) : 1.0;
+    const int pad = black_border;
+
+    auto raw_res = WordOcr::get_instance().recognize(work, true);
     std::vector<OcrItem> out;
     out.reserve(raw_res.size());
     for (const auto& it : raw_res) {
-        std::string txt = normalize_variants(it.text);
+        const double bx = x1 + (it.rect.x - pad) * inv;
+        const double by = y1 + (it.rect.y - pad) * inv;
+        const double bw = it.rect.width * inv;
+        const double bh = it.rect.height * inv;
         out.push_back(OcrItem {
-            x1 + (x2 - x1) * 0.5,
-            y1 + (y2 - y1) * 0.5,
-            x1,
-            y1,
-            x2 - x1,
-            y2 - y1,
-            std::move(txt),
+            bx + bw * 0.5,
+            by + bh * 0.5,
+            static_cast<int>(std::lround(bx)),
+            static_cast<int>(std::lround(by)),
+            static_cast<int>(std::lround(bw)),
+            static_cast<int>(std::lround(bh)),
+            it.text,
             it.score });
     }
     return out;
 }
 
-// Exact 1:1 port of `Te = (a, s) => a.texts.find(e => e.score >= .55 && s.test(e.text.replace(/\s/g, "")))`
-// Outer loop iterates `keywords` in caller-specified priority order so high-priority button texts
-// are matched before fallback keywords, and enforces `it.score >= 0.55`.
+// `Te = (a, s) => a.texts.find(e => e.score >= .55 && s.test(e.text.replace(/\s/g, "")))`
+// 语义要点：① **按 OCR 结果顺序**取第一条命中的（不是按关键字优先级）；
+//           ② 只删空白，不删标点；③ score 门限 0.55。
+// 因此多关键字等价于一条 `A|B` 正则，这里把 items 放外层、keywords 放内层即可等价。
 std::optional<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::find_ocr(
     const std::vector<OcrItem>& items,
     std::initializer_list<std::string_view> keywords)
 {
-    for (std::string_view kw : keywords) {
-        if (kw.empty()) {
+    for (const auto& it : items) {
+        if (it.score < 0.55) {
             continue;
         }
-        for (const auto& it : items) {
-            if (it.score >= 0.55 && it.text.find(kw) != std::string::npos) {
+        const std::string text = strip_ws(it.text);
+        for (std::string_view kw : keywords) {
+            if (kw.empty()) {
+                continue;
+            }
+            if (text.find(kw) != std::string::npos) {
                 return it;
             }
         }
@@ -702,17 +1109,49 @@ std::optional<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::find_ocr(
     return std::nullopt;
 }
 
+// 正则版 `Te`：对应 JS 里 `/^升级$/`、`/返回主页|模拟结束/` 这类写法
+static std::optional<SPAFarmTaskPlugin::OcrItem> find_text_regex(
+    const std::vector<SPAFarmTaskPlugin::OcrItem>& items,
+    const std::string& pattern)
+{
+    std::regex re;
+    try {
+        re = std::regex(pattern, std::regex::ECMAScript);
+    }
+    catch (const std::regex_error&) {
+        Log.error("SPAFarm | 非法正则", pattern);
+        return std::nullopt;
+    }
+    for (const auto& it : items) {
+        if (it.score < 0.55) {
+            continue;
+        }
+        if (std::regex_search(strip_ws(it.text), re)) {
+            return it;
+        }
+    }
+    return std::nullopt;
+}
+
+[[maybe_unused]] static bool has_text_regex(const std::vector<SPAFarmTaskPlugin::OcrItem>& items, const std::string& pattern)
+{
+    return find_text_regex(items, pattern).has_value();
+}
+
 std::optional<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::find_ocr_exact(
     const std::vector<OcrItem>& items,
     std::initializer_list<std::string_view> exact_keywords)
 {
-    for (std::string_view kw : exact_keywords) {
-        std::string target = norm_text(kw);
-        if (target.empty()) {
+    for (const auto& it : items) {
+        if (it.score < 0.55) {
             continue;
         }
-        for (const auto& it : items) {
-            if (it.score >= 0.55 && norm_text(it.text) == target) {
+        const std::string text = strip_ws(it.text);
+        for (std::string_view kw : exact_keywords) {
+            if (kw.empty()) {
+                continue;
+            }
+            if (text == kw) {
                 return it;
             }
         }
@@ -728,15 +1167,16 @@ std::optional<SPAFarmTaskPlugin::OcrItem> SPAFarmTaskPlugin::find_ocr_in_roi(
     int x1,
     int y1)
 {
-    for (std::string_view kw : keywords) {
-        if (kw.empty()) {
+    for (const auto& it : items) {
+        if (it.score < 0.55 || it.cx < x0 || it.cx > x1 || it.cy < y0 || it.cy > y1) {
             continue;
         }
-        for (const auto& it : items) {
-            if (it.score < 0.55 || it.cx < x0 || it.cx > x1 || it.cy < y0 || it.cy > y1) {
+        const std::string text = strip_ws(it.text);
+        for (std::string_view kw : keywords) {
+            if (kw.empty()) {
                 continue;
             }
-            if (it.text.find(kw) != std::string::npos) {
+            if (text.find(kw) != std::string::npos) {
                 return it;
             }
         }
@@ -760,14 +1200,9 @@ bool SPAFarmTaskPlugin::has_ocr_exact(
 
 std::string SPAFarmTaskPlugin::norm_text(std::string_view sv)
 {
-    std::string norm_v = normalize_variants(sv);
-    std::string out;
-    for (const auto& ch : split_utf8_chars(norm_v)) {
-        if (is_cjk_or_alnum_cp(ch)) {
-            out += ch;
-        }
-    }
-    return out;
+    // `rt(a)` L5055：只删空白与标点，其余字符（含 ×、+、拉丁扩展）全部保留。
+    // 注意：不做繁简/异体转换 —— 参考实现的转换只出现在 `mt`（策略名比对）里。
+    return strip_punct(sv);
 }
 
 std::unordered_map<std::string, int> SPAFarmTaskPlugin::char_bag(std::string_view norm_sv)
@@ -800,20 +1235,18 @@ double SPAFarmTaskPlugin::bag_similarity(
 
 std::vector<SPAFarmTaskPlugin::DictEntry> SPAFarmTaskPlugin::build_dict(const std::vector<std::string>& names)
 {
-    std::set<std::string> uniq(names.begin(), names.end());
+    // `Jr(a)` L5063：`[...new Set([...a].map(rt).filter(Boolean))]`，再按长度降序
+    std::set<std::string> uniq;
+    for (const auto& name : names) {
+        std::string n = strip_punct(name);
+        if (!n.empty()) {
+            uniq.insert(n);
+        }
+    }
     std::vector<DictEntry> dict;
     dict.reserve(uniq.size());
-    for (const auto& name : uniq) {
-        std::string n = norm_text(name);
-        if (n.empty()) {
-            continue;
-        }
-        auto chars = split_utf8_chars(n);
-        dict.push_back(DictEntry {
-            name,
-            n,
-            static_cast<int>(chars.size()),
-            char_bag(n) });
+    for (const auto& n : uniq) {
+        dict.push_back(DictEntry { n, n, utf8_len(n), char_bag(n) });
     }
     std::sort(dict.begin(), dict.end(), [](const DictEntry& a, const DictEntry& b) {
         return a.len > b.len;
@@ -823,97 +1256,197 @@ std::vector<SPAFarmTaskPlugin::DictEntry> SPAFarmTaskPlugin::build_dict(const st
 
 std::vector<SPAFarmTaskPlugin::DictMatch> SPAFarmTaskPlugin::match_dict(
     std::string_view text,
-    const std::vector<DictEntry>& dict)
+    const std::vector<DictEntry>& dict,
+    bool fuzzy)
 {
-    // Exact 1:1 port of `xr(a, s, e = .66)` in service.pretty.mjs lines 5058-5133
-    std::string norm = norm_text(text);
-    auto chars = split_utf8_chars(norm);
-    const int total_len = static_cast<int>(chars.size());
-    if (total_len == 0) {
-        return {};
+    // `xr(a, s, {fuzzy:true})` —— service.pretty.mjs L5087-5133
+    //
+    // 原实现（逐行）：
+    //   for (const w of a.matchAll(/\S+/g)) {          // 按 token 切
+    //     const m = rt(w[0]); if (!m) continue;
+    //     if (s.set.has(m)) { push(整段精确); continue; }
+    //     let l = false, E = 0;
+    //     while (E < m.length) {                       // 贪心前缀推进
+    //       let d = null;
+    //       for (const g of s.names) if (g.length >= 2 && m.startsWith(g, E)) { d = g; break; }
+    //       d ? (push(d), E += d.length, l = true) : E++;
+    //     }
+    //     if (!l && fuzzy) { const d = vi(m, s); d && push(d); }
+    //   }
+    //
+    // 差异说明：返回值 start/end 采用**归一化后的字符下标**（JS 用的是原串下标）。
+    // 本项目内所有消费方（`yi` 覆盖率、`Bi` token 定位）都在归一化空间里用，等价。
+
+    std::vector<DictMatch> out;
+    if (dict.empty()) {
+        return out;
     }
 
-    auto slice_chars = [&](int start, int end) {
-        std::string s;
-        for (int i = start; i < end && i < total_len; ++i) {
-            s += chars[i];
+    // 1) 切成 token，同时去掉标点（保留 token 边界）
+    struct TokenChar
+    {
+        std::string ch;
+        int token = 0;
+    };
+    std::vector<TokenChar> nc;
+    int token = -1;
+    bool in_token = false;
+    for (const auto& ch : split_utf8_chars(text)) {
+        const bool ws = (ch.size() == 1
+                         && (ch[0] == ' ' || ch[0] == '\t' || ch[0] == '\n' || ch[0] == '\r' || ch[0] == '\f'
+                             || ch[0] == '\v'))
+            || ch == "\u3000";
+        if (ws) {
+            in_token = false;
+            continue;
         }
-        return s;
+        if (!in_token) {
+            ++token;
+            in_token = true;
+        }
+        if (is_rt_punct(ch)) {
+            continue;
+        }
+        nc.push_back(TokenChar { ch, token });
+    }
+    if (nc.empty()) {
+        return out;
+    }
+
+    std::unordered_map<std::string, int> name_len;
+    name_len.reserve(dict.size());
+    for (const auto& d : dict) {
+        name_len.emplace(d.norm, d.len);
+    }
+
+    // `vi(a, s)` L5080：整串模糊匹配，长度差 <= 1，得分 >= 0.66，并列视为歧义
+    auto fuzzy_pick = [&](const std::vector<std::string>& chars) -> const DictEntry* {
+        const int alen = static_cast<int>(chars.size());
+        if (alen < 2) {
+            return nullptr;
+        }
+        std::unordered_map<std::string, int> bag;
+        for (const auto& c : chars) {
+            ++bag[c];
+        }
+        const DictEntry* best = nullptr;
+        double best_v = 0.0;
+        bool ambiguous = false;
+        for (const auto& d : dict) {
+            if (std::abs(d.len - alen) > 1) {
+                continue;
+            }
+            int common = 0;
+            for (const auto& [ch, cnt] : bag) {
+                auto it = d.bag.find(ch);
+                if (it != d.bag.end()) {
+                    common += std::min(cnt, it->second);
+                }
+            }
+            const double v = static_cast<double>(common) / static_cast<double>(std::max(alen, d.len));
+            if (v > best_v) {
+                best = &d;
+                best_v = v;
+                ambiguous = false;
+            }
+            else if (v == best_v) {
+                ambiguous = true;
+            }
+        }
+        if (best != nullptr && best_v >= 0.66 && !ambiguous) {
+            return best;
+        }
+        return nullptr;
     };
 
-    std::vector<DictMatch> candidates;
-    for (const auto& d : dict) {
-        // 1. Exact substring search
-        for (int pos = 0; pos + d.len <= total_len;) {
-            if (slice_chars(pos, pos + d.len) == d.norm) {
-                candidates.push_back(DictMatch { d.name, d.len, pos, pos + d.len, 1.0, true });
-                pos += d.len;
+    size_t i = 0;
+    while (i < nc.size()) {
+        const int tk = nc[i].token;
+        size_t j = i;
+        while (j < nc.size() && nc[j].token == tk) {
+            ++j;
+        }
+
+        std::vector<std::string> tok_chars;
+        tok_chars.reserve(j - i);
+        for (size_t k = i; k < j; ++k) {
+            tok_chars.push_back(nc[k].ch);
+        }
+        std::string tok;
+        for (const auto& c : tok_chars) {
+            tok += c;
+        }
+
+        auto whole = name_len.find(tok);
+        if (whole != name_len.end()) {
+            out.push_back(DictMatch {
+                tok,
+                whole->second,
+                static_cast<int>(i),
+                static_cast<int>(j),
+                1.0,
+                true });
+            i = j;
+            continue;
+        }
+
+        bool matched = false;
+        size_t pos = 0;
+        while (pos < tok_chars.size()) {
+            const DictEntry* hit = nullptr;
+            for (const auto& d : dict) {
+                if (d.len < 2) {
+                    continue;
+                }
+                // startsWith(g, pos)：按字符比较
+                bool prefix = true;
+                const auto dchars = split_utf8_chars(d.norm);
+                if (pos + dchars.size() > tok_chars.size()) {
+                    continue;
+                }
+                for (size_t k = 0; k < dchars.size(); ++k) {
+                    if (tok_chars[pos + k] != dchars[k]) {
+                        prefix = false;
+                        break;
+                    }
+                }
+                if (prefix) {
+                    hit = &d;
+                    break;
+                }
+            }
+            if (hit != nullptr) {
+                const int dlen = hit->len;
+                out.push_back(DictMatch {
+                    hit->name,
+                    dlen,
+                    static_cast<int>(i + pos),
+                    static_cast<int>(i + pos + dlen),
+                    1.0,
+                    true });
+                pos += static_cast<size_t>(dlen);
+                matched = true;
             }
             else {
                 ++pos;
             }
         }
-        if (d.len < 2) {
-            continue;
-        }
-        // 2. Fuzzy character-bag window search (`vi >= 0.66`)
-        DictMatch best_fuzzy;
-        bool has_fuzzy = false;
-        const int min_w = std::max(2, d.len - 1);
-        const int max_w = std::min(total_len, d.len + 1);
-        for (int w = min_w; w <= max_w; ++w) {
-            for (int pos = 0; pos + w <= total_len; ++pos) {
-                std::string sub = slice_chars(pos, pos + w);
-                if (sub == d.norm) {
-                    continue;
-                }
-                double sim = bag_similarity(char_bag(sub), w, d.bag, d.len);
-                if (sim >= 0.66 && (!has_fuzzy || sim > best_fuzzy.score)) {
-                    best_fuzzy = DictMatch { d.name, d.len, pos, pos + w, sim, false };
-                    has_fuzzy = true;
-                }
+
+        if (!matched && fuzzy) {
+            if (const DictEntry* fz = fuzzy_pick(tok_chars)) {
+                out.push_back(DictMatch {
+                    fz->name,
+                    fz->len,
+                    static_cast<int>(i),
+                    static_cast<int>(j),
+                    0.66,
+                    false });
             }
         }
-        if (has_fuzzy) {
-            candidates.push_back(best_fuzzy);
-        }
+        i = j;
     }
 
-    std::sort(candidates.begin(), candidates.end(), [](const DictMatch& a, const DictMatch& b) {
-        if (a.exact != b.exact) {
-            return a.exact > b.exact;
-        }
-        if (std::abs(a.score - b.score) > 1e-6) {
-            return a.score > b.score;
-        }
-        if (a.len != b.len) {
-            return a.len > b.len;
-        }
-        return a.start < b.start;
-    });
-
-    std::vector<uint8_t> used(total_len, 0);
-    std::vector<DictMatch> selected;
-    for (const auto& m : candidates) {
-        bool overlap = false;
-        for (int i = m.start; i < m.end; ++i) {
-            if (used[i]) {
-                overlap = true;
-                break;
-            }
-        }
-        if (!overlap) {
-            for (int i = m.start; i < m.end; ++i) {
-                used[i] = 1;
-            }
-            selected.push_back(m);
-        }
-    }
-
-    std::sort(selected.begin(), selected.end(), [](const DictMatch& a, const DictMatch& b) {
-        return a.start < b.start;
-    });
-    return selected;
+    return out;
 }
 
 double SPAFarmTaskPlugin::match_coverage(std::string_view text, const std::vector<DictMatch>& matches)
@@ -1173,6 +1706,8 @@ bool SPAFarmTaskPlugin::load_all_data()
                 b.name = jb.get("name", std::string());
                 b.norm_name = norm_text(b.name);
                 b.is_core = jb.get("isCore", false);
+                b.stackable = jb.get("stackable", false);
+                b.inverse = jb.get("inverse", false);
                 b.count_mode = jb.get("countMode", std::string("FIELD_ONLY"));
                 b.max_Active = jb.get("activeCount", 6);
                 b.desc = jb.get("desc", std::string());
@@ -1217,16 +1752,69 @@ bool SPAFarmTaskPlugin::load_all_data()
                 op.elite = false;
                 op.golden = false;
                 op.profession = jc.get("profession", std::string());
-                op.sub_profession_id = jc.get("subProfessionId", std::string());
+                // 资源实际字段是 `subProfession`；`subProfessionId` 只是历史别名
+                op.sub_profession_id = jc.get("subProfession", jc.get("subProfessionId", std::string()));
                 op.position = jc.get("position", std::string("MELEE"));
-                op.purchase_price = jc.get("purchasePrice", 2);
-                op.sell_price = jc.get("sellPrice", 1);
-                op.trait_text = jc.get("traitText", std::string());
+                // 资源实际字段是 `price` / `soldPrice`
+                op.purchase_price = jc.get("price", jc.get("purchasePrice", 2));
+                op.sell_price = jc.get("soldPrice", jc.get("sellPrice", 1));
+                op.self_heal = jc.get("selfHeal", false);
+                op.heals_allies = jc.get("healsAllies", false);
                 if (auto st = jc.find<json::object>("stats"); st) {
                     op.atk = st->get("atk", 0);
                     op.def = st->get("def", 0);
-                    op.max_hp = st->get("maxHp", 0);
-                    op.block_cnt = st->get("blockCnt", 1);
+                    op.max_hp = st->get("hp", st->get("maxHp", 0));
+                    op.block_cnt = st->get("block", st->get("blockCnt", 1));
+                    op.res = st->get("res", 0);
+                    op.bat = st->get("bat", 0.0);
+                }
+                // `traits[]`：文本 + tags（Nt 的 front1/back1/around4/… 全靠 tags）
+                if (auto traits = jc.find<json::array>("traits"); traits) {
+                    for (const auto& jt : *traits) {
+                        if (!jt.is_object()) {
+                            continue;
+                        }
+                        OperatorTrait tr;
+                        tr.id = jt.get("id", std::string());
+                        tr.text = jt.get("text", std::string());
+                        if (auto tags = jt.find<json::array>("tags"); tags) {
+                            for (const auto& tag : *tags) {
+                                if (tag.is_string()) {
+                                    tr.tags.push_back(tag.as_string());
+                                }
+                            }
+                        }
+                        if (op.trait_text.empty()) {
+                            op.trait_text = tr.text;
+                        }
+                        else {
+                            op.trait_text += " " + tr.text;
+                        }
+                        op.traits.push_back(std::move(tr));
+                    }
+                }
+                if (op.trait_text.empty()) {
+                    op.trait_text = jc.get("traitText", std::string());
+                }
+                if (auto rng = jc.find<json::array>("rangeGrid"); rng) {
+                    for (const auto& cell : *rng) {
+                        if (!cell.is_array()) {
+                            continue;
+                        }
+                        const auto& arr = cell.as_array();
+                        if (arr.size() >= 2) {
+                            op.range_grid.emplace_back(
+                                static_cast<int>(arr[0].as_integer()),
+                                static_cast<int>(arr[1].as_integer()));
+                        }
+                    }
+                }
+                if (auto bids = jc.find<json::array>("bonds"); bids) {
+                    for (const auto& v : *bids) {
+                        if (v.is_string()) {
+                            op.bond_ids.push_back(v.as_string());
+                        }
+                    }
                 }
                 if (auto bnames = jc.find<json::array>("bondNames"); bnames) {
                     for (const auto& v : *bnames) {
@@ -1236,7 +1824,9 @@ bool SPAFarmTaskPlugin::load_all_data()
                     }
                 }
                 op.stack_info = parse_stack_trait(op.trait_text);
-                op.base_range = default_range_for_subprof(op.sub_profession_id, op.position);
+                op.base_range = op.range_grid.empty()
+                    ? default_range_for_subprof(op.sub_profession_id, op.position)
+                    : op.range_grid;
                 op.can_block_air = (op.name == "琉璃");
                 op.is_healer = (op.profession == "MEDIC" || op.sub_profession_id == "bard" || op.sub_profession_id == "guardian");
                 op.facing_independent = (
@@ -1281,23 +1871,13 @@ bool SPAFarmTaskPlugin::load_all_data()
                     continue;
                 }
                 ItemInfo it;
-                it.id = ji.get("id", std::string());
+                it.id = ji.get("chessId", std::string());
                 it.name = ji.get("name", std::string());
                 it.norm_name = norm_text(it.name);
                 it.tier = ji.get("tier", 1);
                 it.price = ji.get("price", 2);
-                it.effect = ji.get("effect", std::string());
-                for (const auto& b : m_bonds) {
-                    if (it.effect.find("[" + b.name + "]") != std::string::npos
-                        && it.effect.find("获得") != std::string::npos) {
-                        it.granted_bond_name = b.name;
-                        it.granted_bond_id = b.bond_id;
-                        break;
-                    }
-                }
-                it.category = classify_item_category(it.name, it.effect);
-                it.is_debuff = (it.category == "debuff")
-                    || (it.effect.find("晕眩") != std::string::npos && it.effect.find("携带者") != std::string::npos);
+                // 资源里的装备描述字段是 `desc`（对应 JS `An(a)` 里的 `a.desc`）
+                it.effect = ji.get("desc", std::string());
                 if (!it.norm_name.empty() && m_item_by_norm.find(it.norm_name) == m_item_by_norm.end()) {
                     m_item_by_norm[it.norm_name] = m_items.size();
                     m_items.push_back(std::move(it));
@@ -1307,6 +1887,18 @@ bool SPAFarmTaskPlugin::load_all_data()
 
         // 4. Load farm-rules.json
         if (auto j_rules = read_json_file(data_dir / "farm-rules.json"); j_rules && j_rules->is_object()) {
+            if (auto shop = j_rules->find<json::object>("shop"); shop) {
+                for (const auto& [key, val] : *shop) {
+                    (void)key;
+                    if (!val.is_object()) {
+                        continue;
+                    }
+                    const int lv = val.get("shopLevel", 0);
+                    if (lv > 0) {
+                        m_shop_upgrade_costs[lv] = val.get("initialUpgradePrice", 0);
+                    }
+                }
+            }
             if (auto strats = j_rules->find<json::array>("strategies"); strats) {
                 m_strategies.clear();
                 for (const auto& js : *strats) {
@@ -1332,6 +1924,14 @@ bool SPAFarmTaskPlugin::load_all_data()
                 st.name = jst.get("name", std::string());
                 st.width = jst.get("width", 13);
                 st.height = jst.get("height", 7);
+                if (auto special = jst.find<json::array>("special"); special) {
+                    for (const auto& sp : *special) {
+                        if (!sp.is_object() || sp.get("tileKey", std::string()) != "tile_infection") {
+                            continue;
+                        }
+                        st.infection_tiles.emplace_back(sp.get("r", 0), sp.get("c", 0));
+                    }
+                }
                 if (auto r_arr = jst.find<json::array>("rows"); r_arr) {
                     for (const auto& rv : *r_arr) {
                         if (rv.is_string()) {
@@ -1386,6 +1986,26 @@ bool SPAFarmTaskPlugin::load_all_data()
                     m_board_refs.push_back(std::move(entry));
                 }
             }
+        }
+
+        // 6b. `he` 的 6 个 TemplateMatch 模板（badge_l1..l6.png，纯绿背景由 green_mask 掩掉）
+        m_badge_templates.clear();
+        for (int tier = 1; tier <= 6; ++tier) {
+            const auto p = data_dir / "image" / ("badge_l" + std::to_string(tier) + ".png");
+            std::error_code ec;
+            if (!std::filesystem::exists(p, ec)) {
+                Log.warn("SPAFarm | missing badge template", p.string());
+                continue;
+            }
+            cv::Mat t = cv::imread(p.string(), cv::IMREAD_COLOR);
+            if (t.empty()) {
+                Log.warn("SPAFarm | failed to load badge template", p.string());
+                continue;
+            }
+            m_badge_templates.push_back(std::move(t));
+        }
+        if (m_badge_templates.size() != 6) {
+            Log.warn("SPAFarm | badge templates incomplete:", m_badge_templates.size());
         }
 
         // 7. Load bosses.json & enemy-types.json
@@ -1785,8 +2405,8 @@ SPAFarmTaskPlugin::CameraDetectResult SPAFarmTaskPlugin::detect_camera(
     // 1:1 port of `Hn` (service.pretty.mjs L4526-4557) + `Sr` (L4584-4684).
     //
     // 旧实现与原实现的三处偏离，均已改正：
-    //   1. marker 可用条件只有 `n >= max(150, 0.5 * markerRefN)`；没有 [0.35, 2.5] 区间，
-    //      也没有 allow_goal_only 时把 E 放宽到 0.2 的特例；
+    //   1. marker 可用条件严格等于 `n >= 0.5 * markerRefN`（`Hn` L4531）；JS 没有 150 的下限，
+    //      也没有 [0.35, 2.5] 区间，也没有 allow_goal_only 时把 E 放宽到 0.2 的特例；
     //   2. 三个 marker 都可用且残差 > 15 时，剔除残差最大的一个再重拟合；
     //   3. 接受条件是 `|scale - 1| <= 0.025` 且 `|平移| <= 45px`
     //      （不是 scale in [0.85,1.15] + |angle| <= 8 度 + 残差 <= 10）；
@@ -1795,7 +2415,7 @@ SPAFarmTaskPlugin::CameraDetectResult SPAFarmTaskPlugin::detect_camera(
     {
         std::string_view id;
         std::array<double, 2> ref = { 0.0, 0.0 };
-        int ref_n = 1;
+        int ref_n = 0;
         int top = 110;
         bool blue = false;
     };
@@ -1816,7 +2436,7 @@ SPAFarmTaskPlugin::CameraDetectResult SPAFarmTaskPlugin::detect_camera(
         for (const auto& slot : slots) {
             auto det = detect_marker_centroid(img, slot.ref, slot.top, slot.blue ? "blue" : "red");
             const int n = det ? std::get<2>(*det) : 0;
-            const double need = std::max(150.0, 0.5 * static_cast<double>(slot.ref_n));
+            const double need = 0.5 * static_cast<double>(slot.ref_n); // `Hn` L4531
             const bool usable = det.has_value() && static_cast<double>(n) >= need;
             detail += std::string(slot.id) + "=";
             if (det) {
@@ -2095,7 +2715,7 @@ bool SPAFarmTaskPlugin::goal_only_allowed() const
     // `(!!info.boss || round === lastRound) && !!stageSource && stageSource !== "default"`
     // `turns` 表共 9 回合，第 9 回合为 Boss 回合（resource/SPAFarm/farm-rules.json）。
     constexpr int kLastRound = 9;
-    const bool boss_round = !m_current_boss.empty() || m_current_round >= kLastRound;
+    const bool boss_round = !m_current_boss.empty() || m_current_round == kLastRound; // `N(I) = I === lastRound`
     return boss_round && !m_stage_source.empty() && m_stage_source != "default";
 }
 
@@ -2421,19 +3041,111 @@ std::pair<std::optional<int>, bool> SPAFarmTaskPlugin::read_round_and_prep(
     return { round_num, is_prep };
 }
 
-std::optional<int> SPAFarmTaskPlugin::read_remaining_deploy(const cv::Mat& img) const
+std::optional<int> SPAFarmTaskPlugin::read_remaining_deploy(
+    const cv::Mat& img,
+    const std::vector<OcrItem>& items) const
 {
-    // Exact 1:1 port of `F(j)` in service.pretty.mjs lines 7265-7278
-    auto items = ocr(img, std::array<int, 4> { 750, 130, 420, 55 });
-    std::string joined;
+    // `Jn(a)` L4817-4825 + `Xn(a)` L4762-4785 —— 先走 OCR 回读，失败再退回纯文本解析
+    auto to_digit = [](const std::string& s) -> std::optional<int> {
+        if (s.size() != 1) {
+            return std::nullopt;
+        }
+        const char c = s[0];
+        if (c >= '0' && c <= '8') {
+            return c - '0';
+        }
+        if (c == 'O' || c == 'o' || c == '0') {
+            return 0;
+        }
+        return std::nullopt;
+    };
+
+    // ---- Jn ----
     for (const auto& it : items) {
-        joined += it.text;
+        const std::string t = strip_ws(it.text);
+        if (t.find("剩余可放置") == std::string::npos) {
+            continue;
+        }
+        const int w = std::max(0, static_cast<int>(std::lround(static_cast<double>(it.x) - 10.0)));
+        const int y0 = std::max(0, static_cast<int>(std::lround(static_cast<double>(it.y) - 4.0)));
+        const int width = 1918 - w;
+        const int height = static_cast<int>(std::lround(static_cast<double>(it.h) + 8.0));
+        cv::Mat crop = img_crop(img, w, y0, width, height);
+        if (crop.empty()) {
+            continue;
+        }
+        cv::Mat work = img_resize_cubic(img_gray(crop), width * 4, height * 4);
+        work = img_extend_black(work, 40, 40, 40, 40);
+        auto rec = ocr_rec_only(work, { 0, 0, work.cols, work.rows }, 1, 0);
+        std::string joined;
+        for (const auto& r : rec) {
+            joined += strip_ws(r.text);
+        }
+        // /剩余可放置角色[:：]?([0-8OoＯ〇])/
+        const std::string key = "剩余可放置角色";
+        const size_t pos = joined.find(key);
+        if (pos != std::string::npos) {
+            size_t i = pos + key.size();
+            if (i < joined.size() && (joined[i] == ':' || joined[i] == '：')) {
+                ++i;
+            }
+            if (i < joined.size()) {
+                const std::string one = joined.substr(i, 1);
+                if (one == "Ｏ" || one == "〇") {
+                    return 0;
+                }
+                if (auto d = to_digit(one)) {
+                    return d;
+                }
+            }
+        }
+        break;
     }
-    auto pos = joined.find("剩余可部署");
-    if (pos != std::string::npos) {
-        std::string d = extract_digits_mapped(joined.substr(pos));
-        if (!d.empty()) {
-            return d[0] - '0';
+
+    // ---- Xn(a.texts) ----
+    for (const auto& it : items) {
+        const std::string t = strip_ws(it.text);
+        const std::string key = "剩余可放置角色";
+        if (t.rfind(key, 0) != 0) {
+            continue;
+        }
+        std::string rest = t.substr(key.size());
+        if (!rest.empty() && (rest[0] == ':' || rest[0] == '：')) {
+            rest = rest.substr(1);
+        }
+        if (rest.size() == 1) {
+            if (rest == "Ｏ" || rest == "〇") {
+                return 0;
+            }
+            if (auto d = to_digit(rest)) {
+                return d;
+            }
+            continue;
+        }
+        if (!rest.empty()) {
+            continue;
+        }
+        // 标签与数字分开识别：数字在标签右边 40..60px 内，且垂直居中对齐
+        for (const auto& other : items) {
+            if (&other == &it) {
+                continue;
+            }
+            if (other.x < it.x + it.w - 40 || other.x > it.x + it.w + 60) {
+                continue;
+            }
+            if (std::abs((other.y + other.h * 0.5) - (it.y + it.h * 0.5)) >= it.h * 0.6) {
+                continue;
+            }
+            const std::string nt = strip_ws(other.text);
+            if (nt.size() != 1) {
+                continue;
+            }
+            if (nt == "Ｏ" || nt == "〇") {
+                return 0;
+            }
+            if (auto d = to_digit(nt)) {
+                return d;
+            }
         }
     }
     return std::nullopt;
@@ -2447,607 +3159,771 @@ std::optional<int> SPAFarmTaskPlugin::read_shop_digits_4x(
     const cv::Mat& img,
     const std::array<int, 4>& roi_xywh) const
 {
-    // Exact 1:1 port of `Kr(a, [s, e, t, f])` in service.pretty.mjs lines 4815-4824
-    auto items = ocr_rec_only(img, roi_xywh, 4, 0);
-    std::string digits;
-    for (const auto& it : items) {
-        digits += extract_digits_mapped(it.text);
-    }
-    if (digits.empty()) {
+    // `Kr(a, s)` —— service.pretty.mjs L4817-4825
+    //   [e,t,f,w] = s.map(round)
+    //   i = extract(...).resize(f*4, w*4)
+    //   m = yr(i, [0,0,f*4,w*4])
+    //        .filter(u => u.score > .7 || (u.score > .55 && /^[0OoＯ〇]$/.test(u.text.trim())))
+    //        .map(u => u.text.replace(/\s/g,"").replace(/^[OoＯ〇]$/,"0")).join("")
+    //   return /^\d{1,3}$/.test(m) ? Number(m) : null
+    const int x = static_cast<int>(std::lround(static_cast<double>(roi_xywh[0])));
+    const int y = static_cast<int>(std::lround(static_cast<double>(roi_xywh[1])));
+    const int w = static_cast<int>(std::lround(static_cast<double>(roi_xywh[2])));
+    const int h = static_cast<int>(std::lround(static_cast<double>(roi_xywh[3])));
+    cv::Mat crop = img_crop(img, x, y, w, h);
+    if (crop.empty()) {
         return std::nullopt;
     }
-    return std::stoi(digits);
+    cv::Mat big = img_resize_cubic(crop, crop.cols * 4, crop.rows * 4);
+    auto items = ocr_rec_only(big, { 0, 0, big.cols, big.rows }, 1, 0);
+
+    std::string joined;
+    for (const auto& it : items) {
+        const std::string t = strip_ws(it.text);
+        const bool single_zero = (t == "O" || t == "o" || t == "Ｏ" || t == "〇");
+        if (!(it.score > 0.7 || (it.score > 0.55 && single_zero))) {
+            continue;
+        }
+        joined += single_zero ? std::string("0") : t;
+    }
+    if (joined.empty() || joined.size() > 3) {
+        return std::nullopt;
+    }
+    for (char c : joined) {
+        if (c < '0' || c > '9') {
+            return std::nullopt;
+        }
+    }
+    return std::stoi(joined);
 }
 
 std::optional<int> SPAFarmTaskPlugin::recognize_shop_level_roman_cc(const cv::Mat& img, int up_x)
 {
-    // Exact 1:1 port of `Kn(a, s)` in service.pretty.mjs lines 4945-5033:
-    // Extracts [left: round(up_x - 55), top: 845, width: 110, height: 100] in grayscale,
-    // computes Otsu threshold, finds 4-connected bright components, and classifies each component
-    // into 'V' (if top 30% rows have >= 2 horizontal foreground runs in >= 3 rows) or 'I'.
-    if (img.empty()) {
+    // `Kn(a, s)` —— service.pretty.mjs L4945-5032，逐行对齐
+    //   f = round(s-55); extract({left:f, top:845, width:110, height:100}).greyscale().raw()
+    //   Otsu 求阈值 d；g = count(pixel > d)；n = g < len/2；n && (d = max(d,140))
+    //   y = X => n ? i[X] > d : i[X] <= d
+    //   4 邻域连通域，过滤 x0>1 && y0>1 && x1<108 && y1<98 && (y1-y0) >= (n?28:20) && 像素数>=80
+    //   按 x0 排序；空或 >3 → {null,null}
+    //   T(X): 统计 y0+2 .. y0+round((y1-y0)*.3) 里“至少两段游程”的行数，>=3 记为 V
+    //   拼成 I/II/... 查表
+    constexpr int W = 110;
+    constexpr int H = 100;
+    constexpr int TOP = 845;
+
+    const int left = static_cast<int>(std::lround(static_cast<double>(up_x) - 55.0));
+    cv::Mat crop = img_crop(img, left, TOP, W, H);
+    if (crop.empty()) {
         return std::nullopt;
     }
-    const int W = 110;
-    const int H = 100;
-    const int left = std::clamp(static_cast<int>(std::lround(up_x - 55)), 0, std::max(0, img.cols - W));
-    const int top = 845;
-    if (left + W > img.cols || top + H > img.rows) {
-        return std::nullopt;
+    cv::Mat gray = img_gray(crop);
+    if (gray.cols != W || gray.rows != H) {
+        cv::resize(gray, gray, cv::Size(W, H), 0.0, 0.0, cv::INTER_AREA);
     }
 
-    cv::Mat crop_bgr = img(cv::Rect(left, top, W, H));
-    cv::Mat gray;
-    cv::cvtColor(crop_bgr, gray, cv::COLOR_BGR2GRAY);
-
-    // Otsu threshold (`Kn` lines 4955-4972)
-    int hist[256] = {};
-    double sum_all = 0.0;
-    const int total_px = W * H;
+    std::vector<int> pix(static_cast<size_t>(W) * H);
+    int hist[256] = { 0 };
     for (int y = 0; y < H; ++y) {
-        const uint8_t* row = gray.ptr<uint8_t>(y);
+        const auto* row = gray.ptr<uint8_t>(y);
         for (int x = 0; x < W; ++x) {
-            hist[row[x]]++;
-            sum_all += row[x];
+            const int v = row[x];
+            pix[static_cast<size_t>(y) * W + x] = v;
+            ++hist[v];
         }
     }
-    int wB = 0;
-    double sumB = 0.0;
+    const int total = W * H;
+
+    // Otsu（与 JS 的类间方差写法一致）
+    double sum_all = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        sum_all += static_cast<double>(i) * hist[i];
+    }
+    double sum_b = 0.0;
+    int w_b = 0;
     double max_var = 0.0;
-    int otsu_t = 180;
+    int thr = 128;
     for (int t = 0; t < 256; ++t) {
-        wB += hist[t];
-        if (wB == 0) {
+        w_b += hist[t];
+        if (w_b == 0) {
             continue;
         }
-        int wF = total_px - wB;
-        if (wF == 0) {
+        const int w_f = total - w_b;
+        if (w_f == 0) {
             break;
         }
-        sumB += static_cast<double>(t) * hist[t];
-        const double mB = sumB / wB;
-        const double mF = (sum_all - sumB) / wF;
-        const double var_between = static_cast<double>(wB) * static_cast<double>(wF) * (mB - mF) * (mB - mF);
-        if (var_between > max_var) {
-            max_var = var_between;
-            otsu_t = t;
+        sum_b += static_cast<double>(t) * hist[t];
+        const double m_b = sum_b / w_b;
+        const double m_f = (sum_all - sum_b) / w_f;
+        const double var = static_cast<double>(w_b) * w_f * (m_b - m_f) * (m_b - m_f);
+        if (var > max_var) {
+            max_var = var;
+            thr = t;
         }
-    }
-    if (otsu_t < 100) {
-        return std::nullopt;
     }
 
-    std::vector<uint8_t> bin(total_px, 0);
-    for (int y = 0; y < H; ++y) {
-        const uint8_t* row = gray.ptr<uint8_t>(y);
-        for (int x = 0; x < W; ++x) {
-            if (row[x] > otsu_t) {
-                bin[y * W + x] = 1;
-            }
+    int bright = 0;
+    for (int v : pix) {
+        if (v > thr) {
+            ++bright;
         }
     }
+    const bool dark_fg = bright < total / 2;
+    if (dark_fg) {
+        thr = std::max(thr, 140);
+    }
+    auto is_fg = [&](int idx) {
+        return dark_fg ? pix[static_cast<size_t>(idx)] > thr : pix[static_cast<size_t>(idx)] <= thr;
+    };
 
     struct Comp
     {
         int x0 = W;
-        int y0 = H;
         int x1 = 0;
+        int y0 = H;
         int y1 = 0;
         int n = 0;
     };
 
-    std::vector<uint8_t> vis(total_px, 0);
-    std::vector<Comp> raw_comps;
-    for (int y = 0; y < H; ++y) {
-        for (int x = 0; x < W; ++x) {
-            int idx = y * W + x;
-            if (!bin[idx] || vis[idx]) {
-                continue;
-            }
-            Comp c;
-            std::vector<int> stack = { idx };
-            vis[idx] = 1;
-            while (!stack.empty()) {
-                int cur = stack.back();
-                stack.pop_back();
-                int cx = cur % W;
-                int cy = cur / W;
-                c.x0 = std::min(c.x0, cx);
-                c.x1 = std::max(c.x1, cx);
-                c.y0 = std::min(c.y0, cy);
-                c.y1 = std::max(c.y1, cy);
-                c.n++;
-                const int nbrs[4][2] = { { cx - 1, cy }, { cx + 1, cy }, { cx, cy - 1 }, { cx, cy + 1 } };
-                for (const auto& nb : nbrs) {
-                    int nx = nb[0], ny = nb[1];
-                    if (nx >= 0 && nx < W && ny >= 0 && ny < H) {
-                        int nidx = ny * W + nx;
-                        if (bin[nidx] && !vis[nidx]) {
-                            vis[nidx] = 1;
-                            stack.push_back(nidx);
-                        }
-                    }
+    std::vector<uint8_t> vis(static_cast<size_t>(W) * H, 0);
+    std::vector<Comp> comps;
+    std::vector<int> stack;
+    for (int idx = 0; idx < total; ++idx) {
+        if (!is_fg(idx) || vis[idx]) {
+            continue;
+        }
+        Comp c;
+        vis[idx] = 1;
+        stack.clear();
+        stack.push_back(idx);
+        while (!stack.empty()) {
+            const int cur = stack.back();
+            stack.pop_back();
+            const int q = cur % W;
+            const int p = (cur - q) / W;
+            ++c.n;
+            c.x0 = std::min(c.x0, q);
+            c.x1 = std::max(c.x1, q);
+            c.y0 = std::min(c.y0, p);
+            c.y1 = std::max(c.y1, p);
+            for (int z : { -1, 1, -W, W }) {
+                const int nxt = cur + z;
+                if (nxt < 0 || nxt >= total) {
+                    continue;
+                }
+                if (z == -1 && q == 0) {
+                    continue;
+                }
+                if (z == 1 && q == W - 1) {
+                    continue;
+                }
+                if (is_fg(nxt) && !vis[nxt]) {
+                    vis[nxt] = 1;
+                    stack.push_back(nxt);
                 }
             }
-            raw_comps.push_back(c);
         }
+        comps.push_back(c);
     }
 
-    auto filter_comps = [&](bool strict_h) {
-        std::vector<Comp> out;
-        for (const auto& c : raw_comps) {
-            if (c.x0 > 1 && c.y0 > 1 && c.x1 < W - 2 && c.y1 < H - 2
-                && (c.y1 - c.y0) >= (strict_h ? 28 : 20) && c.n >= 80) {
-                out.push_back(c);
-            }
+    std::vector<Comp> hits;
+    for (const auto& c : comps) {
+        if (c.x0 > 1 && c.y0 > 1 && c.x1 < 108 && c.y1 < 98
+            && (c.y1 - c.y0) >= (dark_fg ? 28 : 20) && c.n >= 80) {
+            hits.push_back(c);
         }
-        std::sort(out.begin(), out.end(), [](const Comp& a, const Comp& b) {
-            return a.x0 < b.x0;
-        });
-        return out;
-    };
-
-    auto comps = filter_comps(true);
-    if (comps.empty()) {
-        comps = filter_comps(false);
     }
-    if (comps.empty() || comps.size() > 3) {
+    std::sort(hits.begin(), hits.end(), [](const Comp& a, const Comp& b) {
+        return a.x0 < b.x0;
+    });
+    if (hits.empty() || hits.size() > 3) {
         return std::nullopt;
     }
 
-    int min_y0 = H, max_y1 = 0;
-    for (const auto& c : comps) {
-        min_y0 = std::min(min_y0, c.y0);
-        max_y1 = std::max(max_y1, c.y1);
-    }
-    if (max_y1 - min_y0 > 50) {
-        return std::nullopt;
-    }
-
-    std::string roman;
-    for (const auto& c : comps) {
-        int top_band_end = c.y0 + std::max(4, static_cast<int>(std::floor((c.y1 - c.y0) * 0.3)));
-        int two_stroke_rows = 0;
-        for (int y = c.y0; y <= top_band_end && y <= c.y1; ++y) {
+    auto is_v = [&](const Comp& c) {
+        int rows = 0;
+        const int end = c.y0 + static_cast<int>(std::lround(static_cast<double>(c.y1 - c.y0) * 0.3));
+        for (int y = c.y0 + 2; y <= end; ++y) {
             int runs = 0;
-            bool in_run = false;
+            bool prev = false;
             for (int x = c.x0; x <= c.x1; ++x) {
-                bool fg = bin[y * W + x] != 0;
-                if (fg && !in_run) {
+                const bool cur = is_fg(y * W + x);
+                if (cur && !prev) {
                     ++runs;
                 }
-                in_run = fg;
+                prev = cur;
             }
             if (runs >= 2) {
-                ++two_stroke_rows;
+                ++rows;
             }
         }
-        roman += (two_stroke_rows >= 3) ? "V" : "I";
+        return rows >= 3;
+    };
+
+    std::string name;
+    for (const auto& c : hits) {
+        name += is_v(c) ? "V" : "I";
     }
 
-    static const std::unordered_map<std::string, int> kRomanMap = {
-        { "I", 1 }, { "II", 2 }, { "III", 3 }, { "IV", 4 }, { "V", 5 }, { "VI", 6 }
+    static const std::unordered_map<std::string, int> kLevel = {
+        { "I", 1 },   { "II", 2 },  { "III", 3 },
+        { "IV", 4 },  { "V", 5 },   { "VI", 6 },
     };
-    auto it = kRomanMap.find(roman);
-    if (it != kRomanMap.end()) {
-        return it->second;
+    auto it = kLevel.find(name);
+    if (it == kLevel.end()) {
+        return std::nullopt;
     }
-    return std::nullopt;
+    return it->second;
 }
 
 SPAFarmTaskPlugin::ShopHeaderState SPAFarmTaskPlugin::read_shop_header(
     const cv::Mat& img,
     const std::vector<OcrItem>& full_items) const
 {
-    // Exact 1:1 port of `Rt(a)` in service.pretty.mjs lines 4826-4890
+    // `Rt(a)` —— service.pretty.mjs L4826-4890，逐行对齐（`pc` 恒为 false，见里程碑文件）
+    //   gold  = Kr([1767,776,66,32]) ?? Kr([1782,777,36,30])
+    //   f     = Te(/^升级$/)
+    //   !f && !Te(/^已满级$/) && Te(/收起/) → 对 x ∈ {337,580} 试 Kn，命中则合成升级按钮 (E,985)
+    //   !f → return {gold, upgradeCost:null, level: Te(/^已满级$/)?6:null}
+    //   i = 升级按钮中心 x；m = Kr([i-13,786,28,30])；u = Kn(i)
+    //   u.level 为空 → 取 [i-60,870,120,80] 放大 3x + 60 黑边做 rec，查 {IV,V,VI} 表
     ShopHeaderState st;
-    if (img.empty()) {
-        return st;
-    }
 
     st.gold = read_shop_digits_4x(img, { 1767, 776, 66, 32 });
-    if (!st.gold) {
+    if (!st.gold.has_value()) {
         st.gold = read_shop_digits_4x(img, { 1782, 777, 36, 30 });
     }
 
-    for (const auto& it : full_items) {
-        if (it.text == "刷新" || (it.text.find("刷新") != std::string::npos && it.x > 1600 && it.y > 600)) {
-            st.refresh_btn = { static_cast<int>(std::lround(it.cx)), static_cast<int>(std::lround(it.cy)) };
-            break;
-        }
-    }
+    const bool max_level = has_text_regex(full_items, "^已满级$");
+    std::optional<OcrItem> up = find_text_regex(full_items, "^升级$");
 
-    std::optional<OcrItem> up_item;
-    for (const auto& it : full_items) {
-        if (it.text == "升级" || (it.text.find("升级") != std::string::npos && it.y > 750 && it.x < 800)) {
-            up_item = it;
-            break;
-        }
-    }
-
-    const bool has_max_level = has_ocr(full_items, { "已满级", "满级" });
-    if (!up_item && has_ocr(full_items, { "收起" })) {
-        for (int probe_x : { 337, 580 }) {
-            if (auto lv = recognize_shop_level_roman_cc(img, probe_x)) {
-                st.level = lv;
-                return st;
+    if (!up.has_value() && !max_level && has_text_regex(full_items, "收起")) {
+        for (int probe : { 337, 580 }) {
+            if (recognize_shop_level_roman_cc(img, probe).has_value()) {
+                // JS: f = {text:"升级", score:.5, box:[E-26, 985-15, 52, 30]}，中心即 (E, 985)
+                OcrItem synth;
+                synth.text = "升级";
+                synth.score = 0.5;
+                synth.w = 52;
+                synth.h = 30;
+                synth.x = probe - 26;
+                synth.y = 985 - 15;
+                synth.cx = probe;
+                synth.cy = 985;
+                up = synth;
+                break;
             }
         }
-        if (has_max_level) {
-            st.level = 6;
-        }
+    }
+
+    if (!up.has_value()) {
+        st.level = max_level ? std::optional<int>(6) : std::nullopt;
         return st;
     }
 
-    if (!up_item) {
-        if (has_max_level) {
-            st.level = 6;
-        }
+    const int btn_x = static_cast<int>(std::lround(up->cx));
+    const int btn_y = static_cast<int>(std::lround(up->cy));
+    st.upgrade_btn = std::pair<int, int> { btn_x, btn_y };
+    st.upgrade_cost = read_shop_digits_4x(img, { btn_x - 13, 786, 28, 30 });
+
+    auto strokes = recognize_shop_level_roman_cc(img, btn_x);
+    if (strokes.has_value()) {
+        st.level = strokes;
+        st.rawLevel = "strokes:" + std::to_string(*strokes);
         return st;
     }
 
-    const int up_x = static_cast<int>(std::lround(up_item->cx));
-    const int up_y = static_cast<int>(std::lround(up_item->cy));
-    st.upgrade_btn = { up_x, up_y };
-    st.upgrade_cost = read_shop_digits_4x(img, { up_x - 13, 786, 28, 30 });
-    st.level = recognize_shop_level_roman_cc(img, up_x);
-
-    // Fallback OCR with 3x cubic resize + 60px black border (`Rt` lines 4862-4880)
-    if (!st.level) {
-        auto rec_items = ocr_rec_only(img, { std::max(0, up_x - 60), 870, 120, 80 }, 3, 60);
-        for (const auto& r : rec_items) {
-            if (r.text.find("IV") != std::string::npos || r.text.find("Ⅳ") != std::string::npos) {
-                st.level = 4;
-                break;
+    cv::Mat crop = img_crop(img, btn_x - 60, 870, 120, 80);
+    if (!crop.empty()) {
+        crop = img_resize_cubic(crop, 360, 240);
+        crop = img_extend_black(crop, 60, 60, 60, 60);
+        auto items = ocr_rec_only(crop, { 0, 0, crop.cols, crop.rows }, 1, 0);
+        std::string joined;
+        for (const auto& it : items) {
+            if (it.score > 0.6) {
+                joined += strip_ws(it.text);
             }
-            if (r.text.find("VI") != std::string::npos || r.text.find("Ⅵ") != std::string::npos) {
-                st.level = 6;
-                break;
-            }
-            if (r.text.find("V") != std::string::npos || r.text.find("Ⅴ") != std::string::npos) {
-                st.level = 5;
-                break;
-            }
-            if (r.text.find("III") != std::string::npos || r.text.find("Ⅲ") != std::string::npos) {
-                st.level = 3;
-                break;
-            }
-            if (r.text.find("II") != std::string::npos || r.text.find("Ⅱ") != std::string::npos) {
-                st.level = 2;
-                break;
-            }
-            if (r.text.find("I") != std::string::npos || r.text.find("Ⅰ") != std::string::npos) {
-                st.level = 1;
-                break;
-            }
+        }
+        st.rawLevel = joined;
+        static const std::unordered_map<std::string, int> kRoman = {
+            { "IV", 4 }, { "Ⅳ", 4 }, { "V", 5 }, { "Ⅴ", 5 }, { "VI", 6 }, { "Ⅵ", 6 },
+        };
+        auto it = kRoman.find(joined);
+        if (it != kRoman.end()) {
+            st.level = it->second;
         }
     }
     return st;
 }
 
-std::vector<int> SPAFarmTaskPlugin::detect_card_gaps(const cv::Mat& img)
+std::optional<SPAFarmTaskPlugin::CardGridFit> SPAFarmTaskPlugin::detect_card_gaps(const cv::Mat& img)
 {
-    // Exact 1:1 port of `Ci(a)` + `Di(a)` in service.pretty.mjs lines 5336-5389
-    if (img.empty() || img.cols < 1700 || img.rows < 1040) {
-        return {};
-    }
-    const int W = img.cols;
-    std::vector<double> col_luma(W, 0.0);
-    for (int x = 250; x < 1700; ++x) {
-        double s = 0.0;
-        for (int y = 800; y < 1040; ++y) {
-            const auto& p = img.at<cv::Vec3b>(y, x);
-            s += (p[2] + p[1] + p[0]) / 3.0;
+    // `Ci(a)` L5325-5351 + `Di(a)` L5352-5388，两段合并在一个函数里，避免多一次截图裁剪
+    //   Ci: extract({0,800,1920,240}).grayscale() → 列求和 → ±2 均值 / height
+    //   Di: 340..1719 找局部极大（±12 内无更大），且 (a[f-30]+a[f+30])/2 - a[f] > 18
+    //       p ∈ [205,250] step 0.5，phase 遍历 gaps，votes/err 取最优（votes 大优先，其次 err 小）
+    //       t 归一到 [330, 330+p)
+    std::vector<double> prof;
+    {
+        cv::Mat crop = img_crop(img, 0, 800, 1920, 240);
+        if (crop.empty()) {
+            return std::nullopt;
         }
-        col_luma[x] = s / 240.0;
-    }
-    std::vector<double> smooth(W, 0.0);
-    for (int x = 255; x < 1695; ++x) {
-        double s = 0.0;
-        for (int d = -3; d <= 3; ++d) {
-            s += col_luma[x + d];
+        cv::Mat gray = img_gray(crop);
+        if (gray.cols != 1920 || gray.rows != 240) {
+            cv::resize(gray, gray, cv::Size(1920, 240), 0.0, 0.0, cv::INTER_AREA);
         }
-        smooth[x] = s / 7.0;
-    }
-    std::vector<int> minima;
-    for (int x = 270; x < 1680; ++x) {
-        double m = 0.0;
-        for (int d = -25; d <= 25; ++d) {
-            m += smooth[x + d];
-        }
-        m /= 51.0;
-        if (smooth[x] < m - 18.0 && smooth[x] <= smooth[x - 1] && smooth[x] <= smooth[x + 1]) {
-            if (minima.empty() || x - minima.back() > 15) {
-                minima.push_back(x);
+        std::vector<double> col(1920, 0.0);
+        for (int y = 0; y < gray.rows; ++y) {
+            const auto* row = gray.ptr<uint8_t>(y);
+            for (int x = 0; x < 1920; ++x) {
+                col[x] += row[x];
             }
-            else if (smooth[x] < smooth[minima.back()]) {
-                minima.back() = x;
+        }
+        prof.resize(1920);
+        for (int x = 0; x < 1920; ++x) {
+            double sum = 0.0;
+            int cnt = 0;
+            for (int d = -2; d <= 2; ++d) {
+                const int idx = x + d;
+                if (idx >= 0 && idx < 1920) {
+                    sum += col[idx];
+                    ++cnt;
+                }
             }
+            prof[x] = (cnt > 0) ? (sum / cnt / gray.rows) : 0.0;
         }
     }
 
-    int best_p = 243;
-    int best_f = 0;
-    int best_votes = 0;
-    double best_score = 1e9;
-    for (int p = 205; p <= 250; ++p) {
-        for (int f : minima) {
-            if (f < 330) {
+    std::vector<int> gaps;
+    for (int f = 340; f < 1720; ++f) {
+        bool is_max = true;
+        for (int i = -12; i <= 12; ++i) {
+            const int idx = f + i;
+            if (idx < 0 || idx >= 1920) {
                 continue;
             }
+            if (prof[idx] < prof[f]) {
+                is_max = false;
+                break;
+            }
+        }
+        if (!is_max) {
+            continue;
+        }
+        const int lo = std::max(0, f - 30);
+        const int hi = std::min(1919, f + 30);
+        if ((prof[lo] + prof[hi]) / 2.0 - prof[f] > 18.0) {
+            gaps.push_back(f);
+        }
+    }
+    if (gaps.empty()) {
+        return std::nullopt;
+    }
+
+    struct Fit
+    {
+        double p = 0.0;
+        int phase = 0;
+        int votes = 0;
+        double err = 0.0;
+        bool valid = false;
+    };
+    Fit best;
+    for (double p = 205.0; p <= 250.0; p += 0.5) {
+        for (int w : gaps) {
             int votes = 0;
             double err = 0.0;
-            for (int k = 0; k < 6; ++k) {
-                int target = f + k * p;
-                if (target > 1680) {
-                    break;
-                }
-                int nearest = -1;
-                int dist = 9999;
-                for (int m : minima) {
-                    if (std::abs(m - target) < dist) {
-                        dist = std::abs(m - target);
-                        nearest = m;
-                    }
-                }
-                if (nearest >= 0 && dist <= 8) {
+            for (int u : gaps) {
+                const int c = static_cast<int>(std::lround((u - w) / p));
+                const double diff = std::abs(w + c * p - u);
+                if (diff <= 10.0) {
                     ++votes;
-                    err += dist;
+                    err += diff;
                 }
             }
-            if (votes > best_votes || (votes == best_votes && err < best_score)) {
-                best_votes = votes;
-                best_p = p;
-                best_f = f;
-                best_score = err;
+            if (votes < 2) {
+                continue;
+            }
+            if (!best.valid || votes > best.votes || (votes == best.votes && err < best.err)) {
+                best = Fit { p, w, votes, err, true };
             }
         }
     }
-    if (best_votes < 2) {
-        return {};
+    if (!best.valid) {
+        return std::nullopt;
     }
-    while (best_f - best_p >= 330) {
-        best_f -= best_p;
+
+    double t = best.phase;
+    while (t - best.p >= 330.0) {
+        t -= best.p;
     }
-    std::vector<int> gaps;
-    for (int g = best_f; g <= 1650; g += best_p) {
-        gaps.push_back(g);
+    while (t < 330.0) {
+        t += best.p;
     }
-    return gaps;
+    CardGridFit out;
+    out.p = best.p;
+    out.first = static_cast<int>(std::lround(t));
+    out.votes = best.votes;
+    return out;
 }
 
 std::vector<SPAFarmTaskPlugin::ShopCard> SPAFarmTaskPlugin::read_shop_cards(const cv::Mat& img)
 {
-    // Exact 1:1 port of `Bi` in service.pretty.mjs lines 5155-5334
+    // `Bi(a)` —— service.pretty.mjs L5155-5334，逐行对齐
+    //   jt = {x:330, y:925, w:1330, h:135}, Ut = 2, Qr = 120
+    //   d = extract(jt).resize(2660, 270, cubic)
+    //   n = d.extend(120,120,0,0,#000)                              → 通道 1（原图）
+    //   y = d.extractChannel("red").linear(5, -1.3*255).extend(...)  → 通道 2
+    //   b = d.grayscale().clahe(24,24,6).extend(...)                 → 通道 3（懒加载）
+    //   u(box) = {x: box0/2 + 330, y: (box1-120)/2 + 925, w: box2/2}
+    //   c(list)：先按盟约匹配（覆盖率 >= len-1），否则按干员名匹配
+    //   按 x 聚类（<90 同组）→ 用 Di 的卡位周期补空位 → 输出 name/kind/source
+    const cv::Rect jt(330, 925, 1330, 135);
+    constexpr int Ut = 2;
+    constexpr int Qr = 120;
+
     if (img.empty()) {
         return {};
     }
-    const cv::Rect jt(330, 925, 1330, 135);
-    cv::Mat orig_crop = img(jt).clone();
+    cv::Mat crop = img_crop(img, jt.x, jt.y, jt.width, jt.height);
+    if (crop.empty()) {
+        return {};
+    }
+    cv::Mat scaled = img_resize_cubic(crop, jt.width * Ut, jt.height * Ut);
+    cv::Mat ch_orig = img_extend_black(scaled, Qr, Qr, 0, 0);
+    cv::Mat ch_red = img_extend_black(img_red_linear(scaled, 5.0, -1.3 * 255.0), Qr, Qr, 0, 0);
+    cv::Mat ch_clahe;
 
-    // Red-channel enhanced crop (`5 * R - 1.3 * 255`)
-    cv::Mat red_crop(jt.height, jt.width, CV_8UC3);
-    for (int y = 0; y < jt.height; ++y) {
-        const auto* src_row = orig_crop.ptr<cv::Vec3b>(y);
-        auto* dst_row = red_crop.ptr<cv::Vec3b>(y);
-        for (int x = 0; x < jt.width; ++x) {
-            int R = src_row[x][2];
-            int v = std::clamp(static_cast<int>(std::lround(5.0 * R - 1.3 * 255.0)), 0, 255);
-            dst_row[x] = cv::Vec3b(static_cast<uint8_t>(v), static_cast<uint8_t>(v), static_cast<uint8_t>(v));
+    // ---- 词典与映射 ----
+    std::vector<std::string> all_names;
+    all_names.reserve(m_operators.size() + m_items.size());
+    std::unordered_map<std::string, std::string> norm_to_orig;
+    std::unordered_set<std::string> operator_norms;
+    for (const auto& op : m_operators) {
+        all_names.push_back(op.name);
+        const std::string n = strip_punct(op.name);
+        norm_to_orig.emplace(n, op.name);
+        operator_norms.insert(n);
+    }
+    for (const auto& it : m_items) {
+        all_names.push_back(it.name);
+        norm_to_orig.emplace(strip_punct(it.name), it.name);
+    }
+    std::vector<std::string> bond_names_raw;
+    bond_names_raw.reserve(m_bonds.size());
+    for (const auto& b : m_bonds) {
+        bond_names_raw.push_back(b.name);
+    }
+    const std::vector<DictEntry> name_dict = build_dict(all_names);
+    const std::vector<DictEntry> bond_dict = build_dict(bond_names_raw);
+
+    // `i`：盟约组合 → 干员名
+    std::unordered_map<std::string, std::vector<std::string>> bond_combo;
+    for (const auto& op : m_operators) {
+        std::vector<std::string> nb;
+        nb.reserve(op.bond_names.size());
+        for (const auto& b : op.bond_names) {
+            nb.push_back(strip_punct(b));
+        }
+        std::sort(nb.begin(), nb.end());
+        std::string key;
+        for (size_t i = 0; i < nb.size(); ++i) {
+            if (i > 0) {
+                key += "+";
+            }
+            key += nb[i];
+        }
+        auto& vec = bond_combo[key];
+        if (std::find(vec.begin(), vec.end(), op.name) == vec.end()) {
+            vec.push_back(op.name);
         }
     }
 
-    auto orig_ocr = ocr(orig_crop, std::nullopt, true);
-    auto red_ocr = ocr(red_crop, std::nullopt, true);
-
-    struct TaggedOcr
+    struct Hit
     {
-        OcrItem item;
-        std::string src;
+        std::string kind; // "bond" / "name"
+        std::string value;
+        double x = 0.0;
+        double y = 0.0;
     };
-    std::vector<TaggedOcr> all_ocr;
-    for (const auto& it : orig_ocr) {
-        all_ocr.push_back({ it, "orig" });
-    }
-    for (const auto& it : red_ocr) {
-        all_ocr.push_back({ it, "red" });
-    }
 
-    struct RawHit
+    struct LocalBox
     {
-        int x = 0;
-        std::string kind; // "operator", "item", "bond"
-        std::string name;
-        double score = 0.0;
-        bool exact = false;
-        std::string src;
+        double x = 0.0;
+        double y = 0.0;
+        double w = 0.0;
+        double h = 0.0;
     };
-    std::vector<RawHit> hits;
+    auto to_local = [&](const OcrItem& it) {
+        return LocalBox {
+            it.x / static_cast<double>(Ut) + jt.x,
+            (it.y - Qr) / static_cast<double>(Ut) + jt.y,
+            it.w / static_cast<double>(Ut),
+            it.h / static_cast<double>(Ut),
+        };
+    };
 
-    for (const auto& tagged : all_ocr) {
-        const auto& it = tagged.item;
-        const int card_x = 330 + it.x;
-        const int rel_y = it.y;
+    auto collect = [&](const std::vector<OcrItem>& items) {
+        std::vector<Hit> hits;
+        for (const auto& it : items) {
+            const LocalBox box = to_local(it);
+            const std::string norm = strip_punct(it.text);
+            if (norm.empty()) {
+                continue;
+            }
+            const double nlen = static_cast<double>(utf8_len(norm));
 
-        if (rel_y < 65) {
-            auto bm = match_dict(it.text, m_bond_dict);
-            if (!bm.empty() && match_coverage(it.text, bm) >= 0.5) {
-                for (const auto& m : bm) {
-                    int sub_x = 330 + it.x + static_cast<int>(std::lround(static_cast<double>(it.w) * m.start / std::max(1, m.len)));
-                    hits.push_back(RawHit { sub_x, "bond", m.name, m.score, m.exact, tagged.src });
+            const auto bond_matches = match_dict(norm, bond_dict, false);
+            size_t covered = 0;
+            for (const auto& b : bond_matches) {
+                covered += static_cast<size_t>(b.end - b.start);
+            }
+            if (!bond_matches.empty() && static_cast<double>(covered) >= nlen - 1.0) {
+                for (const auto& b : bond_matches) {
+                    hits.push_back(Hit {
+                        "bond",
+                        b.name,
+                        box.x + box.w * static_cast<double>(b.start) / nlen,
+                        box.y,
+                    });
                 }
+                continue;
             }
-            continue;
+            for (const auto& m : match_dict(norm, name_dict, true)) {
+                hits.push_back(Hit {
+                    "name",
+                    m.name,
+                    box.x + box.w * static_cast<double>(m.start) / nlen,
+                    box.y,
+                });
+            }
         }
+        return hits;
+    };
 
-        auto cm = match_dict(it.text, m_chess_dict);
-        auto im = match_dict(it.text, m_item_dict);
-        double cov_c = match_coverage(it.text, cm);
-        double cov_i = match_coverage(it.text, im);
+    std::vector<Hit> all_hits = collect(ocr(ch_orig));
+    const auto hits_red = collect(ocr(ch_red));
+    all_hits.insert(all_hits.end(), hits_red.begin(), hits_red.end());
 
-        bool pick_item = (!im.empty() && (cm.empty() || cov_i > cov_c || (im[0].exact && !cm[0].exact)));
-        const auto& chosen = pick_item ? im : cm;
-        const std::string chosen_kind = pick_item ? "item" : "operator";
-        if (!chosen.empty() && std::max(cov_c, cov_i) >= 0.5) {
-            for (const auto& m : chosen) {
-                int sub_x = (chosen.size() == 1)
-                    ? card_x
-                    : (330 + it.x + static_cast<int>(std::lround(static_cast<double>(it.w) * m.start / std::max(1, m.len))));
-                hits.push_back(RawHit { sub_x, chosen_kind, m.name, m.score, m.exact, tagged.src });
-            }
+    std::vector<Hit> name_hits;
+    for (const auto& h : all_hits) {
+        if (h.kind == "name") {
+            name_hits.push_back(h);
         }
     }
-
-    // Targeted gap slot fallback (`Bi` lines 5243-5281)
-    auto gaps = detect_card_gaps(img);
-    for (int gap_x : gaps) {
-        if (gap_x + 180 > 1660) {
-            continue;
-        }
-        bool covered = false;
-        for (const auto& h : hits) {
-            if (h.kind != "bond" && h.x >= gap_x - 20 && h.x < gap_x + 240) {
-                covered = true;
-                break;
-            }
-        }
-        if (covered) {
-            continue;
-        }
-        auto slot_rec = ocr_rec_only(img, { gap_x + 5, 925 + 80, 175, 48 }, 2, 0);
-        for (const auto& r : slot_rec) {
-            auto cm = match_dict(r.text, m_chess_dict);
-            auto im = match_dict(r.text, m_item_dict);
-            bool pick_item = (!im.empty() && (cm.empty() || im[0].score > cm[0].score));
-            const auto& chosen = pick_item ? im : cm;
-            if (!chosen.empty()) {
-                hits.push_back(RawHit {
-                    gap_x + 30,
-                    pick_item ? "item" : "operator",
-                    chosen[0].name,
-                    chosen[0].score,
-                    chosen[0].exact,
-                    "slot" });
-                break;
-            }
-        }
-    }
-
-    std::sort(hits.begin(), hits.end(), [](const RawHit& a, const RawHit& b) {
+    std::sort(name_hits.begin(), name_hits.end(), [](const Hit& a, const Hit& b) {
         return a.x < b.x;
     });
 
-    struct Cluster
+    // ---- 按 x 聚类（`X` 距离 <90） ----
+    struct Group
     {
-        int x = 0;
-        std::string name;
-        std::string kind;
-        std::string source;
-        double score = 0.0;
-        bool exact = false;
-        std::vector<std::string> bonds;
+        double x = 0.0;
+        std::map<std::string, int> names;
+        std::set<std::string> bonds;
     };
-    std::vector<Cluster> clusters;
+    std::vector<Group> groups;
+    auto group_at = [&](double x) -> Group& {
+        for (auto& g : groups) {
+            if (std::abs(g.x - x) < 90.0) {
+                return g;
+            }
+        }
+        groups.push_back(Group { x, {}, {} });
+        return groups.back();
+    };
+    for (const auto& h : name_hits) {
+        ++group_at(h.x).names[h.value];
+    }
+    for (const auto& h : all_hits) {
+        if (h.kind == "bond") {
+            group_at(h.x).bonds.insert(h.value);
+        }
+    }
+    std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
+        return a.x < b.x;
+    });
 
-    for (const auto& h : hits) {
-        Cluster* target = nullptr;
-        for (auto& cl : clusters) {
-            if (std::abs(h.x - cl.x) < 90) {
-                target = &cl;
+    // `N = me.length ? [Ai(me.map(q=>q.y))] : [1000, 1018]`
+    std::vector<double> y_candidates;
+    if (!name_hits.empty()) {
+        std::vector<double> ys;
+        ys.reserve(name_hits.size());
+        for (const auto& h : name_hits) {
+            ys.push_back(h.y);
+        }
+        std::sort(ys.begin(), ys.end());
+        const size_t n = ys.size();
+        y_candidates.push_back((n % 2 == 1) ? ys[(n - 1) / 2] : (ys[n / 2 - 1] + ys[n / 2]) / 2.0);
+    }
+    else {
+        y_candidates = { 1000.0, 1018.0 };
+    }
+
+    // `U`：卡位区间
+    std::vector<std::pair<int, int>> intervals;
+    if (auto grid = detect_card_gaps(img)) {
+        const int step = static_cast<int>(std::lround(grid->p));
+        for (int q = grid->first; static_cast<double>(q) + grid->p <= 1700.0; q += step) {
+            const int end = q + step;
+            if (end > jt.x + 60 && q < 1640) {
+                intervals.emplace_back(q, end);
+            }
+        }
+    }
+
+    // `l(channels, d, g)`
+    auto read_name_at = [&](int d, double g) -> std::string {
+        if (ch_clahe.empty()) {
+            ch_clahe = img_extend_black(img_clahe(img_gray(scaled), 24, 24, 6), Qr, Qr, 0, 0);
+        }
+        const std::vector<const cv::Mat*> channels = { &ch_red, &ch_clahe, &ch_orig };
+        for (const cv::Mat* ch : channels) {
+            for (int b : { 190, 120 }) {
+                const int left = std::max(0, static_cast<int>(std::lround((d - jt.x - 6) * Ut)));
+                const int top = static_cast<int>(std::lround((g - jt.y - 6) * Ut + Qr));
+                for (const auto& it : ocr_rec_only(*ch, { left, top, b * Ut, 40 * Ut }, 1, 0)) {
+                    const auto found = match_dict(it.text, name_dict, true);
+                    if (found.size() == 1) {
+                        return found.front().name;
+                    }
+                }
+            }
+        }
+        return {};
+    };
+
+    for (const auto& [q, p] : intervals) {
+        Group* target = nullptr;
+        for (auto& g : groups) {
+            if (g.x > q - 10 && g.x < p - 30) {
+                target = &g;
                 break;
             }
         }
-        if (!target) {
-            clusters.push_back(Cluster { h.x, "", "", "", 0.0, false, {} });
-            target = &clusters.back();
-        }
-        if (h.kind == "bond") {
-            if (std::find(target->bonds.begin(), target->bonds.end(), h.name) == target->bonds.end()) {
-                target->bonds.push_back(h.name);
-            }
-        }
-        else {
-            bool better = target->name.empty()
-                || (h.exact && !target->exact)
-                || (h.exact == target->exact && h.score > target->score);
-            if (better) {
-                target->x = h.x;
-                target->name = h.name;
-                target->kind = h.kind;
-                target->source = h.src;
-                target->score = h.score;
-                target->exact = h.exact;
-            }
-        }
-    }
-
-    std::vector<ShopCard> cards;
-    int idx = 0;
-    for (auto& cl : clusters) {
-        if (cl.name.empty() && !cl.bonds.empty()) {
-            // Resolve operator uniquely from bonds (`Bi` lines 5309-5321)
-            std::vector<std::string> cands;
-            for (const auto& op : m_operators) {
-                bool all_match = true;
-                for (const auto& b : cl.bonds) {
-                    if (std::find(op.bond_names.begin(), op.bond_names.end(), b) == op.bond_names.end()) {
-                        all_match = false;
-                        break;
-                    }
-                }
-                if (all_match) {
-                    cands.push_back(op.name);
-                }
-            }
-            if (cands.size() == 1) {
-                cl.name = cands.front();
-                cl.kind = "operator";
-                cl.source = "bonds";
-            }
-        }
-        if (cl.name.empty() && cl.bonds.empty()) {
+        if (target != nullptr && !target->names.empty()) {
             continue;
         }
-        ShopCard sc;
-        sc.index = idx++;
-        sc.x = cl.x;
-        sc.name = cl.name;
-        sc.kind = cl.kind;
-        sc.source = cl.source;
-        sc.bonds = std::move(cl.bonds);
-        if (sc.kind == "operator") {
-            if (const auto* op = find_operator(sc.name)) {
-                sc.cost = op->purchase_price;
-                sc.tier = op->tier;
-                if (sc.bonds.empty()) {
-                    sc.bonds = op->bond_names;
-                }
+        std::string found;
+        for (double gy : y_candidates) {
+            found = read_name_at(q + 22, gy);
+            if (!found.empty()) {
+                break;
             }
         }
-        else if (sc.kind == "item") {
-            if (const auto* it = find_item(sc.name)) {
-                sc.cost = it->price;
-                sc.tier = it->tier;
-            }
+        if (found.empty()) {
+            continue;
         }
-        cards.push_back(std::move(sc));
+        if (target != nullptr) {
+            target->names[found] = 1;
+        }
+        else {
+            Group g;
+            g.x = q + 40;
+            g.names[found] = 1;
+            groups.push_back(g);
+        }
     }
 
-    detect_free_cards(img, cards);
+    std::sort(groups.begin(), groups.end(), [](const Group& a, const Group& b) {
+        return a.x < b.x;
+    });
+
+    std::vector<ShopCard> cards;
+    cards.reserve(groups.size());
+    for (const auto& g : groups) {
+        std::vector<std::string> bonds;
+        bonds.reserve(g.bonds.size());
+        for (const auto& b : g.bonds) {
+            bonds.push_back(b);
+        }
+        std::sort(bonds.begin(), bonds.end());
+
+        // `[...q.names.entries()].sort((a,b)=> b[1]-a[1] || b[0].length-a[0].length)[0]`
+        std::string best;
+        int best_cnt = -1;
+        size_t best_len = 0;
+        for (const auto& [name, cnt] : g.names) {
+            const size_t len = static_cast<size_t>(utf8_len(name));
+            if (cnt > best_cnt || (cnt == best_cnt && len > best_len)) {
+                best = name;
+                best_cnt = cnt;
+                best_len = len;
+            }
+        }
+
+        ShopCard card;
+        card.x = static_cast<int>(std::lround(g.x));
+        card.bonds = bonds;
+        if (!best.empty()) {
+            const auto it = norm_to_orig.find(best);
+            card.name = (it != norm_to_orig.end()) ? it->second : best;
+            card.kind = (operator_norms.count(best) > 0) ? "operator" : "item";
+            card.source = "ocr";
+            cards.push_back(card);
+            continue;
+        }
+
+        std::vector<std::string> candidates;
+        if (!bonds.empty()) {
+            std::vector<std::string> keys;
+            keys.reserve(bonds.size());
+            for (const auto& b : bonds) {
+                keys.push_back(strip_punct(b));
+            }
+            std::sort(keys.begin(), keys.end());
+            std::string key;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (i > 0) {
+                    key += "+";
+                }
+                key += keys[i];
+            }
+            auto it = bond_combo.find(key);
+            if (it != bond_combo.end()) {
+                candidates = it->second;
+            }
+        }
+        if (candidates.size() == 1) {
+            card.name = candidates.front();
+            card.kind = "operator";
+            card.source = "bonds";
+        }
+        else {
+            card.name.clear();
+            card.kind = bonds.empty() ? "" : "operator";
+            card.source.clear();
+        }
+        cards.push_back(card);
+    }
+
+    // 注意：`Mt`（免费卡）不是 `Bi` 的一部分，参考实现在 `je` 的批处理里单独调用。
     return cards;
 }
 
 void SPAFarmTaskPlugin::detect_free_cards(const cv::Mat& img, std::vector<ShopCard>& cards) const
 {
-    // Exact 1:1 port of `Mt(I, k)` in service.pretty.mjs lines 8908-8929
+    // `Mt(I, k)` —— service.pretty.mjs L8908-8929
+    //   left = round(x + 40)；越界跳过
+    //   extract({left, 760, 130, 40}).resize(520, 160).extend(40 全边黑) → bt
+    //   命中 /^[0OoＯ〇]$/ 且 score >= .6 即为免费卡
     for (auto& card : cards) {
         if (card.name.empty()) {
             continue;
         }
-        int left = std::clamp(card.x + 40, 0, std::max(0, img.cols - 130));
-        auto price_ocr = ocr(img, std::array<int, 4> { left, 760, 130, 40 }, true);
-        for (const auto& it : price_ocr) {
-            if (it.score >= 0.6 && (it.text == "0" || it.text == "O" || it.text == "o" || it.text == "Ｏ" || it.text == "〇")) {
+        const int left = static_cast<int>(std::lround(static_cast<double>(card.x) + 40.0));
+        if (left < 0 || left + 130 > 1920) {
+            continue;
+        }
+        cv::Mat crop = img_crop(img, left, 760, 130, 40);
+        if (crop.empty()) {
+            continue;
+        }
+        cv::Mat big = img_resize_cubic(crop, 520, 160);
+        big = img_extend_black(big, 40, 40, 40, 40);
+        for (const auto& it : ocr(big)) {
+            const std::string t = strip_ws(it.text);
+            if (it.score >= 0.6 && (t == "0" || t == "O" || t == "o" || t == "Ｏ" || t == "〇")) {
                 card.free_card = true;
                 card.cost = 0;
                 break;
@@ -3066,18 +3942,20 @@ cv::Rect SPAFarmTaskPlugin::unit_sprite_box(
     int c,
     std::string_view camera)
 {
-    // Exact 1:1 port of `ta(a, s, e, t)` in service.pretty.mjs lines 5598-5606
+    // `ta(a, s, e, t)` —— service.pretty.mjs L5598-5606
+    //   u = 相邻格中心投影的 x 差；框 = (fx - 0.45u, y_top, 0.9u, fy + 0.1u - y_top)
+    //   注意：JS 没有任何下限钳制，这里也不加。
     auto [fx, fy] = project_point(H, c + 0.5, r + 0.5);
     auto [ix, iy] = project_point(H, c, r + 0.5);
     auto [mx, my] = project_point(H, c + 1.0, r + 0.5);
     (void)iy;
     (void)my;
-    const double u = std::max(24.0, mx - ix);
+    const double u = mx - ix;
     const double top_y = project_point(H, c + 0.5, r + 0.5 + (camera == "expanded" ? -1.3 : -0.95)).second;
-    int rx = static_cast<int>(std::lround(fx - 0.45 * u));
-    int ry = static_cast<int>(std::lround(top_y));
-    int rw = std::max(12, static_cast<int>(std::lround(0.9 * u)));
-    int rh = std::max(12, static_cast<int>(std::lround(fy + 0.1 * u - top_y)));
+    const int rx = static_cast<int>(std::lround(fx - 0.45 * u));
+    const int ry = static_cast<int>(std::lround(top_y));
+    const int rw = static_cast<int>(std::lround(0.9 * u));
+    const int rh = static_cast<int>(std::lround(fy + 0.1 * u - top_y));
     return cv::Rect(rx, ry, rw, rh);
 }
 
@@ -3200,75 +4078,128 @@ std::vector<std::pair<double, double>> SPAFarmTaskPlugin::detect_unit_badges(
     std::string_view camera,
     const std::vector<std::string>& rows) const
 {
-    // Combines `he` + `yn` geometry from service.pretty.mjs lines 6491-6527 & 6773-6799:
-    // For each deployable cell (r, c) in `abhH`, checks the badge location `[c + 0.23, r + 0.5 + w]`
-    // (`w = camera == "expanded" ? -1.25 : -0.86`) for tier badge + HP bar + sprite foreground.
+    // Exact 1:1 port of `he(j, J)` —— service.pretty.mjs L6773-6791:
+    //   qe(j).resize(1280, 720) → post_recognition("TemplateMatch", {
+    //       template: ["badge_l1.png".."badge_l6.png"], threshold: .7,
+    //       method: 5 (TM_CCOEFF_NORMED), green_mask: !0,
+    //       order_by: "Score", roi: [80, 120, 1100, 440] })
+    //   → reco.detail.filtered 的 box 中心 ×1.5 还原到 1920 空间、<15px 去重。
+    // `he` 本身不依赖棋盘几何；H / camera / rows 是下游 `yn`（map_badges_to_units）的输入。
+    (void)H;
+    (void)camera;
+    (void)rows;
+
     std::vector<std::pair<double, double>> badges;
-    if (img.empty() || rows.empty()) {
+    if (img.empty() || m_badge_templates.empty()) {
         return badges;
     }
-    const double w_off = (camera == "expanded") ? -1.25 : -0.86;
-    for (int r = 0; r < static_cast<int>(rows.size()); ++r) {
-        for (int c = 0; c < static_cast<int>(rows[r].size()); ++c) {
-            char ch = rows[r][c];
-            if (ch != 'a' && ch != 'b' && ch != 'h' && ch != 'H') {
-                continue;
-            }
-            auto [bx, by] = project_point(H, c + 0.5 - 0.27, r + 0.5 + w_off);
-            if (bx < 80 || bx > 1840 || by < 100 || by > 920) {
-                continue;
-            }
 
-            // Check badge neighborhood around (bx, by) for bright Roman numeral glyph on dark badge disc + HP bar / sprite activity
-            int x0 = std::clamp(static_cast<int>(std::lround(bx - 18)), 0, img.cols);
-            int y0 = std::clamp(static_cast<int>(std::lround(by - 18)), 0, img.rows);
-            int x1 = std::clamp(static_cast<int>(std::lround(bx + 18)), 0, img.cols);
-            int y1 = std::clamp(static_cast<int>(std::lround(by + 18)), 0, img.rows);
-            if (x1 <= x0 || y1 <= y0) {
-                continue;
-            }
+    // sharp 的 resize 默认核是 lanczos3，OpenCV 用 LANCZOS4 对应
+    cv::Mat small;
+    cv::resize(img, small, cv::Size(1280, 720), 0.0, 0.0, cv::INTER_LANCZOS4);
+    cv::Rect roi(80, 120, 1100, 440); // `[x, y, w, h]`，1280 空间
+    roi &= cv::Rect(0, 0, small.cols, small.rows);
+    if (roi.width <= 0 || roi.height <= 0) {
+        return badges;
+    }
+    cv::Mat scene = small(roi).clone();
+    cv::Mat scene_rgb;
+    cv::cvtColor(scene, scene_rgb, cv::COLOR_BGR2RGB);
 
-            int bright_glyph = 0;
-            int dark_ring = 0;
-            int gold_or_cyan_frame = 0;
-            for (int y = y0; y < y1; ++y) {
-                const auto* row = img.ptr<cv::Vec3b>(y);
-                for (int x = x0; x < x1; ++x) {
-                    int B = row[x][0], G = row[x][1], R = row[x][2];
-                    int luma = (R + G + B) / 3;
-                    if (luma > 205 && std::max({ R, G, B }) - std::min({ R, G, B }) < 45) {
-                        ++bright_glyph;
-                    }
-                    else if (luma < 55) {
-                        ++dark_ring;
-                    }
-                    if ((R > 165 && G > 115 && B < 95) || (G > 140 && G > R + 35)) {
-                        ++gold_or_cyan_frame;
-                    }
+    struct Hit
+    {
+        double x = 0.0;
+        double y = 0.0;
+        float score = 0.0f;
+    };
+    std::vector<Hit> hits;
+
+    for (size_t ti = 0; ti < m_badge_templates.size(); ++ti) {
+        const cv::Mat& templ = m_badge_templates[ti];
+        if (templ.cols > scene_rgb.cols || templ.rows > scene_rgb.rows) {
+            continue;
+        }
+        cv::Mat templ_rgb;
+        cv::cvtColor(templ, templ_rgb, cv::COLOR_BGR2RGB);
+
+        // `green_mask: !0` == VisionHelper::create_mask(templ, true)：
+        //   inRange 纯绿 (0,255,0) 后取反，绿色背景不参与匹配
+        cv::Mat green;
+        cv::inRange(
+            templ_rgb,
+            cv::Scalar(0, 255, 0),
+            cv::Scalar(0, 255, 0),
+            green);
+        cv::Mat mask;
+        cv::bitwise_not(green, mask);
+        const int mask_pixels = cv::countNonZero(mask);
+        if (mask_pixels == 0) {
+            continue;
+        }
+
+        // MAA 自带 masked TM_CCOEFF_NORMED（与 MaaFramework 的 green_mask + method:5 等价）
+        cv::Mat matched = MaskedCcoeffMatcher::get_instance().match(
+            scene_rgb,
+            templ_rgb,
+            mask,
+            "spa_badge_l" + std::to_string(ti + 1),
+            mask_pixels);
+        if (matched.empty()) {
+            // OpenCV 只有 TM_SQDIFF / TM_CCORR_NORMED 支持 mask，FFT 路径不可用时兜底
+            cv::matchTemplate(scene_rgb, templ_rgb, matched, cv::TM_CCORR_NORMED, mask);
+        }
+        if (matched.empty()) {
+            continue;
+        }
+
+        const int min_distance = std::min(templ.cols, templ.rows) / 2; // MAA MultiMatcher 默认 NMS 半径
+        for (int y = 0; y < matched.rows; ++y) {
+            for (int x = 0; x < matched.cols; ++x) {
+                const float v = matched.at<float>(y, x);
+                if (v < 0.7f || std::isnan(v) || std::isinf(v)) {
+                    continue;
                 }
-            }
-
-            // Also check HP bar or foreground diff on unit sprite box
-            cv::Rect sp_box = unit_sprite_box(H, r, c, camera);
-            double hp_ratio = green_hp_bar_ratio(img, bx + 26.0, by, 24.0);
-            bool has_badge = (bright_glyph >= 8 && dark_ring >= 25 && (hp_ratio >= 0.04 || gold_or_cyan_frame >= 10));
-
-            if (!has_badge && ch == 'H') {
-                // Bench slot check: bench units sit on `H` row (r = 6) and have distinct sprite contrast even without combat HP bar
-                std::string bg_key = std::string(camera) + ":" + std::to_string(r) + "," + std::to_string(c);
-                auto bg_it = m_empty_cell_refs.find(bg_key);
-                const cv::Mat* bg_ptr = (bg_it != m_empty_cell_refs.end()) ? &bg_it->second : nullptr;
-                auto hvec = compute_hsv_hist(img, sp_box, bg_ptr);
-                if (bright_glyph >= 6 && dark_ring >= 20 && !hvec.empty()) {
-                    has_badge = true;
+                Hit h;
+                h.x = roi.x + x + templ.cols / 2.0;
+                h.y = roi.y + y + templ.rows / 2.0;
+                h.score = v;
+                bool need_push = true;
+                for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
+                    if (std::abs(h.x - it->x) >= min_distance || std::abs(h.y - it->y) >= min_distance) {
+                        continue;
+                    }
+                    if (it->score < v) {
+                        *it = h; // 同位只留高分
+                    }
+                    need_push = false;
+                    break;
                 }
-            }
-
-            if (has_badge) {
-                badges.emplace_back(bx, by);
+                if (need_push) {
+                    hits.push_back(h);
+                }
             }
         }
     }
+
+    // `order_by: "Score"` + JS 末尾的 `<15px`（1920 空间）去重
+    std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+        return a.score > b.score;
+    });
+    for (const auto& h : hits) {
+        const double px = h.x * 1.5;
+        const double py = h.y * 1.5;
+        bool duplicate = false;
+        for (const auto& b : badges) {
+            if (std::hypot(b.first - px, b.second - py) < 15.0) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            badges.emplace_back(px, py);
+        }
+    }
+    Log.trace("SPAFarm | he badges:", badges.size(), "templates:", m_badge_templates.size());
     return badges;
 }
 
@@ -3503,38 +4434,61 @@ std::pair<std::string, std::string> SPAFarmTaskPlugin::read_unit_detail_panel(co
     return { resolved_name, facing };
 }
 
-void SPAFarmTaskPlugin::check_triple_merge(const std::string& op_name)
+void SPAFarmTaskPlugin::check_triple_merge(const std::string& op_name, bool force)
 {
-    // Exact 1:1 port of `mt(j, J)` in service.pretty.mjs lines 6829-6845
-    std::vector<size_t> indices;
-    for (size_t i = 0; i < m_units.size(); ++i) {
-        if (m_units[i].name == op_name && !m_units[i].elite) {
-            indices.push_back(i);
+    // `mt(j, J)` —— service.pretty.mjs L6829-6845
+    //   1) 取**全部**同名单位（不看 elite）
+    //   2) 只有一个：直接标 elite
+    //   3) 多个：按 (ghost, area==board) 排序取第一个保留并标 elite，其余从列表与 remembered 中删除
+    std::vector<size_t> idx;
+    for (size_t k = 0; k < m_units.size(); ++k) {
+        if (m_units[k].name == op_name) {
+            idx.push_back(k);
         }
     }
-    if (indices.size() < 3) {
+    if (idx.empty()) {
         return;
     }
-    // Prefer keeping a board unit over a bench unit
-    size_t keep_idx = indices.front();
-    for (size_t idx : indices) {
-        if (m_units[idx].area == "board" && !m_units[idx].ghost) {
-            keep_idx = idx;
-            break;
+    if (idx.size() <= 1) {
+        m_units[idx.front()].elite = true;
+        auto it = m_remembered_units.find(m_units[idx.front()].slot);
+        if (it != m_remembered_units.end()) {
+            it->second.elite = true;
+        }
+        return;
+    }
+    // JS 只在 `p`（待合成）里出现过才走到这里；非待合成时数量 >1 属正常多张，不做合并
+    if (!force && m_pending_merge.count(op_name) == 0) {
+        return;
+    }
+
+    auto rank = [](const UnitSlot& u) {
+        return std::pair<int, int> { u.ghost ? 1 : 0, u.area == "board" ? 0 : 1 };
+    };
+    size_t keep = idx.front();
+    for (size_t k : idx) {
+        if (rank(m_units[k]) < rank(m_units[keep])) {
+            keep = k;
         }
     }
-    m_units[keep_idx].elite = true;
-    auto rem_it = m_remembered_units.find(m_units[keep_idx].slot);
-    if (rem_it != m_remembered_units.end()) {
-        rem_it->second.elite = true;
+    m_units[keep].elite = true;
+    const std::string keep_slot = m_units[keep].slot;
+    auto kit = m_remembered_units.find(keep_slot);
+    if (kit != m_remembered_units.end()) {
+        kit->second.elite = true;
     }
-    for (auto it = indices.rbegin(); it != indices.rend(); ++it) {
-        if (*it != keep_idx) {
-            m_remembered_units.erase(m_units[*it].slot);
-            m_units.erase(m_units.begin() + static_cast<std::ptrdiff_t>(*it));
+    std::vector<size_t> drop;
+    for (size_t k : idx) {
+        if (k != keep) {
+            drop.push_back(k);
         }
     }
-    log_info("三合一升精: " + op_name + " -> 保留于 " + m_units[keep_idx].slot);
+    std::sort(drop.rbegin(), drop.rend());
+    for (size_t k : drop) {
+        m_remembered_units.erase(m_units[k].slot);
+        m_units.erase(m_units.begin() + static_cast<std::ptrdiff_t>(k));
+    }
+    log_info("三合一升精: " + op_name + " -> 保留于 " + keep_slot);
 }
 
 void SPAFarmTaskPlugin::refresh_board_snapshot(
@@ -3669,39 +4623,75 @@ void SPAFarmTaskPlugin::refresh_board_snapshot(
         }
     }
 
-    // Preserve remembered board units that may be occluded in the current frame (`ghost: true`, lines 7055-7070)
+    // 被遮挡的已记住单位：`ghost` 保留 / 20s 后丢弃（`Ut` L7053-7071）
+    //   `if (!v.aux && v.area === "board" && v.r != null && v.c != null)` → 直接补 ghost
+    //   否则记 `missingSince`，超过 `W = 2e4` 才从 `h` 里删
+    const double now_s = now_sec();
     for (const auto& [slot, rem] : m_remembered_units) {
-        if (rem.area == "board" && !rem.auxiliary && !rem.name.empty()) {
-            bool present = false;
-            for (const auto& u : detected) {
-                if (u.slot == slot) {
-                    present = true;
-                    break;
-                }
-            }
-            if (!present) {
-                UnitSlot ghost_u = rem;
-                ghost_u.ghost = true;
-                detected.push_back(std::move(ghost_u));
+        bool present = false;
+        for (const auto& u : detected) {
+            if (u.slot == slot) {
+                present = true;
+                break;
             }
         }
+        if (present) {
+            m_missing_since.erase(slot);
+            continue;
+        }
+        if (!rem.auxiliary && !rem.item && rem.area == "board" && !rem.name.empty()) {
+            UnitSlot ghost_u = rem;
+            ghost_u.ghost = true;
+            ghost_u.source = "carried";
+            ghost_u.verified = true;
+            ghost_u.confirmed = true;
+            detected.push_back(std::move(ghost_u));
+            continue;
+        }
+        if (m_missing_since.count(slot) == 0) {
+            m_missing_since[slot] = now_s;
+        }
+        else if (now_s - m_missing_since[slot] > 20.0) {
+            m_missing_since.erase(slot);
+        }
+    }
+    // 清掉已不在 remembered 里的计时
+    for (auto it = m_missing_since.begin(); it != m_missing_since.end();) {
+        it = (m_remembered_units.count(it->first) == 0) ? m_missing_since.erase(it) : std::next(it);
     }
 
     m_units = std::move(detected);
 
-    // Check triple merges
-    std::set<std::string> unique_names;
-    for (const auto& u : m_units) {
-        if (!u.name.empty() && !u.elite) {
-            unique_names.insert(u.name);
+    // `Date.now() - Dr > 5e3` → 同名非精锐 >= 3 张就地三合一（节流 5s）
+    if (now_s - m_last_merge_check > 5.0) {
+        m_last_merge_check = now_s;
+        std::set<std::string> names;
+        for (const auto& u : m_units) {
+            if (!u.name.empty() && !u.elite) {
+                names.insert(u.name);
+            }
+        }
+        for (const auto& nm : names) {
+            int cnt = 0;
+            for (const auto& u : m_units) {
+                if (u.name == nm && !u.elite) {
+                    ++cnt;
+                }
+            }
+            if (cnt >= 3) {
+                check_triple_merge(nm, true);
+            }
         }
     }
-    for (const auto& nm : unique_names) {
-        check_triple_merge(nm);
+
+    for (auto& u : m_units) {
+        if (!u.name.empty() && m_elite_units.count(u.name) > 0) {
+            u.elite = true; // `for (const re of L.units) re.name && Et.has(re.name) && (re.elite = !0)`
+        }
     }
 
     // Update deployCap from `剩余可部署 N` (`line 7189-7190`)
-    if (auto rem = read_remaining_deploy(img)) {
+    if (auto rem = read_remaining_deploy(img, ocr(img))) {
         int board_cnt = 0;
         for (const auto& u : m_units) {
             if (u.area == "board" && !u.auxiliary) {
@@ -3716,7 +4706,10 @@ void SPAFarmTaskPlugin::refresh_board_snapshot(
     }
 }
 
-void SPAFarmTaskPlugin::inspect_unknown_units(const CameraDetectResult& cam, bool skip_bench_unknown)
+void SPAFarmTaskPlugin::inspect_unknown_units(
+    const CameraDetectResult& cam,
+    bool skip_bench_unknown,
+    bool force_all)
 {
     // Exact 1:1 port of `zr` in service.pretty.mjs lines 7447-7528 (including waitStableBoard L7463, L7464, L7476)
     (void)cam;
@@ -3731,8 +4724,10 @@ void SPAFarmTaskPlugin::inspect_unknown_units(const CameraDetectResult& cam, boo
         }
         const auto* op = u.name.empty() ? nullptr : find_operator(u.name);
         const bool need_facing = (u.area == "board" && u.facing.empty() && (!op || !op->facing_independent));
+        // `zr` 的 `onlyUnknown`：为真时「已命名且已确认」的一律跳过；
+        // 为假时（`!identifyUnknown && !B` 中的 B，即金干员合计）全量重读。
         const bool need_name = u.name.empty() || (!u.confirmed && u.source == "guess");
-        if (!need_name && !need_facing) {
+        if (!force_all && !need_name && !need_facing) {
             continue;
         }
 
@@ -3797,26 +4792,170 @@ void SPAFarmTaskPlugin::inspect_unknown_units(const CameraDetectResult& cam, boo
 // Stage Traffic & Simulated Annealing Placement Solver (`Rr`, `Nt`, `Zr`, `is`, `ss`, `cr`, `ws`)
 // ============================================================================
 
-SPAFarmTaskPlugin::StageTrafficMap SPAFarmTaskPlugin::build_stage_traffic(std::string_view stage_id) const
+
+// ===========================================================================
+// `Rr` 的原语（service.pretty.mjs L5681-5746）
+// ===========================================================================
+
+std::vector<std::pair<int, int>> SPAFarmTaskPlugin::cells_of(
+    const std::vector<std::string>& rows,
+    char ch)
+{
+    std::vector<std::pair<int, int>> out;
+    for (int r = 0; r < static_cast<int>(rows.size()); ++r) {
+        const std::string& line = rows[r];
+        for (int c = 0; c < static_cast<int>(line.size()); ++c) {
+            if (line[c] == ch) {
+                out.emplace_back(r, c);
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<std::pair<int, int>> SPAFarmTaskPlugin::deploy_cells(const std::vector<std::string>& rows)
+{
+    // `Pr(a)`：可部署格 a/b/h
+    std::vector<std::pair<int, int>> out;
+    for (int r = 0; r < static_cast<int>(rows.size()); ++r) {
+        const std::string& line = rows[r];
+        for (int c = 0; c < static_cast<int>(line.size()); ++c) {
+            const char ch = line[c];
+            if (ch == 'a' || ch == 'b' || ch == 'h') {
+                out.emplace_back(r, c);
+            }
+        }
+    }
+    return out;
+}
+
+SPAFarmTaskPlugin::BfsResult SPAFarmTaskPlugin::bfs_from(
+    const std::vector<std::string>& rows,
+    const std::vector<std::pair<int, int>>& starts)
+{
+    // `aa(a, s)` L5691-5716：4 邻域，可走 b/c/S/E/I/O，同时累计最短路条数
+    const int R = static_cast<int>(rows.size());
+    const int C = R > 0 ? static_cast<int>(rows[0].size()) : 0;
+    constexpr int kInf = 1000000;
+    BfsResult out;
+    out.dist.assign(R, std::vector<int>(C, kInf));
+    out.ways.assign(R, std::vector<int>(C, 0));
+
+    auto passable = [](char ch) {
+        return ch == 'b' || ch == 'c' || ch == 'S' || ch == 'E' || ch == 'I' || ch == 'O';
+    };
+
+    std::vector<std::pair<int, int>> queue;
+    for (const auto& st : starts) {
+        if (st.first < 0 || st.second < 0 || st.first >= R || st.second >= C) {
+            continue;
+        }
+        out.dist[st.first][st.second] = 0;
+        out.ways[st.first][st.second] = 1;
+        queue.push_back(st);
+    }
+
+    static const int dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+    for (size_t i = 0; i < queue.size(); ++i) {
+        const auto [r, c] = queue[i];
+        for (const auto& d : dirs) {
+            const int nr = r + d[0];
+            const int nc = c + d[1];
+            if (nr < 0 || nc < 0 || nr >= R || nc >= C) {
+                continue;
+            }
+            if (!passable(rows[nr][nc])) {
+                continue;
+            }
+            if (out.dist[nr][nc] == kInf) {
+                out.dist[nr][nc] = out.dist[r][c] + 1;
+                queue.emplace_back(nr, nc);
+            }
+            if (out.dist[nr][nc] == out.dist[r][c] + 1) {
+                out.ways[nr][nc] += out.ways[r][c];
+            }
+        }
+    }
+    return out;
+}
+
+std::vector<std::pair<int, int>> SPAFarmTaskPlugin::build_path(
+    const std::vector<std::string>& rows,
+    std::pair<int, int> from,
+    std::pair<int, int> to)
+{
+    // `Hi(a, s, e)` L5724-5746：沿列推进，遇边界折返，最后对齐到目标
+    int min_r = 0;
+    int max_r = 0;
+    {
+        std::vector<int> rs;
+        for (const auto& c : cells_of(rows, 'S')) {
+            rs.push_back(c.first);
+        }
+        for (const auto& c : cells_of(rows, 'E')) {
+            rs.push_back(c.first);
+        }
+        for (const auto& c : deploy_cells(rows)) {
+            rs.push_back(c.first);
+        }
+        if (!rs.empty()) {
+            min_r = *std::min_element(rs.begin(), rs.end());
+            max_r = *std::max_element(rs.begin(), rs.end());
+        }
+    }
+
+    const int step = (to.second < from.second) ? -1 : 1;
+    const int stop_col = to.second - step;
+    std::vector<std::pair<int, int>> path { from };
+    int r = from.first;
+    int c = from.second;
+
+    auto advance_two = [&]() {
+        for (int g = 0; g < 2 && c != stop_col; ++g) {
+            c += step;
+            path.emplace_back(r, c);
+        }
+    };
+
+    int dir = (r >= max_r) ? -1 : 1;
+    if (r >= max_r) {
+        advance_two();
+    }
+    for (int g = 0; g < 400 && c != stop_col && c != to.second; ++g) {
+        if ((dir == 1 && r >= max_r) || (dir == -1 && r <= min_r)) {
+            advance_two();
+            dir = (dir == 1) ? -1 : 1;
+            continue;
+        }
+        r += dir;
+        path.emplace_back(r, c);
+    }
+    while (r != to.first) {
+        r += (r < to.first) ? 1 : -1;
+        path.emplace_back(r, c);
+    }
+    if (c != to.second) {
+        c = to.second;
+        path.emplace_back(r, c);
+    }
+    return path;
+}
+
+SPAFarmTaskPlugin::StageTrafficMap SPAFarmTaskPlugin::build_stage_traffic(std::string_view stage_id, bool bottom_only) const
 {
     // Exact 1:1 port of `Rr(a, s)` in service.pretty.mjs lines 5729-5847
     StageTrafficMap tm;
     const auto* st = find_stage(stage_id);
     if (!st || st->rows.empty()) {
-        return tm;
+    
+    return tm;
     }
     tm.stage_id = st->stage_id;
     tm.grid = st->rows;
     tm.rows = static_cast<int>(tm.grid.size());
     tm.cols = static_cast<int>(tm.grid[0].size());
 
-    // Apply `wr` overrides for `act3autochess_m01` (`service.pretty.mjs` lines 7529-7558)
-    if (tm.stage_id == "act3autochess_m01" && tm.rows >= 5 && tm.cols >= 10) {
-        tm.grid[1][4] = 'b';
-        tm.grid[4][4] = 'b';
-        tm.grid[4][9] = 'b';
-    }
-
+    // 地块覆盖（`wr`）已在 `load_all_data` 里按 JS L7529-7543 应用（只有 4 处：4,9 / 4,8 → a，3,10 / 2,10 → c）
     for (int r = 0; r < tm.rows; ++r) {
         for (int c = 0; c < tm.cols; ++c) {
             if (tm.grid[r][c] == 'S') {
@@ -3957,6 +5096,160 @@ SPAFarmTaskPlugin::StageTrafficMap SPAFarmTaskPlugin::build_stage_traffic(std::s
             }
         }
     }
+    // ===== `Rr(a, s)` —— service.pretty.mjs L5748-5822 =====
+    {
+        const int R = tm.rows;
+        const int C = tm.cols;
+        if (R > 0 && C > 0) {
+            const auto& rows = tm.grid;
+            const auto goals = cells_of(rows, 'E');
+            const BfsResult from_goal = bfs_from(rows, goals);
+
+            std::vector<std::pair<int, int>> starts;
+            for (const auto& c : cells_of(rows, 'S')) {
+                if (from_goal.dist[c.first][c.second] < INF) {
+                    starts.push_back(c);
+                }
+            }
+            if (bottom_only && starts.size() > 1) {
+                int max_r = -1;
+                for (const auto& c : starts) {
+                    max_r = std::max(max_r, c.first);
+                }
+                std::vector<std::pair<int, int>> filtered;
+                for (const auto& c : starts) {
+                    if (c.first == max_r) {
+                        filtered.push_back(c);
+                    }
+                }
+                starts.swap(filtered);
+            }
+            if (starts.empty()) {
+                const auto all = cells_of(rows, 'S');
+                int min_c = std::numeric_limits<int>::max();
+                for (const auto& c : all) {
+                    min_c = std::min(min_c, c.second);
+                }
+                for (const auto& c : all) {
+                    if (c.second == min_c) {
+                        starts.push_back(c);
+                    }
+                }
+            }
+
+            tm.ground.assign(R, std::vector<double>(C, 0.0));
+            tm.ground_progress.assign(R, std::vector<double>(C, 0.0));
+            tm.air.assign(R, std::vector<double>(C, 0.0));
+            tm.air_progress.assign(R, std::vector<double>(C, 0.0));
+            tm.ground_paths.clear();
+            tm.air_paths.clear();
+            tm.ground_by_start.clear();
+
+            for (const auto& sp : starts) {
+                const int b = from_goal.dist[sp.first][sp.second];
+                if (b < INF) {
+                    const BfsResult from_start = bfs_from(rows, { sp });
+                    const int total_ways = from_goal.ways[sp.first][sp.second];
+                    std::vector<std::vector<double>> me(R, std::vector<double>(C, 0.0));
+                    for (int r = 0; r < R; ++r) {
+                        for (int c = 0; c < C; ++c) {
+                            if (from_start.dist[r][c] >= INF || from_goal.dist[r][c] >= INF) {
+                                continue;
+                            }
+                            if (from_start.dist[r][c] + from_goal.dist[r][c] != b || total_ways <= 0) {
+                                continue;
+                            }
+                            me[r][c] = static_cast<double>(from_start.ways[r][c])
+                                * from_goal.ways[r][c] / static_cast<double>(total_ways);
+                            tm.ground[r][c] += me[r][c];
+                            tm.ground_progress[r][c] = std::max(
+                                tm.ground_progress[r][c],
+                                static_cast<double>(from_start.dist[r][c]) / static_cast<double>(b));
+                        }
+                    }
+                    tm.ground_by_start.push_back(me);
+
+                    // groundPaths：从 S 沿 dist 递减走到 E
+                    std::vector<std::pair<int, int>> path { sp };
+                    int cr = sp.first;
+                    int cc = sp.second;
+                    while (from_goal.dist[cr][cc] > 0) {
+                        static const int kDirs[4][2] = { { 0, -1 }, { 1, 0 }, { -1, 0 }, { 0, 1 } };
+                        bool moved = false;
+                        for (const auto& d : kDirs) {
+                            const int nr = cr + d[0];
+                            const int nc = cc + d[1];
+                            if (nr < 0 || nc < 0 || nr >= R || nc >= C) {
+                                continue;
+                            }
+                            if (from_goal.dist[nr][nc] == from_goal.dist[cr][cc] - 1) {
+                                cr = nr;
+                                cc = nc;
+                                path.emplace_back(cr, cc);
+                                moved = true;
+                                break;
+                            }
+                        }
+                        if (!moved) {
+                            break;
+                        }
+                    }
+                    tm.ground_paths.push_back(path);
+                }
+
+                // airPaths：最近的 E 用 `Hi` 生成路径
+                if (!goals.empty()) {
+                    auto nearest = goals.front();
+                    for (const auto& g : goals) {
+                        const int d1 = std::abs(g.first - sp.first) + std::abs(g.second - sp.second);
+                        const int d0 = std::abs(nearest.first - sp.first) + std::abs(nearest.second - sp.second);
+                        if (d1 < d0) {
+                            nearest = g;
+                        }
+                    }
+                    const auto air_path = build_path(rows, sp, nearest);
+                    if (!air_path.empty()) {
+                        const double denom = static_cast<double>(air_path.size() - 1);
+                        for (size_t i = 0; i < air_path.size(); ++i) {
+                            const auto [r, c] = air_path[i];
+                            if (r < 0 || c < 0 || r >= R || c >= C) {
+                                continue;
+                            }
+                            tm.air[r][c] += 1.0;
+                            if (denom > 0) {
+                                tm.air_progress[r][c] =
+                                    std::max(tm.air_progress[r][c], static_cast<double>(i) / denom);
+                            }
+                        }
+                        tm.air_paths.push_back(air_path);
+                    }
+                }
+            }
+
+            // grazeFrom：路径拐角外扩
+            tm.graze_from.assign(R, std::vector<std::optional<std::pair<int, int>>>(C, std::nullopt));
+            for (const auto& path : tm.ground_paths) {
+                for (size_t i = 1; i + 1 < path.size(); ++i) {
+                    const auto prev = path[i - 1];
+                    const auto cur = path[i];
+                    const auto next = path[i + 1];
+                    if (prev.first == next.first || prev.second == next.second) {
+                        continue;
+                    }
+                    const int gr = prev.first + next.first - cur.first;
+                    const int gc = prev.second + next.second - cur.second;
+                    if (gr < 0 || gc < 0 || gr >= R || gc >= C) {
+                        continue;
+                    }
+                    if (tm.ground[gr][gc] > 0.0) {
+                        continue;
+                    }
+                    tm.graze_from[gr][gc] = cur;
+                }
+            }
+        }
+    }
+
     return tm;
 }
 
@@ -3984,639 +5277,1438 @@ SPAFarmTaskPlugin::GrazeStats SPAFarmTaskPlugin::compute_cell_graze(
     return gs;
 }
 
-SPAFarmTaskPlugin::PlacementEvalResult SPAFarmTaskPlugin::evaluate_placement_full(
+SPAFarmTaskPlugin::PlacementEvalResult SPAFarmTaskPlugin::evaluate_placement_nt(
     const std::vector<PlacementAssign>& placement,
     const std::vector<UnitSlot>& bench_units,
     const StageTrafficMap& traffic,
     const PlacementEvalOptions& opts) const
 {
-    // Exact 1:1 port of the FULL `Nt(a, s, e = {}, t = null)` in service.pretty.mjs lines 5862-6301:
-    // Includes:
-    // ① focusBonds (`focusBondMul`, `coreBondMul`, `Ue(op)` 2x stacking multiplier, `Yi=60`, `Zi=30`)
-    // ② supportWeight.defense (`w`) & supportWeight.heal (`i`) weighting on road blocking, off-road tank penalty (`-80*w`), and healer coverage (`70*h*i`, `12*oe*ue*i`)
-    // ③ advance mode exposed ranged penalty (`"输出位比保护它的近战更靠近出生点"`, `C += 0.5`), ranged-ahead-of-melee road penalty (`-110*ge - 20*Fe`), stronger-blocker-behind-weaker penalty (`-25*min(4,Ce)`), infection tile drain/damage (`sa={dmg:1.44,drain:70}, Ki=45`), unguarded route penalty (`-400*ge, -250`), first-contact tile `Ft` coverage (`-120` / `+15*min(3,ge)`), and `avoidRightCol` red-gate adjacency penalty (`-600, gate++`, `-200`).
-    PlacementEvalResult res;
-    if (placement.empty()) {
-        return res;
+    // `Nt(a, s, e)` —— service.pretty.mjs L5862-6301，逐项对齐
+    // 变量名沿用 JS：f=focusBonds, w=supportWeight.defense, i=supportWeight.heal,
+    //                M=defense, C=exposed, T=advanceScore, me=gate, Z=stacking
+    PlacementEvalResult out;
+    const auto& rows = traffic.grid;
+    const int R = traffic.rows;
+    const int Cn = traffic.cols;
+    if (R <= 0 || Cn <= 0 || placement.empty()) {
+        return out;
     }
 
-    static constexpr double kInfDmg = 1.44;
-    static constexpr double kInfDrain = 70.0;
-    static constexpr double kInfExtra = 45.0;
-    static constexpr double kHealDpsMul = 0.25;
-    static constexpr double kHealAllyBase = 12.0;
-    static constexpr double kBondTierScore = 60.0;
-    static constexpr double kStackBondTierScore = 30.0;
-    static constexpr double kLeakByBlock[5] = { 1.0, 0.75, 0.5, 0.25, 0.1 };
-    static constexpr double kRouteDpsCap = 1500.0;
+    constexpr double kGi = 0.15;   // `Gi`
+    constexpr double kWi = 0.3;    // `Wi`
+    constexpr double kXi = 2.0;    // `Xi`
+    constexpr double kVi = 0.5;    // `Vi`
+    constexpr double kInfDmg = 1.44; // `sa.dmg`
+    constexpr double kInfDrain = 70.0; // `sa.drain`
+    constexpr double kKi = 45.0;
+    constexpr double kJi = 0.25;
+    constexpr double kQi = 12.0;
+    constexpr double kYi = 60.0;
+    constexpr double kZi = 30.0;
+    [[maybe_unused]] constexpr double kEs = 1.5;
+    constexpr double kFn = 12.0;
+    constexpr double kRs = 1500.0;
+    static constexpr double kTs[5] = { 1.0, 0.75, 0.5, 0.25, 0.1 };
 
     const double w = opts.support_defense_weight;
     const double heal_w = opts.support_heal_weight;
+    const std::unordered_set<std::string>& focus = opts.focus_bonds;
 
-    auto has_bond = [](const OperatorInfo& op, std::string_view bname) {
-        return std::find(op.bond_names.begin(), op.bond_names.end(), bname) != op.bond_names.end();
+    // ---- 单位视图（`a.units` / `s`）----
+    struct UnitView
+    {
+        int uid = -1;
+        const OperatorInfo* op = nullptr;
+        int r = -1;
+        int c = -1;
+        std::string facing = "RIGHT";
+        bool elite = false;
+    };
+    std::vector<UnitView> all_units;
+    std::vector<int> placed_idx;
+    for (const auto& pa : placement) {
+        UnitView uv;
+        uv.uid = static_cast<int>(all_units.size());
+        uv.op = find_operator(pa.name);
+        uv.r = pa.r;
+        uv.c = pa.c;
+        uv.facing = pa.facing.empty() ? "RIGHT" : pa.facing;
+        uv.elite = pa.elite;
+        if (uv.op != nullptr) {
+            placed_idx.push_back(uv.uid);
+        }
+        all_units.push_back(uv);
+    }
+    for (const auto& bu : bench_units) {
+        UnitView uv;
+        uv.uid = static_cast<int>(all_units.size());
+        uv.op = find_operator(bu.name);
+        uv.r = -1;
+        uv.c = -1;
+        if (uv.op != nullptr) {
+            all_units.push_back(uv);
+        }
+    }
+    auto d = [&](int uid) -> const OperatorInfo* {
+        for (const auto& u : all_units) {
+            if (u.uid == uid) {
+                return u.op;
+            }
+        }
+        return nullptr;
+    };
+
+    // ---- 基础工具 ----
+    auto is_ranged_class = [](const OperatorInfo& op) {
+        if (op.position == "RANGED") {
+            return true;
+        }
+        return op.profession == "SNIPER" || op.profession == "CASTER"
+            || op.profession == "SUPPORT" || op.profession == "MEDIC";
+    };
+    auto trait_cap = [](const OperatorTrait& tr) -> int {
+        if (auto m = regex_first_group(tr.text, "至多叠加([0-9]+)层")) {
+            return std::stoi(*m);
+        }
+        return 0;
+    };
+    auto trait_per_battle = [](const OperatorTrait& tr) {
+        return tr.text.find("每场战斗") != std::string::npos;
+    };
+    auto tankiness = [](const OperatorInfo& op) {
+        return std::max(0.4, std::min(3.0, op.max_hp / 1500.0 * (1.0 + op.def / 400.0)));
+    };
+    auto sell_value = [&](const OperatorInfo& op) {
+        for (const auto& tr : op.traits) {
+            if (tr.text.find("自身售出价格+1") != std::string::npos) {
+                return 8;
+            }
+        }
+        return op.sell_price > 0 ? op.sell_price : 1;
+    };
+    auto chess_value = [](const OperatorInfo& op) {
+        return 200.0 * (1.0 + 0.25 * (std::max(1, op.tier) - 1)) * (op.golden ? 1.4 : 1.0);
     };
     auto has_focus_bond = [&](const OperatorInfo& op) {
-        for (const auto& b : op.bond_names) {
-            if (opts.focus_bonds.count(b) > 0) {
+        for (const auto& b : op.bond_ids) {
+            if (focus.count(b) > 0) {
                 return true;
             }
         }
         return false;
     };
-    auto is_ranged_fragile = [](const OperatorInfo& op) {
-        return op.position == "RANGED" || op.profession == "SNIPER" || op.profession == "CASTER"
-            || op.profession == "SUPPORT" || op.profession == "MEDIC";
+    auto leak_factor = [&](int uid) {
+        const auto* op = d(uid);
+        const int block = op != nullptr ? op->block_cnt : 1;
+        return kTs[std::min(4, std::max(0, block))];
     };
-    auto is_tank_role = [&](const OperatorInfo& op) {
-        return op.profession == "TANK" || has_bond(op, "坚城") || has_bond(op, "强盾");
-    };
-    auto role_taunt_rank = [&](const OperatorInfo& op) -> int {
-        if (has_bond(op, "坚城")) {
-            return 3;
+    auto at = [&](int r, int c) -> char {
+        if (r < 0 || c < 0 || r >= R || c >= Cn) {
+            return '\0';
         }
-        if (has_bond(op, "强盾") || op.profession == "TANK") {
-            return 2;
-        }
-        if (op.profession == "PIONEER" || op.profession == "WARRIOR") {
-            return 1;
-        }
-        return 0;
-    };
-    auto block_strength = [&](const OperatorInfo& op) -> double {
-        return op.block_cnt * 100.0 + role_taunt_rank(op) * 30.0 + op.max_hp / 500.0;
-    };
-    auto defense_factor = [&](const OperatorInfo& op) -> double {
-        const double hp_def = std::min(2.0, (op.max_hp / 2200.0 + op.def / 450.0) * 0.5);
-        return std::min(2.2, (op.block_cnt / 2.0) * (0.5 + 0.5 * hp_def) * (1.0 + 0.2 * role_taunt_rank(op)));
-    };
-    auto effective_atk = [&](const PlacementAssign& pa, const OperatorInfo& op) -> double {
-        return op.atk * (pa.elite ? 1.4 : 1.0) * (op.profession == "MEDIC" ? kHealDpsMul : 1.0);
+        return rows[r][c];
     };
 
-    double M = 0.0; // defense
-    double Z = 0.0; // stacking
-    double C = 0.0; // exposed
-    double T = 0.0; // advance_score
-    double me = 0.0; // gate
-    int unguarded = 0;
+    double M = 0.0;
+    double C = 0.0;
+    double T = 0.0;
+    double me = 0.0;
 
-    // Precompute each placed unit's resolved OperatorInfo & world attack cells (`rangeSet`)
-    struct PlacedUnitCtx
-    {
-        PlacementAssign pa;
-        const OperatorInfo* op = nullptr;
-        std::string cell_key;
-        std::vector<std::pair<int, int>> range_cells;
-        std::unordered_set<std::string> range_set;
-    };
-    std::vector<PlacedUnitCtx> units;
-    units.reserve(placement.size());
-    std::unordered_map<std::string, size_t> by_cell;
-
-    for (const auto& pa : placement) {
-        const auto* op = find_operator(pa.name);
-        if (!op) {
-            continue;
+    // `Be`：站在地面路线上的近战
+    std::vector<int> Be;
+    for (int uid : placed_idx) {
+        const auto& u = all_units[uid];
+        if (at(u.r, u.c) == 'b' && traffic.ground[u.r][u.c] > 0.0) {
+            Be.push_back(uid);
         }
-        PlacedUnitCtx ctx;
-        ctx.pa = pa;
-        ctx.op = op;
-        ctx.cell_key = std::to_string(pa.r) + "," + std::to_string(pa.c);
-        for (const auto& off : op->base_range) {
-            auto [dr, dc] = rotate_offset(off, pa.facing);
-            int tr = pa.r + dr;
-            int tc = pa.c + dc;
-            if (tr >= 0 && tr < traffic.rows && tc >= 0 && tc < traffic.cols) {
-                ctx.range_cells.emplace_back(tr, tc);
-                ctx.range_set.insert(std::to_string(tr) + "," + std::to_string(tc));
-            }
-        }
-        by_cell[ctx.cell_key] = units.size();
-        units.push_back(std::move(ctx));
-    }
-    if (units.empty()) {
-        return res;
     }
 
-    // L5885-5897: ③ `advance` mode exposed ranged penalty ("输出位比保护它的近战更靠近出生点")
-    if (opts.advance && opts.round >= 4 && !traffic.spawns.empty()) {
-        std::vector<const PlacedUnitCtx*> melee_units;
-        for (const auto& u : units) {
-            if (!is_ranged_fragile(*u.op)) {
-                melee_units.push_back(&u);
+    // ---- advance：输出位比保护它的近战更靠前 ----
+    if (opts.advance && (opts.round <= 0 ? 1 : opts.round) >= 4) {
+        bool has_melee = false;
+        for (int uid : placed_idx) {
+            const auto* op = d(uid);
+            if (op != nullptr && !is_ranged_class(*op)) {
+                has_melee = true;
+                break;
             }
         }
-        if (!melee_units.empty()) {
-            for (const auto& ue : units) {
-                if (!is_ranged_fragile(*ue.op)) {
+        if (has_melee) {
+            std::vector<std::pair<int, int>> starts;
+            for (const auto& p : traffic.ground_paths) {
+                if (!p.empty()) {
+                    starts.push_back(p.front());
+                }
+            }
+            auto near_start = [&](const UnitView& u) {
+                return opts.avoid_right_col
+                    && std::any_of(starts.begin(), starts.end(), [&](const std::pair<int, int>& s) {
+                           return std::abs(s.first - u.r) + std::abs(s.second - u.c) == 1;
+                       });
+            };
+            std::vector<int> melee_ids;
+            for (int uid : placed_idx) {
+                const auto* op = d(uid);
+                if (op != nullptr && !is_ranged_class(*op) && !near_start(all_units[uid])) {
+                    melee_ids.push_back(uid);
+                }
+            }
+            for (int uid : placed_idx) {
+                const auto& u = all_units[uid];
+                const auto* op = d(uid);
+                if (op == nullptr || !is_ranged_class(*op) || at(u.r, u.c) == 'h') {
                     continue;
                 }
-                if (ue.pa.r >= 0 && ue.pa.r < traffic.rows && ue.pa.c >= 0 && ue.pa.c < traffic.cols
-                    && traffic.grid[ue.pa.r][ue.pa.c] == 'h') {
+                if (starts.empty()) {
                     continue;
                 }
-                std::pair<int, int> ge = traffic.spawns.front();
-                int Fe = 999;
-                for (const auto& sp : traffic.spawns) {
-                    int d = std::abs(ue.pa.r - sp.first) + std::abs(ue.pa.c - sp.second);
-                    if (d < Fe) {
-                        Fe = d;
-                        ge = sp;
-                    }
-                }
-                bool protected_by_closer_melee = false;
-                for (const auto* Ce : melee_units) {
-                    if (std::abs(Ce->pa.r - ue.pa.r) <= 2
-                        && (std::abs(Ce->pa.r - ge.first) + std::abs(Ce->pa.c - ge.second)) < Fe) {
-                        protected_by_closer_melee = true;
-                        break;
-                    }
-                }
-                if (!protected_by_closer_melee) {
+                auto nearest = *std::min_element(starts.begin(), starts.end(), [&](const auto& a, const auto& b) {
+                    return std::abs(a.first - u.r) + std::abs(a.second - u.c)
+                        < std::abs(b.first - u.r) + std::abs(b.second - u.c);
+                });
+                const int dist = std::abs(nearest.first - u.r) + std::abs(nearest.second - u.c);
+                const bool shielded = std::any_of(melee_ids.begin(), melee_ids.end(), [&](int mid) {
+                    const auto& mu = all_units[mid];
+                    return std::abs(mu.r - u.r) <= 2
+                        && std::abs(nearest.first - mu.r) + std::abs(nearest.second - mu.c) < dist;
+                });
+                if (!shielded) {
                     C += 0.5;
                 }
             }
         }
     }
 
-    // L5916-5924: Infection tiles (`tile_infection`) and incoming healer HPS per cell
-    std::unordered_set<std::string> infected_cells;
-    std::unordered_map<std::string, double> incoming_heal;
-    for (const auto& u : units) {
-        if (u.op->stack_info.infects_tile) {
-            infected_cells.insert(u.cell_key);
+    // ---- N：某格被近战堵住后的有效流量 ----
+    auto block_value = [&](int r, int c, int self_uid) {
+        if (r < 0 || c < 0 || r >= R || c >= Cn) {
+            return 0.0;
         }
-        if (u.op->is_healer) {
-            const double hps = u.op->atk * (u.pa.elite ? 1.4 : 1.0) * (u.op->profession == "MEDIC" ? 0.35 : 0.15);
-            for (const auto& rk : u.range_set) {
-                incoming_heal[rk] += hps;
+        const double base = traffic.ground[r][c];
+        if (base <= 0.0) {
+            return 0.0;
+        }
+        const char ch = rows[r][c];
+        if (ch == 'S' || ch == 'E') {
+            return 0.0;
+        }
+        double v = base;
+        const double prog = traffic.ground_progress[r][c];
+        for (int uid : Be) {
+            if (uid == self_uid) {
+                continue;
+            }
+            const auto& bu = all_units[uid];
+            if (bu.r == r && bu.c == c) {
+                v *= 2.0;
+                continue;
+            }
+            if (traffic.ground_progress[bu.r][bu.c] < prog) {
+                v *= 1.0 - std::min(1.0, traffic.ground[bu.r][bu.c]) * (1.0 - leak_factor(uid));
+            }
+        }
+        return v;
+    };
+
+    // ---- U：路口承担的分流压力 ----
+    std::unordered_map<std::string, double> U;
+    for (int uid : Be) {
+        const auto& u = all_units[uid];
+        const auto* op = d(uid);
+        if (op == nullptr || is_ranged_class(*op)) {
+            continue;
+        }
+        const double prog = traffic.ground_progress[u.r][u.c];
+        std::vector<std::pair<int, int>> ups;
+        static const int kDirs[4][2] = { { -1, 0 }, { 1, 0 }, { 0, -1 }, { 0, 1 } };
+        for (const auto& dir : kDirs) {
+            const int nr = u.r + dir[0];
+            const int nc = u.c + dir[1];
+            if (nr < 0 || nc < 0 || nr >= R || nc >= Cn) {
+                continue;
+            }
+            if (traffic.ground[nr][nc] <= 0.0 || traffic.ground_progress[nr][nc] >= prog) {
+                continue;
+            }
+            const char ch = rows[nr][nc];
+            if (ch == 'S' || ch == 'E') {
+                continue;
+            }
+            ups.emplace_back(nr, nc);
+        }
+        auto add = [&](int r, int c, double v) {
+            U[std::to_string(r) + "," + std::to_string(c)] += v;
+        };
+        add(u.r, u.c, ups.empty() ? 1.0 : 0.0);
+        for (const auto& p : ups) {
+            add(p.first, p.second, kXi / static_cast<double>(ups.size()));
+        }
+    }
+
+    // ---- q：按「是否在某条路线的接敌点之后」给格加权 ----
+    std::unordered_map<std::string, double> q;
+    {
+        auto near_any = [&](int r, int c) {
+            for (int uid : placed_idx) {
+                const auto& u = all_units[uid];
+                if (std::abs(u.r - r) + std::abs(u.c - c) <= 1) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        std::unordered_map<std::string, std::vector<double>> acc;
+        for (const auto& path : traffic.ground_paths) {
+            int engage = -1;
+            for (size_t i = 0; i < path.size(); ++i) {
+                if (near_any(path[i].first, path[i].second)) {
+                    engage = static_cast<int>(i);
+                }
+            }
+            for (size_t i = 0; i < path.size(); ++i) {
+                const std::string key = std::to_string(path[i].first) + "," + std::to_string(path[i].second);
+                acc[key].push_back((engage >= 0 && static_cast<int>(i) > engage) ? kWi : 1.0);
+            }
+        }
+        for (const auto& [key, vec] : acc) {
+            double sum = 0.0;
+            for (double v : vec) {
+                sum += v;
+            }
+            q[key] = sum / static_cast<double>(vec.size());
+        }
+    }
+
+    // ---- z/P：单格价值（带缓存）----
+    std::unordered_map<int, double> z_cache;
+    auto cell_value_raw = [&](int r, int c) -> double {
+        const double base = traffic.ground[r][c];
+        if (base <= 0.0) {
+            return 0.0;
+        }
+        const char ch = rows[r][c];
+        if (ch == 'S' || ch == 'E') {
+            return 0.0;
+        }
+        double factor = 1.0;
+        const double prog = traffic.ground_progress[r][c];
+        for (int uid : Be) {
+            const auto& bu = all_units[uid];
+            if (bu.r == r && bu.c == c) {
+                continue;
+            }
+            if (traffic.ground_progress[bu.r][bu.c] < prog) {
+                factor *= 1.0 - std::min(1.0, traffic.ground[bu.r][bu.c]) * (1.0 - leak_factor(uid));
+            }
+        }
+        const std::string key = std::to_string(r) + "," + std::to_string(c);
+        auto uit = U.find(key);
+        auto qit = q.find(key);
+        return base * std::max(kGi, factor)
+            * (1.0 + (uit != U.end() ? uit->second : 0.0))
+            * (qit != q.end() ? qit->second : 1.0);
+    };
+    auto z = [&](int r, int c) -> double {
+        const int key = r * 100 + c;
+        auto it = z_cache.find(key);
+        if (it != z_cache.end()) {
+            return it->second;
+        }
+        const double v = cell_value_raw(r, c);
+        z_cache[key] = v;
+        return v;
+    };
+
+    // ---- 治疗覆盖表 Ee + 派生判定 ----
+    std::unordered_map<std::string, std::vector<int>> heal_cover;
+    for (int uid : placed_idx) {
+        const auto& u = all_units[uid];
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
+        }
+        if (op->profession != "MEDIC" && !op->heals_allies) {
+            continue;
+        }
+        for (const auto& off : op->base_range) {
+            const auto [dr, dc] = rotate_offset(off, u.facing);
+            heal_cover[std::to_string(u.r + dr) + "," + std::to_string(u.c + dc)].push_back(uid);
+        }
+    }
+    auto covered_by_other = [&](int uid) {
+        const auto& u = all_units[uid];
+        const std::string key = std::to_string(u.r) + "," + std::to_string(u.c);
+        auto it = heal_cover.find(key);
+        if (it == heal_cover.end()) {
+            return false;
+        }
+        for (int other : it->second) {
+            if (other != uid) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::set<std::string> infection;
+    if (const auto* stage = find_stage(traffic.stage_id)) {
+        for (const auto& t : stage->infection_tiles) {
+            infection.insert(std::to_string(t.first) + "," + std::to_string(t.second));
+        }
+    }
+    auto on_infection = [&](int uid) {
+        const auto& u = all_units[uid];
+        return u.r >= 0 && infection.count(std::to_string(u.r) + "," + std::to_string(u.c)) > 0;
+    };
+    auto has_stack_trait4 = [](const OperatorInfo& op) {
+        for (const auto& tr : op.traits) {
+            bool on_deploy = false;
+            for (const auto& tag : tr.tags) {
+                if (tag == "onDeploy") {
+                    on_deploy = true;
+                }
+            }
+            if (on_deploy && tr.text.find("每场战斗") != std::string::npos) {
+                if (auto m = regex_first_group(tr.text, "至多叠加([0-9]+)层")) {
+                    if (std::stoi(*m) >= 4) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    };
+    auto has_medic_cover = [&](int uid) {
+        const auto& u = all_units[uid];
+        auto it = heal_cover.find(std::to_string(u.r) + "," + std::to_string(u.c));
+        if (it == heal_cover.end()) {
+            return false;
+        }
+        for (int other : it->second) {
+            const auto* op = d(other);
+            if (other != uid && op != nullptr && op->profession == "MEDIC") {
+                return true;
+            }
+        }
+        return false;
+    };
+    auto survives_infection = [&](int uid) {
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            return false;
+        }
+        return op->self_heal || has_stack_trait4(*op) || has_medic_cover(uid);
+    };
+    auto infection_uptime = [&](int uid) {
+        if (!on_infection(uid)) {
+            return 1.0;
+        }
+        if (survives_infection(uid)) {
+            return 1.0;
+        }
+        const auto* op = d(uid);
+        const double hp = op != nullptr && op->max_hp > 0 ? op->max_hp : 1200.0;
+        return std::min(1.0, hp / (kInfDrain * kKi));
+    };
+    std::unordered_map<int, double> dmg_taken;
+    auto damage_factor = [&](int uid) {
+        auto it = dmg_taken.find(uid);
+        if (it != dmg_taken.end()) {
+            return it->second;
+        }
+        double v = 1.0;
+        if (on_infection(uid)) {
+            v = kInfDmg * infection_uptime(uid);
+        }
+        dmg_taken[uid] = v;
+        return v;
+    };
+
+    // ---- 阻挡收益 ----
+    std::vector<std::vector<double>> S(R, std::vector<double>(Cn, 0.0));
+    std::vector<std::vector<double>> ae(R, std::vector<double>(Cn, 0.0));
+    std::unordered_map<int, double> stage_cover;
+
+    for (int uid : Be) {
+        const auto& u = all_units[uid];
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
+        }
+        const double bval = block_value(u.r, u.c, uid) * (1.0 - leak_factor(uid));
+        stage_cover[uid] = bval;
+        if (is_ranged_class(*op)) {
+            double on_road = 0.0;
+            double behind_melee = 0.0;
+            for (const auto& start_mat : traffic.ground_by_start) {
+                const double here = std::min(1.0, start_mat[u.r][u.c]);
+                if (here <= 0.0) {
+                    continue;
+                }
+                const bool shielded = std::any_of(Be.begin(), Be.end(), [&](int other) {
+                    if (other == uid) {
+                        return false;
+                    }
+                    const auto& ou = all_units[other];
+                    const auto* oop = d(other);
+                    return oop != nullptr && !is_ranged_class(*oop)
+                        && start_mat[ou.r][ou.c] > 0.0
+                        && traffic.ground_progress[ou.r][ou.c] < traffic.ground_progress[u.r][u.c];
+                });
+                if (shielded) {
+                    behind_melee += here;
+                }
+                else {
+                    on_road += here;
+                }
+            }
+            M += bval * 70.0 * 0.3 - 110.0 * on_road - 20.0 * behind_melee;
+            C += on_road;
+            continue;
+        }
+        M += bval * 70.0 * std::min(1.8, 0.4 + 0.6 * tankiness(*op) * w) * damage_factor(uid);
+    }
+
+    // ---- 身前的近战更耐打？ ----
+    for (const auto& start_mat : traffic.ground_by_start) {
+        std::vector<int> on_route;
+        for (int uid : Be) {
+            const auto& u = all_units[uid];
+            if (start_mat[u.r][u.c] > 0.0) {
+                on_route.push_back(uid);
+            }
+        }
+        std::sort(on_route.begin(), on_route.end(), [&](int a, int b) {
+            const auto& ua = all_units[a];
+            const auto& ub = all_units[b];
+            return traffic.ground_progress[ua.r][ua.c] < traffic.ground_progress[ub.r][ub.c];
+        });
+        for (size_t i = 0; i < on_route.size(); ++i) {
+            for (size_t j = i + 1; j < on_route.size(); ++j) {
+                const int front = on_route[i];
+                const int back = on_route[j];
+                const auto* of = d(front);
+                const auto* ob = d(back);
+                if (of == nullptr || ob == nullptr) {
+                    continue;
+                }
+                int back_range = 0;
+                for (const auto& off : ob->base_range) {
+                    back_range = std::max(back_range, off.first);
+                }
+                if (back_range >= 2 || has_stack_trait4(*of)) {
+                    continue;
+                }
+                const double diff = ob->block_cnt * tankiness(*ob) - of->block_cnt * tankiness(*of);
+                if (diff > 0.0) {
+                    M -= 25.0 * std::min(4.0, diff);
+                }
             }
         }
     }
 
-    auto survive_on_cell = [&](const PlacedUnitCtx& u) -> std::pair<double, double> {
-        if (infected_cells.count(u.cell_key) == 0) {
-            return { 0.0, 1.0 };
+    // ---- 感染地块 / 叠层 ----
+    double stacking = 0.0;
+    for (int uid : placed_idx) {
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
         }
-        const double net = incoming_heal[u.cell_key] - kInfDrain;
-        const double factor = (net >= 0.0)
-            ? 1.0
-            : std::max(0.15, 1.0 + net / std::max(100.0, u.op->max_hp * 0.08));
-        return { net, factor };
-    };
-
-    // L5954-5975: Per-path traffic attenuation across blockers (`N(r, c, unit)` & first-contact tiles `Ft`)
-    std::vector<double> path_leak(traffic.paths.size(), 1.0);
-    std::vector<bool> path_has_melee_blocker(traffic.paths.size(), false);
-    std::vector<std::pair<const PlacedUnitCtx*, std::string>> first_contacts;
-    std::unordered_map<std::string, double> road_blocker_traffic;
-
-    auto effective_cell_traffic = [&](int r, int c, const PlacedUnitCtx* self_u) -> double {
-        if (traffic.paths.empty()) {
-            return (r >= 0 && r < traffic.rows && c >= 0 && c < traffic.cols) ? traffic.ground_traffic[r][c] : 0.0;
+        const double mul = has_focus_bond(*op) ? 2.0 : 1.0;
+        if (has_stack_trait4(*op) && covered_by_other(uid)) {
+            stacking -= 50.0 * mul;
         }
-        const std::string key = std::to_string(r) + "," + std::to_string(c);
-        double sum = 0.0;
-        for (size_t pi = 0; pi < traffic.paths.size(); ++pi) {
-            const auto& p = traffic.paths[pi];
-            auto fl_it = p.ground_flow.find(key);
-            if (fl_it == p.ground_flow.end()) {
+        if (!on_infection(uid)) {
+            continue;
+        }
+        if (has_stack_trait4(*op)) {
+            stacking += 100.0 * mul;
+            continue;
+        }
+        if (survives_infection(uid)) {
+            continue;
+        }
+        (void)damage_factor(uid);
+    }
+
+    // ---- 近战范围极小且不在路线上 ----
+    for (int uid : placed_idx) {
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
+        }
+        if (op->position == "MELEE" && op->profession != "TANK"
+            && std::find(Be.begin(), Be.end(), uid) == Be.end()
+            && op->base_range.size() <= 2) {
+            M -= 60.0;
+        }
+    }
+    // ---- 重装不在路线上 ----
+    for (int uid : placed_idx) {
+        const auto* op = d(uid);
+        if (op != nullptr && op->profession == "TANK" && std::find(Be.begin(), Be.end(), uid) == Be.end()) {
+            M -= 80.0 * w;
+        }
+    }
+
+    // ---- 推进分 / 覆盖 ----
+    double heal_sum = 0.0;
+    for (int uid : placed_idx) {
+        const auto& u = all_units[uid];
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
+        }
+        // `T`：朝向最近出生点
+        if (!traffic.ground_paths.empty()) {
+            std::vector<std::pair<int, int>> starts;
+            for (const auto& p : traffic.ground_paths) {
+                if (!p.empty()) {
+                    starts.push_back(p.front());
+                }
+            }
+            if (!starts.empty()) {
+                auto nearest = *std::min_element(starts.begin(), starts.end(), [&](const auto& a, const auto& b) {
+                    return std::abs(a.first - u.r) + std::abs(a.second - u.c)
+                        < std::abs(b.first - u.r) + std::abs(b.second - u.c);
+                });
+                const int lane = (nearest.second > u.c) ? std::min(u.c, Cn - 4) : std::max(u.c, 0 + 3);
+                const int dr = nearest.first - u.r;
+                const int dc = nearest.second - lane;
+                const int dist = std::abs(dr) + std::abs(dc);
+                static const std::unordered_map<std::string, std::pair<int, int>> kDir = {
+                    { "RIGHT", { 0, 1 } }, { "LEFT", { 0, -1 } }, { "UP", { -1, 0 } }, { "DOWN", { 1, 0 } },
+                };
+                std::pair<int, int> fdir = { 0, 1 };
+                if (auto it = kDir.find(u.facing); it != kDir.end()) {
+                    fdir = it->second;
+                }
+                T += (20 - dist) * 4.0
+                    + (fdir.first * dr + fdir.second * dc) / static_cast<double>(std::max(1, dist)) * 6.0;
+            }
+        }
+        // 面朝方向还有更靠近 E 的格
+        if (traffic.ground[u.r][u.c] > 0.0) {
+            const double prog = traffic.ground_progress[u.r][u.c];
+            static const std::unordered_map<std::string, std::pair<int, int>> kDir2 = {
+                { "RIGHT", { 0, 1 } }, { "LEFT", { 0, -1 } }, { "UP", { -1, 0 } }, { "DOWN", { 1, 0 } },
+            };
+            if (auto it = kDir2.find(u.facing); it != kDir2.end()) {
+                const int nr = u.r + it->second.first;
+                const int nc = u.c + it->second.second;
+                if (nr >= 0 && nc >= 0 && nr < R && nc < Cn && traffic.ground[nr][nc] > 0.0
+                    && traffic.ground_progress[nr][nc] < prog) {
+                    M += 1.0;
+                }
+            }
+        }
+
+        int cover_cnt = 0;
+        int heal_cnt = 0;
+        for (const auto& off : op->base_range) {
+            const auto [dr, dc] = rotate_offset(off, u.facing);
+            const int tr = u.r + dr;
+            const int tc = u.c + dc;
+            if (tr < 0 || tc < 0 || tr >= R || tc >= Cn) {
                 continue;
             }
-            double f = fl_it->second;
-            int my_prog = p.ground_progress.at(key);
-            for (const auto& other : units) {
-                if (self_u && other.cell_key == self_u->cell_key) {
+            if (op->profession == "MEDIC" || op->heals_allies) {
+                bool counted = false;
+                for (int other : placed_idx) {
+                    const auto& ou = all_units[other];
+                    if (other == uid || ou.r != tr || ou.c != tc) {
+                        continue;
+                    }
+                    const auto* oop = d(other);
+                    if (oop == nullptr || has_stack_trait4(*oop)) {
+                        continue;
+                    }
+                    auto cit = stage_cover.find(other);
+                    if (cit != stage_cover.end()) {
+                        heal_sum += cit->second;
+                        ++heal_cnt;
+                        counted = true;
+                    }
+                    break;
+                }
+                (void)counted;
+                if (op->profession == "MEDIC") {
                     continue;
                 }
-                auto opr_it = p.ground_progress.find(other.cell_key);
-                if (opr_it != p.ground_progress.end() && opr_it->second < my_prog) {
-                    int blk = is_ranged_fragile(*other.op) ? 0 : std::clamp(other.op->block_cnt, 0, 4);
-                    f *= kLeakByBlock[blk];
-                }
             }
-            sum += f;
-        }
-        return sum / std::max<size_t>(1, traffic.paths.size());
-    };
-
-    for (size_t pi = 0; pi < traffic.paths.size(); ++pi) {
-        const auto& p = traffic.paths[pi];
-        std::vector<std::pair<int, const PlacedUnitCtx*>> path_units;
-        for (const auto& u : units) {
-            auto it = p.ground_progress.find(u.cell_key);
-            if (it != p.ground_progress.end()) {
-                path_units.emplace_back(it->second, &u);
+            if (z(tr, tc) > 0.0) {
+                S[tr][tc] += chess_value(*op) * damage_factor(uid);
+                ++cover_cnt;
+            }
+            else if (tr < R && tc < Cn && traffic.graze_from[tr][tc].has_value()) {
+                ae[tr][tc] += chess_value(*op) * damage_factor(uid);
             }
         }
-        std::sort(path_units.begin(), path_units.end(), [](const auto& a, const auto& b) {
-            return a.first < b.first;
-        });
+    }
 
-        double leak = 1.0;
-        const PlacedUnitCtx* first_melee = nullptr;
-        int first_melee_prog = -1;
-        for (const auto& [prog, u_ptr] : path_units) {
-            if (!is_ranged_fragile(*u_ptr->op) && u_ptr->op->block_cnt >= 1) {
-                path_has_melee_blocker[pi] = true;
-                if (!first_melee) {
-                    first_melee = u_ptr;
-                    first_melee_prog = prog;
-                }
-                leak *= kLeakByBlock[std::clamp(u_ptr->op->block_cnt, 0, 4)];
+    // ---- 汇总阻挡收益 ----
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < Cn; ++c) {
+            if (S[r][c] != 0.0) {
+                M += S[r][c] / 20.0 * z(r, c) * (1.1 - 0.2 * traffic.ground_progress[r][c]);
+            }
+            const auto& graze = traffic.graze_from[r][c];
+            if (ae[r][c] != 0.0 && graze.has_value()) {
+                M += kVi * (ae[r][c] / 20.0) * z(graze->first, graze->second)
+                    * (1.1 - 0.2 * traffic.ground_progress[graze->first][graze->second]);
             }
         }
-        path_leak[pi] = leak;
+    }
+    M += heal_sum * 70.0 * heal_w;
 
-        if (first_melee) {
-            std::string prev_tile = first_melee->cell_key;
-            for (const auto& [k, pr] : p.ground_progress) {
-                if (pr == first_melee_prog - 1) {
-                    prev_tile = k;
+    // ---- 治疗者覆盖队友 ----
+    for (int uid : placed_idx) {
+        const auto& u = all_units[uid];
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
+        }
+        if (op->profession != "MEDIC" && !op->heals_allies) {
+            continue;
+        }
+        const double mul = (op->profession == "MEDIC") ? 1.0 : kJi;
+        int cnt = 0;
+        for (int other : placed_idx) {
+            if (other == uid) {
+                continue;
+            }
+            const auto& ou = all_units[other];
+            if (has_stack_trait4(*d(other))) {
+                continue;
+            }
+            for (const auto& off : op->base_range) {
+                const auto [dr, dc] = rotate_offset(off, u.facing);
+                if (ou.r == u.r + dr && ou.c == u.c + dc) {
+                    ++cnt;
                     break;
                 }
             }
-            first_contacts.emplace_back(first_melee, prev_tile);
+        }
+        if (cnt > 0) {
+            M += kQi * mul * cnt * heal_w;
         }
     }
 
-    // L5976-6088: Evaluate each placed unit (road blocking, supportWeight.defense/heal, infection, DPS graze, advance score)
-    for (const auto& F : units) {
-        const auto& op = *F.op;
-        const double focus_mul = has_focus_bond(op) ? 2.0 : 1.0;
-        const auto [net_heal, surv_factor] = survive_on_cell(F);
-        const double inf_dmg = (infected_cells.count(F.cell_key) > 0) ? kInfDmg : 1.0;
-
-        const bool on_ground_road = (F.pa.r >= 0 && F.pa.r < traffic.rows && F.pa.c >= 0 && F.pa.c < traffic.cols
-                                     && traffic.ground_traffic[F.pa.r][F.pa.c] > 0.0);
-        if (on_ground_road) {
-            const int blk = is_ranged_fragile(op) ? 0 : std::clamp(op.block_cnt, 0, 4);
-            const double ue = effective_cell_traffic(F.pa.r, F.pa.c, &F) * (1.0 - kLeakByBlock[blk]);
-            road_blocker_traffic[F.cell_key] = ue;
-
-            if (is_ranged_fragile(op)) {
-                double ge = 0.0;
-                double Fe = 0.0;
-                for (const auto& Ce : traffic.paths) {
-                    auto fl_it = Ce.ground_flow.find(F.cell_key);
-                    if (fl_it == Ce.ground_flow.end()) {
-                        continue;
-                    }
-                    const int my_prog = Ce.ground_progress.at(F.cell_key);
-                    bool melee_ahead = false;
-                    for (const auto& other : units) {
-                        if (other.cell_key != F.cell_key && !is_ranged_fragile(*other.op) && other.op->block_cnt >= 1) {
-                            auto o_it = Ce.ground_progress.find(other.cell_key);
-                            if (o_it != Ce.ground_progress.end() && o_it->second < my_prog) {
-                                melee_ahead = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (melee_ahead) {
-                        Fe += fl_it->second;
-                    }
-                    else {
-                        ge += fl_it->second;
-                    }
-                }
-                const double n_paths = std::max<double>(1.0, static_cast<double>(traffic.paths.size()));
-                ge /= n_paths;
-                Fe /= n_paths;
-                M += ue * 70.0 * 0.3 - 110.0 * ge - 20.0 * Fe;
-                C += ge;
+    // ---- 路线无人防守 ----
+    std::vector<int> unguarded;
+    for (size_t si = 0; si < traffic.ground_by_start.size(); ++si) {
+        const auto& mat = traffic.ground_by_start[si];
+        double survive = 1.0;
+        double covered = 0.0;
+        for (int uid : Be) {
+            const auto& u = all_units[uid];
+            if (mat[u.r][u.c] > 0.0) {
+                survive *= 1.0 - std::min(1.0, mat[u.r][u.c]) * (1.0 - leak_factor(uid));
             }
-            else {
-                // ② supportWeight.defense (`w`) weighting on melee road blocker
-                M += ue * 70.0 * std::min(1.8, 0.4 + 0.6 * defense_factor(op) * w) * surv_factor;
-
-                // L6001-6011: Stronger blocker behind weaker blocker on same path penalty
-                for (const auto& ke : traffic.paths) {
-                    auto my_it = ke.ground_progress.find(F.cell_key);
-                    if (my_it == ke.ground_progress.end()) {
-                        continue;
-                    }
-                    for (const auto& ge : units) {
-                        if (ge.cell_key == F.cell_key || is_ranged_fragile(*ge.op) || ge.op->block_cnt < 1) {
-                            continue;
-                        }
-                        auto ge_it = ke.ground_progress.find(ge.cell_key);
-                        if (ge_it != ke.ground_progress.end() && ge_it->second < my_it->second) {
-                            if (role_taunt_rank(op) < 2 && !ge.op->can_block_air) {
-                                const double diff = (block_strength(op) - block_strength(*ge.op)) / 100.0;
-                                if (diff > 0.0) {
-                                    M -= 25.0 * std::min(4.0, diff);
-                                }
-                            }
-                        }
-                    }
+        }
+        for (int r = 0; r < R; ++r) {
+            for (int c = 0; c < Cn; ++c) {
+                if (mat[r][c] > 0.0) {
+                    covered += S[r][c] * std::min(1.0, mat[r][c]);
                 }
             }
         }
-
-        // L6022-6028: Infection tile bonus/penalty
-        if (infected_cells.count(F.cell_key) > 0) {
-            if (net_heal < 0.0) {
-                M += std::max(-180.0, net_heal * 1.5);
-            }
-            else {
-                M += 25.0;
-            }
-            if (op.stack_info.uses_infected_tile) {
-                Z += kInfExtra * focus_mul;
-            }
+        const double risk = survive * std::max(0.0, 1.0 - covered / kRs);
+        if (risk > 0.3) {
+            unguarded.push_back(static_cast<int>(si));
         }
-
-        // L6030-6033: Off-road melee & tank penalties (`-60`, `-80 * w`)
-        if (!is_ranged_fragile(op) && !on_ground_road && F.range_cells.size() <= 2) {
-            M -= 60.0;
-        }
-        if (is_tank_role(op) && !on_ground_road) {
-            M -= 80.0 * w;
-        }
-
-        // L6038-6046: Advance score `T` toward nearest spawn
-        if (!traffic.spawns.empty()) {
-            std::pair<int, int> ge = traffic.spawns.front();
-            int best_d = 999;
-            for (const auto& sp : traffic.spawns) {
-                int d = std::abs(F.pa.r - sp.first) + std::abs(F.pa.c - sp.second);
-                if (d < best_d) {
-                    best_d = d;
-                    ge = sp;
+        M -= 400.0 * risk;
+    }
+    if (traffic.ground_by_start.size() > 1) {
+        for (size_t si = 0; si < traffic.ground_by_start.size(); ++si) {
+            const auto& mat = traffic.ground_by_start[si];
+            const bool has_melee = std::any_of(Be.begin(), Be.end(), [&](int uid) {
+                const auto& u = all_units[uid];
+                const auto* op = d(uid);
+                return mat[u.r][u.c] > 0.0 && op != nullptr && !is_ranged_class(*op);
+            });
+            if (!has_melee) {
+                M -= 250.0;
+                if (std::find(unguarded.begin(), unguarded.end(), static_cast<int>(si)) == unguarded.end()) {
+                    unguarded.push_back(static_cast<int>(si));
                 }
             }
-            auto [f_dr, f_dc] = rotate_offset({ 0, 1 }, F.pa.facing);
-            const double ke = ge.first - F.pa.r;
-            const double we = ge.second - F.pa.c;
-            const double ot = std::abs(ke) + std::abs(we);
-            T += (20.0 - ot) * 4.0 + ((ke * f_dr + we * f_dc) / std::max(1.0, ot)) * 6.0;
         }
-
-        // L6050-6088: Attack / Heal range evaluation & `supportWeight.heal` (`heal_w`)
-        double fe = 0.0;
-        double he = 0.0;
-        double h_road = 0.0;
-        for (const auto& [tr, tc] : F.range_cells) {
-            std::string rk = std::to_string(tr) + "," + std::to_string(tc);
-            if (op.is_healer) {
-                auto rb_it = road_blocker_traffic.find(rk);
-                if (rb_it != road_blocker_traffic.end()) {
-                    h_road += rb_it->second;
-                }
+        for (int uid : placed_idx) {
+            const auto& u = all_units[uid];
+            const auto* op = d(uid);
+            if (op == nullptr || op->profession == "MEDIC") {
                 continue;
             }
-            const double gt = effective_cell_traffic(tr, tc, nullptr);
-            if (gt > 0.0) {
-                double imp = 1.0;
-                if (auto imp_it = traffic.road_importance.find(rk); imp_it != traffic.road_importance.end()) {
-                    imp = imp_it->second;
+            std::set<int> routes;
+            for (size_t si = 0; si < traffic.ground_by_start.size(); ++si) {
+                const auto& mat = traffic.ground_by_start[si];
+                if (std::find(Be.begin(), Be.end(), uid) != Be.end() && mat[u.r][u.c] > 0.0) {
+                    routes.insert(static_cast<int>(si));
                 }
-                fe += gt * (0.7 + 0.3 * imp);
-            }
-            if (is_ranged_fragile(op) || F.range_cells.size() > 2) {
-                he += traffic.air_traffic[tr][tc];
-            }
-        }
-
-        if (op.is_healer) {
-            M += h_road * 70.0 * heal_w;
-            int covered_allies = 0;
-            for (const auto& other : units) {
-                if (other.cell_key != F.cell_key && F.range_set.count(other.cell_key) > 0) {
-                    ++covered_allies;
+                for (const auto& off : op->base_range) {
+                    const auto [dr, dc] = rotate_offset(off, u.facing);
+                    const int tr = u.r + dr;
+                    const int tc = u.c + dc;
+                    if (tr >= 0 && tc >= 0 && tr < R && tc < Cn && mat[tr][tc] > 0.0) {
+                        routes.insert(static_cast<int>(si));
+                        break;
+                    }
                 }
             }
-            const double oe = (op.profession == "MEDIC") ? 1.0 : 0.25;
-            M += kHealAllyBase * oe * covered_allies * heal_w;
-        }
-        else {
-            const double dps_unit = (effective_atk(F.pa, op) * inf_dmg * surv_factor) / 600.0;
-            M += dps_unit * (fe * 55.0 + he * 18.0);
-        }
-    }
-
-    // L6090-6101: Unguarded spawn routes penalty (`-400 * ge`, `-250`)
-    for (size_t pi = 0; pi < traffic.paths.size(); ++pi) {
-        const auto& p = traffic.paths[pi];
-        double route_dps = 0.0;
-        for (const auto& u : units) {
-            if (u.op->is_healer) {
-                continue;
-            }
-            double covered_flow = 0.0;
-            for (const auto& rk : u.range_set) {
-                if (auto fl_it = p.ground_flow.find(rk); fl_it != p.ground_flow.end()) {
-                    covered_flow += fl_it->second;
-                }
-            }
-            if (covered_flow > 0.0) {
-                const auto [nh, sf] = survive_on_cell(u);
-                (void)nh;
-                const double idmg = (infected_cells.count(u.cell_key) > 0) ? kInfDmg : 1.0;
-                route_dps += effective_atk(u.pa, *u.op) * idmg * sf * std::min(2.5, covered_flow);
-            }
-        }
-        const double ge = path_leak[pi] * std::max(0.0, 1.0 - route_dps / kRouteDpsCap);
-        M -= 400.0 * ge;
-        if (traffic.paths.size() > 1 && !path_has_melee_blocker[pi]) {
-            ++unguarded;
-            M -= 250.0;
-        }
-    }
-
-    // L6118-6135: ① `focusBonds` & core bonds scoring (`Yi=60`, `Zi=30`, `focusBondMul`, `coreBondMul`)
-    std::unordered_map<std::string, std::set<std::string>> field_bond_ops;
-    std::unordered_map<std::string, std::set<std::string>> all_bond_ops;
-    for (const auto& u : units) {
-        for (const auto& b : u.op->bond_names) {
-            field_bond_ops[b].insert(u.op->name);
-            all_bond_ops[b].insert(u.op->name);
-        }
-        if (auto eq_it = m_unit_equipped_bond.find(u.op->name); eq_it != m_unit_equipped_bond.end() && !eq_it->second.empty()) {
-            field_bond_ops[eq_it->second].insert(u.op->name);
-            all_bond_ops[eq_it->second].insert(u.op->name);
-        }
-    }
-    for (const auto& bu : bench_units) {
-        if (const auto* bop = find_operator(bu.name)) {
-            for (const auto& b : bop->bond_names) {
-                all_bond_ops[b].insert(bop->name);
+            if (routes.size() >= 2) {
+                M += 20.0 * (static_cast<double>(routes.size()) - 1.0);
             }
         }
     }
 
-    std::unordered_set<std::string> active_bonds;
-    for (const auto& b : m_bonds) {
-        const auto& set_ref = (b.count_mode == "BOARD_AND_DECK" || b.count_mode == "FIELD_AND_BENCH")
-            ? all_bond_ops[b.name]
-            : field_bond_ops[b.name];
-        const int G = static_cast<int>(set_ref.size());
-        int oe = 0;
-        for (int th : b.thresholds) {
-            if (G >= th) {
-                ++oe;
-            }
-        }
-        if (oe <= 0) {
+    // ---- 盟约激活加成 ----
+    std::set<std::string> active_bonds;
+    for (const auto& bond : m_bonds) {
+        if (!bond.stackable) {
             continue;
         }
-        active_bonds.insert(b.name);
-        const double ue = (opts.focus_bonds.count(b.name) > 0) ? opts.focus_bond_mul : 1.0;
-        const double ge = b.is_core ? opts.core_bond_mul : 1.0;
-        M += oe * kBondTierScore * ge * ue;
-        if (b.desc.find("层数") != std::string::npos || b.desc.find("叠加") != std::string::npos) {
-            Z += oe * kStackBondTierScore * ge * ue;
+        std::set<std::string> names;
+        for (int uid : placed_idx) {
+            const auto* op = d(uid);
+            if (op != nullptr && std::find(op->bond_ids.begin(), op->bond_ids.end(), bond.bond_id) != op->bond_ids.end()) {
+                names.insert(op->name);
+            }
+        }
+        const int threshold = bond.thresholds.empty() ? 99 : bond.thresholds.front();
+        if (static_cast<int>(names.size()) >= threshold) {
+            active_bonds.insert(bond.bond_id);
+        }
+    }
+    double stack_total = stacking;
+    for (const auto& bond : m_bonds) {
+        std::set<std::string> names;
+        for (int uid : placed_idx) {
+            const auto* op = d(uid);
+            if (op != nullptr && std::find(op->bond_ids.begin(), op->bond_ids.end(), bond.bond_id) != op->bond_ids.end()) {
+                names.insert(op->name);
+            }
+        }
+        const int cnt = static_cast<int>(names.size());
+        int tier = 0;
+        if (bond.inverse) {
+            tier = (!bond.thresholds.empty() && cnt == bond.thresholds.front()) ? 1 : 0;
+        }
+        else {
+            for (int th : bond.thresholds) {
+                if (cnt >= th) {
+                    ++tier;
+                }
+            }
+        }
+        if (tier == 0) {
+            continue;
+        }
+        const double focus_mul = focus.count(bond.bond_id) > 0 ? opts.focus_bond_mul : 1.0;
+        const double core_mul = bond.is_core ? opts.core_bond_mul : 1.0;
+        M += tier * kYi * core_mul * focus_mul;
+        if (bond.stackable) {
+            stack_total += tier * kZi * core_mul * focus_mul;
         }
     }
 
-    // L6136-6148: First-contact tile `Ft` coverage check (`-120` if 0 allies cover, `+15*min(3,ge)` otherwise)
-    for (const auto& [blocker_u, ft_key] : first_contacts) {
-        int ge = 0;
-        for (const auto& ke : units) {
-            if (ke.cell_key == blocker_u->cell_key) {
-                continue;
-            }
-            if (ke.range_set.count(ft_key) > 0 || ke.range_set.count(blocker_u->cell_key) > 0) {
-                ++ge;
+
+    // ---- `Ft`：首个接敌格（路径上第一个紧邻近战的格）----
+    std::set<std::string> first_contact;
+    for (const auto& path : traffic.ground_paths) {
+        int engage = -1;
+        for (size_t i = 0; i < path.size(); ++i) {
+            for (int uid : Be) {
+                const auto& u = all_units[uid];
+                const auto* op = d(uid);
+                if (u.r == path[i].first && u.c == path[i].second && op != nullptr && !is_ranged_class(*op)) {
+                    engage = static_cast<int>(i);
+                }
             }
         }
-        if (ge == 0) {
+        if (engage > 0) {
+            first_contact.insert(std::to_string(path[engage - 1].first) + "," + std::to_string(path[engage - 1].second));
+        }
+    }
+    auto in_range_of = [&](int uid, int r, int c) {
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            return false;
+        }
+        const auto& u = all_units[uid];
+        for (const auto& off : op->base_range) {
+            const auto [dr, dc] = rotate_offset(off, u.facing);
+            if (u.r + dr == r && u.c + dc == c) {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (const auto& key : first_contact) {
+        const auto comma = key.find(',');
+        const int r = std::stoi(key.substr(0, comma));
+        const int c = std::stoi(key.substr(comma + 1));
+        int blocker = -1;
+        for (int uid : Be) {
+            const auto& u = all_units[uid];
+            if (std::abs(u.r - r) + std::abs(u.c - c) == 1) {
+                blocker = uid;
+                break;
+            }
+        }
+        int others = 0;
+        for (int uid : placed_idx) {
+            if (uid == blocker) {
+                continue;
+            }
+            if (in_range_of(uid, r, c)) {
+                ++others;
+            }
+            else if (blocker >= 0) {
+                const auto& bu = all_units[blocker];
+                if (in_range_of(uid, bu.r, bu.c)) {
+                    ++others;
+                }
+            }
+        }
+        if (others == 0) {
             M -= 120.0;
         }
         else {
-            M += 15.0 * std::min(3, ge);
+            M += 15.0 * std::min(3, others);
         }
     }
 
-    // L6149-6179: `avoidRightCol` red-gate adjacency penalty & single-tile spawn penalty
+    // ---- avoidRightCol：贴着红门的干员 ----
     if (opts.avoid_right_col) {
-        for (const auto& u : units) {
-            for (const auto& sp : traffic.spawns) {
-                if (std::abs(u.pa.r - sp.first) + std::abs(u.pa.c - sp.second) == 1) {
-                    M -= 600.0;
-                    me += 1.0;
+        std::set<int> handled;
+        std::set<std::string> start_cells;
+        for (const auto& path : traffic.ground_paths) {
+            if (!path.empty()) {
+                start_cells.insert(std::to_string(path.front().first) + "," + std::to_string(path.front().second));
+            }
+        }
+        for (const auto& key : start_cells) {
+            const auto comma = key.find(',');
+            const int r = std::stoi(key.substr(0, comma));
+            const int c = std::stoi(key.substr(comma + 1));
+            for (int uid : placed_idx) {
+                const auto& u = all_units[uid];
+                if (handled.count(uid) > 0 || std::abs(u.r - r) + std::abs(u.c - c) != 1) {
+                    continue;
+                }
+                handled.insert(uid);
+                int others = 0;
+                for (int other : placed_idx) {
+                    if (other == uid) {
+                        continue;
+                    }
+                    if (in_range_of(other, u.r, u.c) || in_range_of(other, r, c)) {
+                        ++others;
+                    }
+                }
+                M -= 600.0;
+                me += 1.0;
+            }
+        }
+    }
+
+    // ---- `V`：已激活的可叠层盟约（供 `front1/back1` 与休息期共用）----
+    std::set<std::string> stackable_active;
+    for (const auto& bond : m_bonds) {
+        if (!bond.stackable) {
+            continue;
+        }
+        std::set<std::string> names;
+        for (int uid : placed_idx) {
+            const auto* op = d(uid);
+            if (op != nullptr
+                && std::find(op->bond_ids.begin(), op->bond_ids.end(), bond.bond_id) != op->bond_ids.end()) {
+                names.insert(op->name);
+            }
+        }
+        const int th = bond.thresholds.empty() ? 99 : bond.thresholds.front();
+        if (static_cast<int>(names.size()) >= th) {
+            stackable_active.insert(bond.bond_id);
+        }
+    }
+    // `f`：聚焦盟约的 bondId 集合（用于 `+1` 倍判定）
+    std::set<std::string> focus_ids;
+    for (const auto& name : opts.focus_bonds) {
+        for (const auto& bond : m_bonds) {
+            if (bond.name == name) {
+                focus_ids.insert(bond.bond_id);
+            }
+        }
+    }
+    auto bond_id_of = [&](const std::string& name) {
+        for (const auto& bond : m_bonds) {
+            if (bond.name == name) {
+                return bond.bond_id;
+            }
+        }
+        return std::string();
+    };
+    auto bond_name_of = [&](const std::string& id) {
+        for (const auto& bond : m_bonds) {
+            if (bond.bond_id == id) {
+                return bond.name;
+            }
+        }
+        return id;
+    };
+
+    // `St(F)`：攻击范围覆盖值 + 首接格数
+    auto range_cover = [&](int uid, double& v_out, int& engage_out) {
+        v_out = 0.0;
+        engage_out = 0;
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            return;
+        }
+        const auto& u = all_units[uid];
+        const bool ranged = is_ranged_class(*op);
+        for (const auto& off : op->base_range) {
+            const auto [dr, dc] = rotate_offset(off, u.facing);
+            const int rr = u.r + dr;
+            const int cc = u.c + dc;
+            if (rr >= 0 && cc >= 0 && rr < R && cc < Cn && traffic.ground[rr][cc] > 0.0) {
+                const char ch = rows[rr][cc];
+                if (ch != 'S' && ch != 'E') {
+                    const double qv = [&]() {
+                        auto it = q.find(std::to_string(rr) + "," + std::to_string(cc));
+                        return it == q.end() ? 1.0 : it->second;
+                    }();
+                    v_out += traffic.ground[rr][cc]
+                        * (ranged ? 0.5 : 1.2 - traffic.ground_progress[rr][cc]) * qv;
+                }
+            }
+            if (first_contact.count(std::to_string(rr) + "," + std::to_string(cc)) > 0) {
+                ++engage_out;
+            }
+        }
+    };
+
+    // `Tt`：场上所有干员的售出价格之和（`ur` 的「售出价格」分支要用）
+    int total_sell = 0;
+    for (int uid : placed_idx) {
+        const auto* op = d(uid);
+        if (op != nullptr) {
+            total_sell += static_cast<int>(sell_value(*op));
+        }
+    }
+    // `ur(text)`：休息期结束时叠层数（供 `front1` 的「特质与其相同」与休息期块共用）
+    auto rest_layers = [&](const std::string& text) -> int {
+        if (text.find("休整期结束时") == std::string::npos) {
+            return 0;
+        }
+        if (text.find("身前一格") != std::string::npos || text.find("身后一格") != std::string::npos
+            || text.find("同一行") != std::string::npos || text.find("本回合每") != std::string::npos
+            || text.find("场上每") != std::string::npos || text.find("整备区每") != std::string::npos) {
+            return 0;
+        }
+        std::vector<std::string> bonds;
+        size_t pos = 0;
+        while (true) {
+            const size_t a = text.find("【", pos);
+            if (a == std::string::npos) {
+                break;
+            }
+            const size_t b = text.find("】", a + 3);
+            if (b == std::string::npos) {
+                break;
+            }
+            const std::string name = text.substr(a + 3, b - (a + 3));
+            const std::string id = bond_id_of(name);
+            if (!id.empty() && stackable_active.count(id) > 0) {
+                bonds.push_back(id);
+            }
+            pos = b + 3;
+        }
+        if (text.find("售出价格") != std::string::npos && text.find("场上所有干员") != std::string::npos) {
+            if (bonds.empty()) {
+                return 0;
+            }
+            int cap = 99;
+            if (auto m = regex_first_group(text, "至多叠加([0-9]+)层")) {
+                cap = std::stoi(*m);
+            }
+            return std::min(cap, total_sell) * static_cast<int>(bonds.size());
+        }
+        int per = 0;
+        if (auto m = regex_first_group(text, "层数\\+([0-9]+)")) {
+            per = std::stoi(*m);
+        }
+        if (per == 0) {
+            return 0;
+        }
+        if (text.find("层数最多") != std::string::npos || text.find("核心盟约") != std::string::npos) {
+            return stackable_active.empty() ? 0 : per;
+        }
+        return per * static_cast<int>(bonds.size());
+    };
+
+    // ---- `Mt`：同名干员只让左上角第一名计叠层 ----
+    std::unordered_map<std::string, int> first_by_name;
+    {
+        std::vector<int> sorted = placed_idx;
+        std::sort(sorted.begin(), sorted.end(), [&](int a, int b) {
+            if (all_units[a].r != all_units[b].r) {
+                return all_units[a].r < all_units[b].r;
+            }
+            return all_units[a].c < all_units[b].c;
+        });
+        for (int uid : sorted) {
+            const auto* op = d(uid);
+            if (op == nullptr) {
+                continue;
+            }
+            if (first_by_name.count(op->name) == 0) {
+                first_by_name[op->name] = uid;
+            }
+        }
+    }
+
+    // ---- 特质标签叠层（`Nt` L6198-6280）----
+    for (int uid : placed_idx) {
+        const auto* op = d(uid);
+        if (op == nullptr) {
+            continue;
+        }
+        const auto& u = all_units[uid];
+        const double oe = has_focus_bond(*op) ? 2.0 : 1.0;
+        auto fit = first_by_name.find(op->name);
+        if (fit == first_by_name.end() || fit->second != uid) {
+            continue; // 同名只左上角第一名计
+        }
+
+        // `<战斗中>...每击倒一名敌人...层数+`
+        for (const auto& tr : op->traits) {
+            const std::string t = strip_ws(tr.text);
+            const bool in_range_tag = std::find(tr.tags.begin(), tr.tags.end(), "inRange") != tr.tags.end();
+            if (in_range_tag || t.find("<战斗中>") == std::string::npos) {
+                continue;
+            }
+            static const std::regex kKnock(R"(每击倒一名敌人[^<]*层数\+)");
+            if (!std::regex_search(t, kKnock)) {
+                continue;
+            }
+            double v = 0.0;
+            int engage = 0;
+            range_cover(uid, v, engage);
+            stacking += (10.0 * v + 30.0 * engage) * oe;
+        }
+
+        for (const auto& tr : op->traits) {
+            const int cap = trait_cap(tr);
+            const bool per_battle = trait_per_battle(tr);
+            for (const auto& tag : tr.tags) {
+                if (tag == "front1" || tag == "back1") {
+                    const int k = (tag == "front1") ? 1 : -1;
+                    int dr = 0;
+                    int dc = 0;
+                    if (u.facing == "RIGHT") {
+                        dr = 0;
+                        dc = 1;
+                    }
+                    else if (u.facing == "LEFT") {
+                        dr = 0;
+                        dc = -1;
+                    }
+                    else if (u.facing == "UP") {
+                        dr = -1;
+                        dc = 0;
+                    }
+                    else {
+                        dr = 1;
+                        dc = 0;
+                    }
+                    const int nr = u.r + dr * k;
+                    const int nc = u.c + dc * k;
+                    int nb = -1;
+                    for (int other : placed_idx) {
+                        if (all_units[other].r == nr && all_units[other].c == nc) {
+                            nb = other;
+                            break;
+                        }
+                    }
+                    if (nb < 0) {
+                        continue;
+                    }
+                    const auto* nop = d(nb);
+                    if (nop == nullptr) {
+                        continue;
+                    }
+                    if (tr.text.find("特质与其相同") != std::string::npos) {
+                        double ct = 0.0;
+                        for (const auto& ntr : nop->traits) {
+                            ct += rest_layers(ntr.text);
+                        }
+                        if (ct > 0.0) {
+                            stacking += ct * kFn * oe;
+                        }
+                    }
+                    else {
+                        std::vector<std::string> bonds;
+                        const bool self_and = tr.text.find("自身及") != std::string::npos || tr.text.find("自身以及") != std::string::npos;
+                        for (const auto& b : op->bond_ids) {
+                            if (self_and) {
+                                bonds.push_back(b);
+                            }
+                        }
+                        for (const auto& b : nop->bond_ids) {
+                            bonds.push_back(b);
+                        }
+                        std::set<std::string> uniq;
+                        for (const auto& b : bonds) {
+                            if (stackable_active.count(b) > 0) {
+                                uniq.insert(b);
+                            }
+                        }
+                        if (!uniq.empty()) {
+                            int layers = 0;
+                            if (tr.text.find("售出价格") != std::string::npos) {
+                                layers = 2 * static_cast<int>(sell_value(*nop));
+                            }
+                            else if (auto m = regex_first_group(tr.text, "层数\\+([0-9]+)")) {
+                                layers = std::stoi(*m);
+                            }
+                            else {
+                                layers = 6;
+                            }
+                            bool any_focus = false;
+                            for (const auto& b : uniq) {
+                                if (focus_ids.count(b) > 0) {
+                                    any_focus = true;
+                                    break;
+                                }
+                            }
+                            stacking += layers * kFn * static_cast<double>(uniq.size()) * (any_focus ? 2.0 : 1.0);
+                        }
+                    }
+                }
+                else if (tag == "sameRow") {
+                    int cnt = 0;
+                    for (int other : placed_idx) {
+                        if (other != uid && all_units[other].r == u.r) {
+                            ++cnt;
+                        }
+                    }
+                    stacking += 12.0 * static_cast<double>(cnt) * oe;
+                }
+                else if (tag == "around8") {
+                    const std::string t = strip_ws(tr.text);
+                    if (t.find("周围八格每有一名敌人") == std::string::npos) {
+                        continue;
+                    }
+                    double gsum = 0.0;
+                    int fc = 0;
+                    for (int dr = -1; dr <= 1; ++dr) {
+                        for (int dc = -1; dc <= 1; ++dc) {
+                            if (dr == 0 && dc == 0) {
+                                continue;
+                            }
+                            const int rr = u.r + dr;
+                            const int cc = u.c + dc;
+                            if (rr < 0 || cc < 0 || rr >= R || cc >= Cn) {
+                                continue;
+                            }
+                            if (traffic.ground[rr][cc] > 0.0) {
+                                const char ch = rows[rr][cc];
+                                if (ch != 'S' && ch != 'E') {
+                                    gsum += traffic.ground[rr][cc];
+                                }
+                            }
+                            if (first_contact.count(std::to_string(rr) + "," + std::to_string(cc)) > 0) {
+                                ++fc;
+                            }
+                        }
+                    }
+                    stacking += (12.0 * gsum + 40.0 * static_cast<double>(fc)) * oe;
+                }
+                else if (tag == "onSkill"
+                    && std::find(tr.tags.begin(), tr.tags.end(), "front1") == tr.tags.end()) {
+                    double v = 0.0;
+                    int engage = 0;
+                    range_cover(uid, v, engage);
+                    stacking += (6.0 * v + 20.0 * engage) * oe;
+                }
+                else if (tag == "around4" || tag == "around12") {
+                    const int rad = (tag == "around4") ? 1 : 2;
+                    int cnt = 0;
+                    for (int other : placed_idx) {
+                        if (other == uid) {
+                            continue;
+                        }
+                        const int dist = std::max(
+                            std::abs(all_units[other].r - u.r),
+                            std::abs(all_units[other].c - u.c));
+                        if (dist <= rad) {
+                            ++cnt;
+                        }
+                    }
+                    stacking += 12.0 * static_cast<double>(cnt) * oe;
+                }
+                else if (tag == "inRange") {
+                    double v = 0.0;
+                    int engage = 0;
+                    range_cover(uid, v, engage);
+                    stacking += (14.0 * v + 40.0 * engage) * oe;
+                }
+                else if (tag == "onDeploy" && per_battle && cap >= 4) {
+                    const double cell = block_value(u.r, u.c, uid);
+                    const double base = (cell > 0.0 ? cell : 0.0) * 0.3;
+                    const double g = traffic.ground_progress[u.r][u.c];
+                    stacking += 60.0 * base * (1.4 - g) * oe;
+                }
+            }
+        }
+    }
+
+    // ---- 休息期叠层（`lr`）—— service.pretty.mjs L6288-6300 ----
+    {
+        std::set<std::string> lr_done;
+        std::vector<int> order = placed_idx;
+        for (size_t k = 0; k < all_units.size(); ++k) {
+            if (std::find(placed_idx.begin(), placed_idx.end(), static_cast<int>(k)) == placed_idx.end()) {
+                order.push_back(static_cast<int>(k));
+            }
+        }
+        // JS：`Number(Xt.has(oe.uid)) - Number(Xt.has(G.uid))` —— 未上场的排在前面
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
+            const bool pa = std::find(placed_idx.begin(), placed_idx.end(), a) != placed_idx.end();
+            const bool pb = std::find(placed_idx.begin(), placed_idx.end(), b) != placed_idx.end();
+            return static_cast<int>(pa) < static_cast<int>(pb);
+        });
+        for (int uid : order) {
+            const auto* op = d(uid);
+            if (op == nullptr) {
+                continue;
+            }
+            const bool on_board = std::find(placed_idx.begin(), placed_idx.end(), uid) != placed_idx.end();
+            bool any_focus_bond = false;
+            for (const auto& b : op->bond_ids) {
+                if (focus_ids.count(b) > 0) {
+                    any_focus_bond = true;
                     break;
                 }
             }
-            int max_deploy_c = -1;
-            for (int c = 0; c < traffic.cols; ++c) {
-                char ch = traffic.grid[u.pa.r][c];
-                if (ch == 'a' || ch == 'b' || ch == 'h') {
-                    max_deploy_c = std::max(max_deploy_c, c);
+            const double mul = any_focus_bond ? 2.0 : 1.0;
+            // `!(on_board && Mt.get(name)?.uid !== uid) && !lr.has(name)`
+            if (on_board) {
+                auto it = first_by_name.find(op->name);
+                if (it == first_by_name.end() || it->second != uid) {
+                    continue;
                 }
             }
-            const bool can_frontline = is_tank_role(*u.op)
-                || u.op->profession == "WARRIOR"
-                || u.op->profession == "PIONEER"
-                || u.op->stack_info.on_deploy;
-            if (u.pa.c == max_deploy_c && !can_frontline) {
-                M -= 200.0;
-            }
-        }
-    }
-    for (const auto& p : traffic.paths) {
-        if (p.is_single_tile && !p.first_tile.empty()) {
-            auto it = by_cell.find(p.first_tile);
-            if (it != by_cell.end()) {
-                const auto& u = units[it->second];
-                const bool ok = is_tank_role(*u.op) || u.op->profession == "WARRIOR"
-                    || u.op->profession == "PIONEER" || u.op->stack_info.on_deploy;
-                if (!ok) {
-                    M -= 150.0;
-                }
-            }
-        }
-    }
-
-    // L6181-6285: Trait stacking geometry score (`front1`, `back1`, `sameRow`, `around4/8/12`, `inRange`, `on_deploy`, `on_skill`, `end_of_prep`)
-    for (size_t i = 0; i < units.size(); ++i) {
-        const auto& u = units[i];
-        const auto& op = *u.op;
-        const double oe = has_focus_bond(op) ? 2.0 : 1.0;
-
-        for (const auto& rule : op.stack_info.rules) {
-            if (!rule.need_bond.empty() && active_bonds.count(rule.need_bond) == 0) {
+            if (lr_done.count(op->name) > 0) {
                 continue;
             }
-            int matched_neighbors = 0;
-            for (size_t j = 0; j < units.size(); ++j) {
-                if (i == j && rule.other_only) {
+            for (const auto& tr : op->traits) {
+                const std::string& text = tr.text;
+                if (text.find("休整期结束时") == std::string::npos) {
                     continue;
                 }
-                const auto& nb = units[j];
-                if (!rule.need_bond.empty() && !has_bond(*nb.op, rule.need_bond)) {
+                if (!on_board && text.find("整备区也生效") == std::string::npos) {
                     continue;
                 }
-                const int dr = nb.pa.r - u.pa.r;
-                const int dc = nb.pa.c - u.pa.c;
-                const int manhattan = std::abs(dr) + std::abs(dc);
-                const int chebyshev = std::max(std::abs(dr), std::abs(dc));
-                bool geom_ok = false;
-                if (rule.geom == "front1") {
-                    auto [fdr, fdc] = rotate_offset({ 0, 1 }, u.pa.facing);
-                    geom_ok = (dr == fdr && dc == fdc);
+                if (text.find("身前一格") != std::string::npos || text.find("身后一格") != std::string::npos
+                    || text.find("同一行") != std::string::npos || text.find("本回合每") != std::string::npos
+                    || text.find("场上每") != std::string::npos || text.find("整备区每") != std::string::npos) {
+                    continue;
                 }
-                else if (rule.geom == "back1") {
-                    auto [bdr, bdc] = rotate_offset({ 0, -1 }, u.pa.facing);
-                    geom_ok = (dr == bdr && dc == bdc);
+                int layer = 0;
+                if (text.find("售出价格") != std::string::npos && text.find("场上所有干员") != std::string::npos) {
+                    int cap = 99;
+                    if (auto m = regex_first_group(text, "至多叠加([0-9]+)层")) {
+                        cap = std::stoi(*m);
+                    }
+                    int bond_cnt = 0;
+                    {
+                        size_t pos = 0;
+                        while (true) {
+                            const size_t a = text.find("【", pos);
+                            if (a == std::string::npos) {
+                                break;
+                            }
+                            const size_t b = text.find("】", a + 3);
+                            if (b == std::string::npos) {
+                                break;
+                            }
+                            const std::string id = bond_id_of(text.substr(a + 3, b - (a + 3)));
+                            if (!id.empty() && stackable_active.count(id) > 0) {
+                                ++bond_cnt;
+                            }
+                            pos = b + 3;
+                        }
+                    }
+                    if (bond_cnt > 0) {
+                        layer = std::min(cap, total_sell) * bond_cnt;
+                    }
                 }
-                else if (rule.geom == "sameRow") {
-                    geom_ok = (dr == 0 && dc != 0);
+                else {
+                    int per = 0;
+                    if (auto m = regex_first_group(text, "层数\\+([0-9]+)")) {
+                        per = std::stoi(*m);
+                    }
+                    if (per == 0) {
+                        continue;
+                    }
+                    if (text.find("层数最多") != std::string::npos || text.find("核心盟约") != std::string::npos) {
+                        layer = stackable_active.empty() ? 0 : per;
+                    }
+                    else {
+                        int bond_cnt = 0;
+                        size_t pos = 0;
+                        while (true) {
+                            const size_t a = text.find("【", pos);
+                            if (a == std::string::npos) {
+                                break;
+                            }
+                            const size_t b = text.find("】", a + 3);
+                            if (b == std::string::npos) {
+                                break;
+                            }
+                            const std::string id = bond_id_of(text.substr(a + 3, b - (a + 3)));
+                            if (!id.empty() && stackable_active.count(id) > 0) {
+                                ++bond_cnt;
+                            }
+                            pos = b + 3;
+                        }
+                        layer = per * bond_cnt;
+                    }
                 }
-                else if (rule.geom == "around4") {
-                    geom_ok = (manhattan == 1);
-                }
-                else if (rule.geom == "around8") {
-                    geom_ok = (chebyshev == 1);
-                }
-                else if (rule.geom == "around12") {
-                    geom_ok = (manhattan >= 1 && manhattan <= 2);
-                }
-                else if (rule.geom == "inRange") {
-                    geom_ok = (u.range_set.count(nb.cell_key) > 0);
-                }
-                if (geom_ok) {
-                    ++matched_neighbors;
+                if (layer > 0) {
+                    lr_done.insert(op->name);
+                    stacking += layer * kFn * mul;
                 }
             }
-            if (matched_neighbors > 0) {
-                Z += std::min(3, matched_neighbors) * 38.0 * oe;
-            }
-            else {
-                Z -= 15.0 * oe;
-            }
-        }
-
-        if (op.stack_info.on_deploy) {
-            const bool on_road = (u.pa.r >= 0 && u.pa.r < traffic.rows && u.pa.c >= 0 && u.pa.c < traffic.cols
-                                  && traffic.ground_traffic[u.pa.r][u.pa.c] > 0.0);
-            Z += (on_road ? 32.0 : 24.0) * oe;
-        }
-        if (op.stack_info.on_skill) {
-            GrazeStats gs = compute_cell_graze(traffic, op, u.pa.r, u.pa.c, u.pa.facing);
-            if (gs.ground + gs.air > 0.05) {
-                Z += 22.0 * std::min(2.5, gs.ground + gs.air) * oe;
-            }
-            else {
-                Z -= 10.0 * oe;
-            }
-        }
-        if (op.stack_info.end_of_prep) {
-            Z += 22.0 * oe;
         }
     }
 
-    res.defense = M;
-    res.stacking = Z;
-    res.exposed = C;
-    res.advance_score = T;
-    res.gate = me;
-    res.unguarded_routes = unguarded;
-    res.score = M + Z - C * 80.0 + (opts.advance ? T : 0.0);
-    return res;
+    // `bossSide`：把推进分替换成“整体靠左/靠右”
+    if (!opts.boss_side.empty()) {
+        double col_sum = 0.0;
+        int right_facing = 0;
+        for (int uid : placed_idx) {
+            col_sum += all_units[uid].c;
+            if (all_units[uid].facing == "RIGHT") {
+                ++right_facing;
+            }
+        }
+        T = 1000.0 * (opts.boss_side == "left" ? -1.0 : 1.0) * col_sum + right_facing * 20.0;
+    }
+
+    out.defense = std::round(M);
+    out.stacking = std::round(stacking);
+    out.exposed = C;
+    out.advance_score = T;
+    out.gate = me;
+    out.unguarded_routes = static_cast<int>(unguarded.size());
+    out.score = out.defense;
+    return out;
 }
+
+
 
 double SPAFarmTaskPlugin::evaluate_placement(
     const std::vector<PlacementAssign>& placement,
@@ -4643,370 +6735,599 @@ double SPAFarmTaskPlugin::evaluate_placement(
     opts.advance = advance_mode;
     opts.round = m_current_round;
     opts.avoid_right_col = (m_current_round >= 9 && m_current_boss.find("左") == std::string::npos);
-    return evaluate_placement_full(placement, bench_units, traffic, opts).score;
+    return evaluate_placement_nt(placement, bench_units, traffic, opts).score;
+}
+
+SPAFarmTaskPlugin::PlacementEvalOptions SPAFarmTaskPlugin::default_eval_options(bool advance_mode) const
+{
+    PlacementEvalOptions o;
+    o.focus_bonds = std::unordered_set<std::string>(m_active_core_bonds.begin(), m_active_core_bonds.end());
+    // 注意：JS 的 focusBonds 是 **bondId**；这里沿用名字，由 evaluate_placement_nt 内部按 bond_id 比对，
+    // 因此调用前会用 m_bonds 把名字翻译成 id。
+    o.focus_bond_mul = 2.0;
+    o.core_bond_mul = 1.5;
+    o.support_defense_weight = 1.0;
+    o.support_heal_weight = 1.0;
+    o.advance = advance_mode;
+    o.avoid_right_col = false;
+    o.round = m_current_round;
+    return o;
 }
 
 std::pair<std::vector<SPAFarmTaskPlugin::PlacementAssign>, std::vector<SPAFarmTaskPlugin::PlacementMove>>
 SPAFarmTaskPlugin::solve_placement(
     const StageTrafficMap& traffic,
     int max_deploy,
-    bool advance_mode) const
+    bool advance_mode,
+    const PlacementEvalOptions* extra) const
 {
-    // Exact 1:1 port of `Zr` + `is` + `ss` + `ws` in service.pretty.mjs lines 6302-6455 & 7560-7646:
-    // Two-stage optimization (`ss`):
-    // - Stage 1 maximizes defense (`defense - 80 * exposed`) via SA (`Zr`) + greedy local refinement (`is`).
-    // - Stage 2 preserves defense within `best_def - max(80, |best_def| * 0.12)` and `exposed <= min_exposed`, `gate <= min_gate`,
-    //   while maximizing stacking + advance (`stacking + (advance ? advance_score : 0) + 0.25 * defense`).
-    std::vector<UnitSlot> candidates;
+    // `ss(a)` L6409-6478 + `Zr(a, s, e, t)` L6312-6388
+    std::vector<PlacementAssign> no_assign;
+    std::vector<PlacementMove> no_moves;
+
+    // ---- 候选单位（上场 + 备战）----
+    struct SU
+    {
+        std::string name;
+        const OperatorInfo* op = nullptr;
+        int r = -1;
+        int c = -1;
+        std::string facing = "RIGHT";
+        bool elite = false;
+    };
+    std::vector<SU> units;
     for (const auto& u : m_units) {
-        if (!u.name.empty() && !u.auxiliary && !u.item && find_operator(u.name) != nullptr) {
-            candidates.push_back(u);
-        }
-    }
-    if (candidates.empty()) {
-        return { {}, {} };
-    }
-
-    std::vector<std::pair<int, int>> melee_cells;
-    std::vector<std::pair<int, int>> ranged_cells;
-    for (int r = 1; r <= 4 && r < traffic.rows; ++r) {
-        for (int c = 0; c < traffic.cols; ++c) {
-            char ch = traffic.grid[r][c];
-            if (ch == 'a' || ch == 'b') {
-                melee_cells.emplace_back(r, c);
-            }
-            if (ch == 'a' || ch == 'h') {
-                ranged_cells.emplace_back(r, c);
-            }
-        }
-    }
-
-    std::unordered_map<std::string, int> owned_counts;
-    for (const auto& u : candidates) {
-        owned_counts[u.name]++;
-    }
-    std::unordered_set<std::string> active_bonds_est(m_active_core_bonds.begin(), m_active_core_bonds.end());
-
-    std::sort(candidates.begin(), candidates.end(), [&](const UnitSlot& a, const UnitSlot& b) {
-        const auto* opa = find_operator(a.name);
-        const auto* opb = find_operator(b.name);
-        double sa = opa ? (score_operator_for_plan(*opa, owned_counts, active_bonds_est) + (a.elite ? 25.0 : 0.0) + (a.area == "board" ? 4.0 : 0.0)) : 0.0;
-        double sb = opb ? (score_operator_for_plan(*opb, owned_counts, active_bonds_est) + (b.elite ? 25.0 : 0.0) + (b.area == "board" ? 4.0 : 0.0)) : 0.0;
-        return sa > sb;
-    });
-
-    const int target_cnt = std::min(static_cast<int>(candidates.size()), std::max(1, max_deploy));
-    std::vector<UnitSlot> chosen(candidates.begin(), candidates.begin() + target_cnt);
-    std::vector<UnitSlot> bench_rest(candidates.begin() + target_cnt, candidates.end());
-
-    std::set<std::pair<int, int>> used_cells;
-    std::vector<PlacementAssign> current;
-    static const std::array<std::string, 4> kDirs = { "RIGHT", "UP", "LEFT", "DOWN" };
-
-    for (const auto& u : chosen) {
-        const auto* op = find_operator(u.name);
-        if (!op) {
+        if (u.name.empty() || find_operator(u.name) == nullptr) {
             continue;
         }
-        const auto& pool = (op->position == "RANGED") ? ranged_cells : melee_cells;
-        if (pool.empty()) {
-            continue;
-        }
-        std::pair<int, int> best_rc = pool.front();
-        std::string best_dir = u.facing.empty() ? "LEFT" : u.facing;
-        double best_cell_score = -1e9;
+        SU su;
+        su.name = u.name;
+        su.op = find_operator(u.name);
+        su.r = u.r;
+        su.c = u.c;
+        su.facing = u.facing.empty() ? "RIGHT" : u.facing;
+        su.elite = u.elite;
+        units.push_back(su);
+    }
+    if (units.empty()) {
+        return { no_assign, no_moves };
+    }
 
-        for (const auto& rc : pool) {
-            if (used_cells.count(rc) > 0) {
+    const auto& rows = traffic.grid;
+    const int R = traffic.rows;
+    const int Cn = traffic.cols;
+
+    // 可部署格（排除 H 所在行）
+    std::vector<std::pair<int, int>> cells;
+    for (const auto& p : deploy_cells(rows)) {
+        if (rows[p.first][p.second] != 'H') {
+            cells.emplace_back(p);
+        }
+    }
+    if (extra != nullptr && !cells.empty()) {
+        const int cols = traffic.cols;
+        if (extra->exclude_left_cols > 0 || extra->left_half_only) {
+            int min_col_all = std::numeric_limits<int>::max();
+            for (int r = 0; r < traffic.rows; ++r) {
+                for (int c = 0; c < cols; ++c) {
+                    const char ch = traffic.grid[r][c];
+                    if (ch != '#' && ch != 'H' && ch != 'Q') {
+                        min_col_all = std::min(min_col_all, c);
+                    }
+                }
+            }
+            const int cut = extra->exclude_left_cols;
+            std::vector<std::pair<int, int>> kept;
+            for (const auto& p : cells) {
+                if (cut > 0 && p.second < min_col_all + cut) {
+                    continue;
+                }
+                if (extra->left_half_only && p.second >= cols / 2 + cols % 2) {
+                    continue;
+                }
+                kept.push_back(p);
+            }
+            cells.swap(kept);
+        }
+    }
+    if (cells.empty()) {
+        return { no_assign, no_moves };
+    }
+    int min_col_cells = std::numeric_limits<int>::max();
+    for (const auto& p : cells) {
+        min_col_cells = std::min(min_col_cells, p.second);
+    }
+    int all_min_col = std::numeric_limits<int>::max();
+    for (int r = 0; r < R; ++r) {
+        for (int c = 0; c < Cn; ++c) {
+            const char ch = rows[r][c];
+            if (ch == '#' || ch == 'H' || ch == 'Q') {
                 continue;
             }
-            for (const auto& dir : kDirs) {
-                GrazeStats gs = compute_cell_graze(traffic, *op, rc.first, rc.second, dir);
-                double sc = gs.ground * 10.0 + gs.air * 5.0 + gs.early_ground * 6.0;
-                if (op->position == "MELEE" && traffic.ground_traffic[rc.first][rc.second] > 0.0) {
-                    sc += traffic.ground_traffic[rc.first][rc.second] * 18.0;
-                }
-                if (u.area == "board" && u.r == rc.first && u.c == rc.second) {
-                    sc += 6.0;
-                }
-                if (sc > best_cell_score) {
-                    best_cell_score = sc;
-                    best_rc = rc;
-                    best_dir = dir;
-                }
-            }
-        }
-        used_cells.insert(best_rc);
-        current.push_back(PlacementAssign {
-            u.slot,
-            u.area,
-            u.r,
-            u.c,
-            u.name,
-            best_rc.first,
-            best_rc.second,
-            best_dir,
-            u.elite });
-    }
-
-    if (current.empty()) {
-        return { {}, {} };
-    }
-
-    PlacementEvalOptions opts;
-    for (const auto& cb : m_active_core_bonds) {
-        opts.focus_bonds.insert(cb);
-    }
-    if (m_goal != "medal") {
-        for (const auto& gt : kGoalTasks) {
-            if (gt.id == m_goal) {
-                opts.focus_bonds.insert(gt.bonds.begin(), gt.bonds.end());
-                break;
-            }
+            all_min_col = std::min(all_min_col, c);
         }
     }
-    opts.focus_bond_mul = (m_goal == "medal") ? 2.0 : 6.0;
-    opts.core_bond_mul = 1.5;
-    opts.support_defense_weight = 1.0;
-    opts.support_heal_weight = 1.0;
-    opts.advance = advance_mode;
-    opts.round = m_current_round;
-    opts.avoid_right_col = (m_current_round >= 9 && m_current_boss.find("左") == std::string::npos);
+    (void)min_col_cells;
 
-    std::mt19937 rng(42 + m_current_round * 131 + static_cast<int>(current.size()) * 17);
+    std::vector<std::pair<int, int>> usable;
+    for (const auto& p : cells) {
+        if (p.second >= all_min_col) {
+            usable.emplace_back(p);
+        }
+    }
+    if (usable.empty()) {
+        usable = cells;
+    }
 
-    auto run_sa_stage = [&](std::vector<PlacementAssign> init_state,
-                            int total_iters,
-                            auto&& score_fn) -> std::vector<PlacementAssign> {
-        std::vector<PlacementAssign> cur = std::move(init_state);
-        double cur_sc = score_fn(evaluate_placement_full(cur, bench_rest, traffic, opts));
+    // 每行最右列（`l` / `E`）
+    std::unordered_map<int, int> rightmost;
+    for (const auto& p : usable) {
+        auto it = rightmost.find(p.first);
+        if (it == rightmost.end() || it->second < p.second) {
+            rightmost[p.first] = p.second;
+        }
+    }
+    auto is_rightmost = [&](const std::pair<int, int>& p) {
+        auto it = rightmost.find(p.first);
+        return it != rightmost.end() && it->second == p.second;
+    };
+
+    const int deploy_limit = std::min(max_deploy > 0 ? max_deploy : 8, static_cast<int>(usable.size()));
+    std::vector<SU> chosen(units.begin(), units.begin() + std::min<int>(deploy_limit, static_cast<int>(units.size())));
+
+    auto valid_cell = [&](const SU& u, const std::pair<int, int>& p) {
+        if (u.op == nullptr) {
+            return false;
+        }
+        if (rows[p.first][p.second] == 'h' && u.op->position != "RANGED") {
+            return false;
+        }
+        return true;
+    };
+
+    // `Zr(a, s, e, t)`
+    auto zr = [&](uint32_t seed,
+                  const std::function<double(const PlacementEvalResult&)>& weight,
+                  const std::vector<PlacementAssign>* init,
+                  int iterations_override = 0,
+                  bool no_new_units = false) -> std::vector<PlacementAssign> {
+        uint32_t st = seed != 0 ? seed : 1;
+        auto rnd = [&]() {
+            st ^= st << 13;
+            st ^= st >> 17;
+            st ^= st << 5;
+            return static_cast<double>(st) / 4294967296.0;
+        };
+
+        std::vector<PlacementAssign> cur;
+        if (init != nullptr) {
+            cur = *init;
+        }
+        else {
+            std::set<std::pair<int, int>> used;
+            for (const auto& u : chosen) {
+                std::vector<std::pair<int, int>> pool;
+                for (const auto& p : usable) {
+                    if (used.count(p) > 0 || !valid_cell(u, p)) {
+                        continue;
+                    }
+                    pool.push_back(p);
+                }
+                if (pool.empty()) {
+                    continue;
+                }
+                std::stable_sort(pool.begin(), pool.end(), [&](const auto& a, const auto& b) {
+                    const bool ga = valid_cell(u, a), gb = valid_cell(u, b);
+                    if (ga != gb) {
+                        return gb;
+                    }
+                    const bool sa = traffic.ground[a.first][a.second] > 0.0;
+                    const bool sb = traffic.ground[b.first][b.second] > 0.0;
+                    if (u.op != nullptr && u.op->position == "MELEE") {
+                        return sb && !sa;
+                    }
+                    return sa && !sb;
+                });
+                used.insert(pool.front());
+                PlacementAssign pa;
+                pa.name = u.name;
+                pa.r = pool.front().first;
+                pa.c = pool.front().second;
+                pa.facing = "RIGHT";
+                pa.elite = u.elite;
+                cur.push_back(pa);
+            }
+        }
+        if (cur.empty()) {
+            return cur;
+        }
+
+        auto evaluate = [&](const std::vector<PlacementAssign>& pl) {
+            auto opts = default_eval_options(advance_mode);
+            if (extra != nullptr) {
+                opts.avoid_right_col = extra->avoid_right_col;
+                // `boss_side` 不在这里生效：JS 的 `ws`/`is` 是用加权函数重排，
+                // 不是改 `Nt` 本身的推进分。见下面的 `is` 阶段。
+                opts.focus_bond_mul = extra->focus_bond_mul;
+                opts.core_bond_mul = extra->core_bond_mul;
+                opts.support_defense_weight = extra->support_defense_weight;
+                opts.support_heal_weight = extra->support_heal_weight;
+            }
+            // focus_bonds 用 bondId
+            std::unordered_set<std::string> ids;
+            for (const auto& name : m_active_core_bonds) {
+                for (const auto& b : m_bonds) {
+                    if (b.name == name) {
+                        ids.insert(b.bond_id);
+                    }
+                }
+            }
+            if (!ids.empty()) {
+                opts.focus_bonds = ids;
+            }
+            std::vector<UnitSlot> bench;
+            for (const auto& u : units) {
+                bool placed = std::any_of(pl.begin(), pl.end(), [&](const PlacementAssign& a) {
+                    return a.name == u.name;
+                });
+                if (!placed) {
+                    UnitSlot s;
+                    s.name = u.name;
+                    bench.push_back(s);
+                }
+            }
+            return evaluate_placement_nt(pl, bench, traffic, opts);
+        };
+
+        double best_val = weight(evaluate(cur));
         std::vector<PlacementAssign> best = cur;
-        double best_sc = cur_sc;
+        double cur_val = best_val;
 
-        for (int iter = 0; iter < total_iters; ++iter) {
-            const double temp = 80.0 * std::pow(0.5 / 80.0, static_cast<double>(iter) / std::max(1, total_iters));
-            std::vector<PlacementAssign> next = cur;
-            const size_t idx = rng() % next.size();
-            const auto* op = find_operator(next[idx].name);
-            if (!op) {
-                continue;
-            }
-            const int mut_type = rng() % 3;
-            if (mut_type == 0) {
-                next[idx].facing = kDirs[rng() % 4];
-            }
-            else if (mut_type == 1) {
-                const auto& pool = (op->position == "RANGED") ? ranged_cells : melee_cells;
-                if (!pool.empty()) {
-                    auto cand_rc = pool[rng() % pool.size()];
-                    bool occupied = false;
-                    for (size_t j = 0; j < next.size(); ++j) {
-                        if (j != idx && next[j].r == cand_rc.first && next[j].c == cand_rc.second) {
-                            occupied = true;
-                            break;
-                        }
-                    }
-                    if (!occupied) {
-                        next[idx].r = cand_rc.first;
-                        next[idx].c = cand_rc.second;
-                    }
-                }
-            }
-            else if (next.size() >= 2) {
-                size_t j = rng() % next.size();
-                if (j != idx) {
-                    const auto* op_j = find_operator(next[j].name);
-                    if (op_j && op_j->position == op->position) {
-                        std::swap(next[idx].r, next[j].r);
-                        std::swap(next[idx].c, next[j].c);
-                    }
+        const int n = static_cast<int>(cur.size());
+        const int total_units = static_cast<int>(units.size());
+        const int iterations = (iterations_override > 0)
+            ? iterations_override
+            : static_cast<int>(
+                std::lround((2500.0 + 1100.0 * n + 400.0 * std::max(0, total_units - n))));
+        static const std::array<std::string, 4> kDirs = { "RIGHT", "UP", "LEFT", "DOWN" };
+
+        for (int it = 0; it < iterations && !need_exit(); ++it) {
+            const double temp = 50.0 * (1.0 - static_cast<double>(it) / iterations) + 0.5;
+            auto cand = cur;
+            const int qi = std::min<int>(n - 1, static_cast<int>(rnd() * n));
+            const double p = rnd();
+
+            // 未上场单位
+            std::vector<int> idle;
+            for (int i = 0; i < total_units; ++i) {
+                const bool used = std::any_of(cand.begin(), cand.end(), [&](const PlacementAssign& a) {
+                    return a.name == units[i].name;
+                });
+                if (!used) {
+                    idle.push_back(i);
                 }
             }
 
-            double next_sc = score_fn(evaluate_placement_full(next, bench_rest, traffic, opts));
-            double delta = next_sc - cur_sc;
-            if (delta >= 0.0 || std::exp(delta / std::max(0.1, temp)) > std::generate_canonical<double, 10>(rng)) {
-                cur = std::move(next);
-                cur_sc = next_sc;
-                if (cur_sc > best_sc) {
-                    best_sc = cur_sc;
-                    best = cur;
+            if (!no_new_units && !idle.empty() && p < 0.12) {
+                const int pick = idle[std::min<int>(static_cast<int>(idle.size()) - 1, static_cast<int>(rnd() * idle.size()))];
+                if (!valid_cell(units[pick], { cand[qi].r, cand[qi].c })) {
+                    continue;
+                }
+                cand[qi].name = units[pick].name;
+                cand[qi].elite = units[pick].elite;
+            }
+            else if (p < 0.4) {
+                cand[qi].facing = kDirs[std::min<int>(3, static_cast<int>(rnd() * 4))];
+            }
+            else if (p < 0.72) {
+                std::set<std::pair<int, int>> used_cells;
+                for (const auto& a : cand) {
+                    used_cells.insert({ a.r, a.c });
+                }
+                std::vector<std::pair<int, int>> free_cells;
+                const auto* op = find_operator(cand[qi].name);
+                for (const auto& cell : usable) {
+                    if (used_cells.count(cell) > 0) {
+                        continue;
+                    }
+                    if (op != nullptr && rows[cell.first][cell.second] == 'h' && op->position != "RANGED") {
+                        continue;
+                    }
+                    free_cells.push_back(cell);
+                }
+                if (free_cells.empty()) {
+                    continue;
+                }
+                const auto& cell = free_cells[std::min<int>(static_cast<int>(free_cells.size()) - 1, static_cast<int>(rnd() * free_cells.size()))];
+                cand[qi].r = cell.first;
+                cand[qi].c = cell.second;
+            }
+            else {
+                const int ei = std::min<int>(n - 1, static_cast<int>(rnd() * n));
+                if (ei == qi) {
+                    continue;
+                }
+                std::swap(cand[qi].r, cand[ei].r);
+                std::swap(cand[qi].c, cand[ei].c);
+                std::swap(cand[qi].facing, cand[ei].facing);
+            }
+
+            const double val = weight(evaluate(cand));
+            if (val > cur_val || rnd() < std::exp((val - cur_val) / temp)) {
+                cur = cand;
+                cur_val = val;
+                if (val > best_val) {
+                    best_val = val;
+                    best = cand;
                 }
             }
         }
         return best;
     };
 
-    // Stage 1 (`ss` lines 6412-6417): Maximize defense (`defense - 80 * exposed`)
-    auto stage1_best = run_sa_stage(current, 320, [](const PlacementEvalResult& r) {
-        return r.defense - r.exposed * 80.0;
-    });
-    const PlacementEvalResult f_eval = evaluate_placement_full(stage1_best, bench_rest, traffic, opts);
-    const double w_def_floor = f_eval.defense - std::max(80.0, std::abs(f_eval.defense) * 0.12);
-    const double i_exp_ceil = f_eval.exposed;
-    const double m_gate_ceil = f_eval.gate;
-
-    // Stage 2 (`ss` lines 6418-6433): Maximize stacking + advance while keeping defense >= w_def_floor
-    auto best_assign = run_sa_stage(stage1_best, 260, [&](const PlacementEvalResult& r) {
-        if (r.exposed > i_exp_ceil) {
-            return -1e9 - r.exposed * 1e4;
-        }
-        if (r.gate > m_gate_ceil) {
-            return -1e9 - r.gate * 1e4;
-        }
-        if (r.defense < w_def_floor) {
-            return -1e6 + r.defense;
-        }
-        return r.stacking + (opts.advance ? r.advance_score : 0.0) + r.defense * 0.25;
-    });
-
-    // Build move sequence (`ws` in service.pretty.mjs lines 7560-7646)
-    std::vector<PlacementMove> moves;
-    for (const auto& u : m_units) {
-        if (u.area != "board" || u.auxiliary || u.ghost) {
+    // ---- 第一阶段：防御（3 个种子）----
+    auto w1 = [&](const PlacementEvalResult& r) {
+        return r.defense + 0.05 * r.stacking
+            - (advance_mode ? 1e5 * r.exposed : 0.0) - 3e3 * r.gate;
+    };
+    std::vector<PlacementAssign> best1;
+    double best1_val = -1e18;
+    for (int k = 0; k < 3; ++k) {
+        auto pl = zr(static_cast<uint32_t>(42 + 101 * k), w1, nullptr);
+        if (pl.empty()) {
             continue;
         }
-        bool still_on_board = false;
-        for (const auto& pa : best_assign) {
-            if (pa.slot == u.slot) {
-                still_on_board = true;
+        const double v = w1(evaluate_placement_nt(
+            pl,
+            {},
+            traffic,
+            default_eval_options(advance_mode)));
+        if (v > best1_val) {
+            best1_val = v;
+            best1 = pl;
+        }
+    }
+    if (best1.empty()) {
+        return { no_assign, no_moves };
+    }
+
+    // ---- 第二阶段：叠层（`ss` L6438-6441；`strategy === "defense"` 时整段跳过）----
+    const std::string strategy = (extra != nullptr) ? extra->strategy : "balance";
+    double defense_max = evaluate_placement_nt(best1, {}, traffic, default_eval_options(advance_mode)).defense;
+    auto best2 = best1;
+    if (strategy != "defense") {
+        // `as = { defense:1, balance:.85, stack:.6 }`
+        const double as_factor = (strategy == "stack") ? 0.6 : 0.85;
+        const double def_coef = (strategy == "balance") ? 0.6 : 0.3;
+        auto w2 = [&](const PlacementEvalResult& r) {
+            const double target = as_factor * defense_max;
+            return r.stacking * 2.0 + r.defense * def_coef
+                - 4.0 * std::max(0.0, target - r.defense)
+                - 300.0 * r.unguarded_routes
+                - (advance_mode ? 1e5 * r.exposed : 0.0) - 3e3 * r.gate;
+        };
+        auto pl = zr(43, w2, &best1);
+        if (!pl.empty()) {
+            best2 = pl;
+        }
+    }
+
+    // ---- 第三阶段：advance 约束优先 ----
+    if (advance_mode) {
+        const auto base = evaluate_placement_nt(best2, {}, traffic, default_eval_options(true));
+        const double def_floor = base.defense - std::abs(base.defense) * 0.05;
+        const double stack_floor = base.stacking - std::abs(base.stacking) * 0.05;
+        auto w3 = [&](const PlacementEvalResult& r) {
+            if (r.gate > base.gate || r.exposed > base.exposed + 0.001
+                || r.defense < def_floor || r.stacking < stack_floor
+                || r.unguarded_routes > base.unguarded_routes) {
+                return -1e6 - 1e5 * r.exposed - 1e3 * std::max(0.0, def_floor - r.defense)
+                    - 1e3 * std::max(0.0, stack_floor - r.stacking);
+            }
+            return r.defense + r.stacking * 2.0 + r.advance_score * 0.05;
+        };
+        auto pl = zr(59, w3, &best2);
+        if (!pl.empty() && w3(evaluate_placement_nt(pl, {}, traffic, default_eval_options(true))) >= w3(base)) {
+            best2 = pl;
+        }
+    }
+
+    // ---- `ws` / `is`：BOSS 回合以现有布阵为起点重排（L6390-6408 / L8267-8290）----
+    if (extra != nullptr && !extra->boss_side.empty()) {
+        // `is(a, s, e)` 的 `t`：units 只保留已上场的、advance=true、maxDeploy=s.length、
+        // bossSide=e、iterations=8000
+        PlacementEvalOptions is_opts = default_eval_options(true);
+        is_opts.avoid_right_col = extra->avoid_right_col;
+        is_opts.exclude_left_cols = extra->exclude_left_cols;
+        is_opts.left_half_only = extra->left_half_only;
+        is_opts.strategy = "balance";
+        is_opts.boss_side = extra->boss_side;
+
+        const bool left_side = (extra->boss_side == "left");
+        auto is_weight = [left_side](const PlacementEvalResult& r) {
+            if (left_side) {
+                return r.exposed > 0.0 ? -1e9 - r.exposed * 1e6
+                                       : r.advance_score + r.defense * 0.03 + r.stacking * 0.08;
+            }
+            return r.defense + r.stacking * 0.5 + r.advance_score * 0.05 - 150.0 * r.exposed;
+        };
+
+        std::vector<PlacementAssign> best_is = best2;
+        double best_is_val = is_weight(evaluate_placement_nt(best2, {}, traffic, is_opts));
+        for (int k = 0; k < 2; ++k) {
+            auto pl = zr(static_cast<uint32_t>(331 + 101 * k), is_weight, &best2, 8000, true);
+            if (pl.empty()) {
+                continue;
+            }
+            const double v = is_weight(evaluate_placement_nt(pl, {}, traffic, is_opts));
+            if (v > best_is_val) {
+                best_is_val = v;
+                best_is = pl;
+            }
+        }
+        best2 = best_is;
+    }
+
+    // ---- 生成 moves ----
+    std::vector<PlacementMove> moves;
+    for (const auto& a : best2) {
+        PlacementMove mv;
+        mv.unit = a.name;
+        mv.to_area = "board";
+        mv.to_r = a.r;
+        mv.to_c = a.c;
+        mv.facing = a.facing;
+        const UnitSlot* cur = nullptr;
+        for (const auto& u : m_units) {
+            if (u.name == a.name) {
+                cur = &u;
                 break;
             }
         }
-        if (!still_on_board) {
-            for (int bc = 3; bc <= 11; ++bc) {
-                bool taken = false;
-                for (const auto& bu : m_units) {
-                    if (bu.area == "bench" && bu.c == bc) {
-                        taken = true;
-                        break;
-                    }
-                }
-                if (!taken) {
-                    moves.push_back(PlacementMove {
-                        "bench", u.name, "board", u.r, u.c, "bench", 6, bc, "" });
-                    break;
-                }
-            }
+        if (cur == nullptr) {
+            mv.type = "deploy";
+            mv.from_area = "bench";
+        }
+        else if (cur->area == "board" && cur->r == a.r && cur->c == a.c) {
+            mv.type = (cur->facing == a.facing) ? "none" : "orient";
+            mv.from_area = "board";
+            mv.from_r = cur->r;
+            mv.from_c = cur->c;
+        }
+        else {
+            mv.type = "reposition";
+            mv.from_area = cur->area;
+            mv.from_r = cur->r;
+            mv.from_c = cur->c;
+        }
+        if (mv.type != "none") {
+            moves.push_back(mv);
+        }
+    }
+    // 场上但不在新方案里的 → 撤回备战席
+    for (const auto& u : m_units) {
+        if (u.area != "board" || u.name.empty()) {
+            continue;
+        }
+        const bool kept = std::any_of(best2.begin(), best2.end(), [&](const PlacementAssign& a) {
+            return a.name == u.name;
+        });
+        if (!kept) {
+            PlacementMove mv;
+            mv.type = "bench";
+            mv.unit = u.name;
+            mv.from_area = "board";
+            mv.from_r = u.r;
+            mv.from_c = u.c;
+            mv.to_area = "bench";
+            moves.push_back(mv);
         }
     }
 
-    for (const auto& pa : best_assign) {
-        const auto* op = find_operator(pa.name);
-        const bool face_indep = (op && op->facing_independent);
-        if (pa.from_area == "bench") {
-            moves.push_back(PlacementMove {
-                "deploy",
-                pa.name,
-                "bench",
-                pa.from_r,
-                pa.from_c,
-                "board",
-                pa.r,
-                pa.c,
-                pa.facing });
-        }
-        else if (pa.from_r != pa.r || pa.from_c != pa.c) {
-            moves.push_back(PlacementMove {
-                "reposition",
-                pa.name,
-                "board",
-                pa.from_r,
-                pa.from_c,
-                "board",
-                pa.r,
-                pa.c,
-                pa.facing });
-        }
-        else if (!face_indep) {
-            for (const auto& u : m_units) {
-                if (u.slot == pa.slot && !u.facing.empty() && u.facing != pa.facing) {
-                    moves.push_back(PlacementMove {
-                        "orient",
-                        pa.name,
-                        "board",
-                        pa.r,
-                        pa.c,
-                        "board",
-                        pa.r,
-                        pa.c,
-                        pa.facing });
-                    break;
-                }
-            }
-        }
-    }
-
-    return { best_assign, moves };
+    return { best2, moves };
 }
 
 std::optional<std::pair<double, double>> SPAFarmTaskPlugin::detect_facing_white_box(const cv::Mat& img)
 {
-    // Exact 1:1 port of `Ei(a)` in service.pretty.mjs lines 4907-4944:
-    // Downsamples to 960x540, finds bright neutral pixels (`min > 200, max - min < 40`),
-    // extracts 4-connected components inside x: 200..780, y: 40..490, and matches bounding box
-    // width 110..235, height 80..200, fill ratio 0.06..0.55.
+    // 1:1 port of `Ei(a)` in service.pretty.mjs L4907-4944:
+    //   resize 960x540 → scan x 180..950, y 40..500 for bright neutral pixels
+    //   (min > 200 && max - min < 40) → 8-connected components
+    //   → bbox width in (220, 470), height in (160, 400) → largest by pixel count
+    //   → return (x0 + x1, y0 + y1) which is the centre doubled into 1920x1080 space.
     if (img.empty()) {
         return std::nullopt;
     }
     cv::Mat small_img;
     cv::resize(img, small_img, cv::Size(960, 540), 0.0, 0.0, cv::INTER_AREA);
-    const int W = 960;
-    const int H = 540;
-    std::vector<uint8_t> mask(W * H, 0);
-    for (int y = 40; y < 490; ++y) {
+    constexpr int W = 960;
+    constexpr int H = 540;
+    std::vector<uint8_t> mask(static_cast<size_t>(W) * H, 0);
+    for (int y = 40; y < 500; ++y) {
         const auto* row = small_img.ptr<cv::Vec3b>(y);
-        for (int x = 200; x < 780; ++x) {
+        for (int x = 180; x < 950; ++x) {
             const int B = row[x][0], G = row[x][1], R = row[x][2];
             const int mx = std::max({ R, G, B });
             const int mn = std::min({ R, G, B });
             if (mn > 200 && (mx - mn) < 40) {
-                mask[y * W + x] = 1;
+                mask[static_cast<size_t>(y) * W + x] = 1;
             }
         }
     }
 
-    std::vector<uint8_t> vis(W * H, 0);
-    std::optional<std::pair<double, double>> best_center;
-    int best_n = 0;
+    struct FacingBox
+    {
+        int n = 0;
+        int x0 = W;
+        int x1 = 0;
+        int y0 = H;
+        int y1 = 0;
+    };
 
-    for (int y = 40; y < 490; ++y) {
-        for (int x = 200; x < 780; ++x) {
-            int idx = y * W + x;
+    std::vector<uint8_t> vis(static_cast<size_t>(W) * H, 0);
+    std::vector<FacingBox> boxes;
+    std::vector<int> stack;
+    for (int y = 40; y < 500; ++y) {
+        for (int x = 180; x < 950; ++x) {
+            const int idx = y * W + x;
             if (!mask[idx] || vis[idx]) {
                 continue;
             }
-            int x0 = x, x1 = x, y0 = y, y1 = y, n = 0;
-            std::vector<int> stack = { idx };
+            FacingBox c;
             vis[idx] = 1;
+            stack.clear();
+            stack.push_back(idx);
             while (!stack.empty()) {
-                int cur = stack.back();
+                const int cur = stack.back();
                 stack.pop_back();
-                int cx = cur % W;
-                int cy = cur / W;
-                x0 = std::min(x0, cx);
-                x1 = std::max(x1, cx);
-                y0 = std::min(y0, cy);
-                y1 = std::max(y1, cy);
-                ++n;
-                const int nbrs[4] = { cur - 1, cur + 1, cur - W, cur + W };
-                for (int nb : nbrs) {
-                    if (nb >= 0 && nb < W * H && mask[nb] && !vis[nb]) {
-                        vis[nb] = 1;
-                        stack.push_back(nb);
+                const int cx = cur % W;
+                const int cy = cur / W;
+                ++c.n;
+                c.x0 = std::min(c.x0, cx);
+                c.x1 = std::max(c.x1, cx);
+                c.y0 = std::min(c.y0, cy);
+                c.y1 = std::max(c.y1, cy);
+                // `Ei` 用 8 邻域：[-t-1, -t, -t+1, -1, 1, t-1, t, t+1]
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        const int nx = cx + dx;
+                        const int ny = cy + dy;
+                        if (nx < 0 || ny < 0 || nx >= W || ny >= H) {
+                            continue;
+                        }
+                        const int nidx = ny * W + nx;
+                        if (mask[nidx] && !vis[nidx]) {
+                            vis[nidx] = 1;
+                            stack.push_back(nidx);
+                        }
                     }
                 }
             }
-            int bw = x1 - x0 + 1;
-            int bh = y1 - y0 + 1;
-            double fill = static_cast<double>(n) / static_cast<double>(bw * bh);
-            if (bw >= 110 && bw <= 235 && bh >= 80 && bh <= 200 && fill >= 0.06 && fill <= 0.55 && n > best_n) {
-                best_n = n;
-                best_center = { (x0 + x1) * 1.0, (y0 + y1) * 1.0 }; // * 0.5 * 2.0 = * 1.0 in 1920x1080
-            }
+            boxes.push_back(c);
         }
     }
-    return best_center;
+
+    const FacingBox* best = nullptr;
+    for (const auto& c : boxes) {
+        const int bw = c.x1 - c.x0;
+        const int bh = c.y1 - c.y0;
+        // `Ei` 的唯一判据：宽 220..470、高 160..400
+        if (!(bw > 220 && bw < 470 && bh > 160 && bh < 400)) {
+            continue;
+        }
+        if (best == nullptr || c.n > best->n) {
+            best = &c;
+        }
+    }
+    if (best == nullptr) {
+        return std::nullopt;
+    }
+    // 960x540 下的中心 (x0+x1)/2 映射回 1920x1080 正好是 (x0+x1)
+    return std::make_pair(
+        static_cast<double>(best->x0 + best->x1),
+        static_cast<double>(best->y0 + best->y1));
 }
 
 bool SPAFarmTaskPlugin::execute_placement_move(const PlacementMove& mv, const CameraDetectResult& cam)
@@ -5029,15 +7350,21 @@ bool SPAFarmTaskPlugin::execute_placement_move(const PlacementMove& mv, const Ca
         return true;
     }
 
-    // Poll up to 5 times for white facing box (`Ei`)
+    // `At` L9093-9096：每 60ms 截一帧找朝向控件，最多 1500ms。
+    // 旧实现只轮询 5×120ms=600ms，慢一帧就误判「未出现朝向控件」。
     std::optional<std::pair<double, double>> box_center;
-    for (int i = 0; i < 5 && !need_exit(); ++i) {
-        cv::Mat cur = shot();
-        box_center = detect_facing_white_box(cur);
-        if (box_center.has_value()) {
-            break;
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::steady_clock::now() - t0).count() < 1500
+               && !need_exit()) {
+            cv::Mat cur = shot();
+            box_center = detect_facing_white_box(cur);
+            if (box_center.has_value()) {
+                break;
+            }
+            sleep_ms(60);
         }
-        sleep_ms(120);
     }
 
     double cx = box_center ? box_center->first : tx;
@@ -5061,7 +7388,7 @@ bool SPAFarmTaskPlugin::execute_placement_move(const PlacementMove& mv, const Ca
 
     auto [dx, dy] = dir_delta(mv.facing);
     for (int attempt = 0; attempt < 3 && !need_exit(); ++attempt) {
-        drag_segments(cx, cy, cx + dx, cy + dy, 6, 20, 80);
+        drag_segments(cx, cy, cx + dx, cy + dy, 4, 12, 40); // `At` L9113-9115: steps 4, hold 40
         sleep_ms(220);
         cv::Mat after = shot();
         auto still_box = detect_facing_white_box(after);
@@ -5096,7 +7423,7 @@ bool SPAFarmTaskPlugin::execute_placement_move(const PlacementMove& mv, const Ca
     return false;
 }
 
-int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advance_mode)
+int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advance_mode, bool retry)
 {
     // Exact 1:1 port of `we(I = {})` in service.pretty.mjs lines 9724-9983:
     // ① If `收起` is visible on screen, tap `收起` (300ms) first so the shop panel does not occlude the board.
@@ -5126,13 +7453,112 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
     }
 
     CameraDetectResult cur_cam { st->camera, st->raw_H, st->fit };
-    refresh_board_snapshot(st->img, cur_cam, false);
-    inspect_unknown_units(cur_cam, true);
 
-    StageTrafficMap traffic = build_stage_traffic(m_stage_id);
-    auto [assigns, moves] = solve_placement(traffic, m_deploy_cap, advance_mode);
+    // ---- `we` 的三合一阶段（L9729-9736） ----
+    if (!m_pending_merge.empty()) {
+        wait_stable_board(3000);
+        cv::Mat merge_img = shot();
+        if (!merge_img.empty()) {
+            refresh_board_snapshot(merge_img, cur_cam, true); // `e.snapshot({force:!0})`
+        }
+    }
+    bool golden_summon = false; // `B`
+    for (const auto& nm : m_pending_merge) {
+        m_elite_units.insert(nm);
+        // `<获得时>...(随机获得|获得N名)...干员` 的金干员合成后会改变整备区构成，需要全量重读
+        const auto* mop = find_operator(nm);
+        if (mop != nullptr && mop->golden) {
+            for (const auto& tr : mop->traits) {
+                const std::string t = strip_ws(tr.text);
+                if (t.find("<获得时>") == std::string::npos || t.find("干员") == std::string::npos) {
+                    continue;
+                }
+                static const std::regex kGrant(R"(随机获得|获得[0-9一二三]?名)");
+                if (std::regex_search(t, kGrant)) {
+                    golden_summon = true;
+                    break;
+                }
+            }
+        }
+        check_triple_merge(nm, true);
+    }
+    const bool merged_any = !m_pending_merge.empty();
+    if (merged_any) {
+        std::string names;
+        for (const auto& nm : m_pending_merge) {
+            names += (names.empty() ? "" : "、") + nm;
+        }
+        log_info("第 " + std::to_string(m_current_round) + " 回合 · " + names + " 精锐合成，重新识别"
+            + (golden_summon ? "全部干员" : "相关格子"));
+        m_pending_merge.clear();
+    }
+
+    refresh_board_snapshot(st->img, cur_cam, false);
+
+    // `ee = z === 0 && bench数 < Wt(state) - 1`
+    int bench_cnt = 0;
+    for (const auto& u : m_units) {
+        if (u.area == "bench") {
+            ++bench_cnt;
+        }
+    }
+    int bench_cap = 10;
+    for (const auto& stg : m_stages) {
+        if (stg.stage_id != m_stage_id) {
+            continue;
+        }
+        for (const auto& row : stg.rows) {
+            if (row.find('H') == std::string::npos) {
+                continue;
+            }
+            const int cnt = static_cast<int>(std::count(row.begin(), row.end(), 'H'));
+            bench_cap = (cnt > 0) ? cnt : 10;
+            break;
+        }
+        break;
+    }
+    const bool skip_bench_unknown = (bench_cnt < bench_cap - 1);
+    // `onlyUnknown: !identifyUnknown && !B`，生产 `identifyUnknown=false` → `!B`
+    inspect_unknown_units(cur_cam, skip_bench_unknown, golden_summon);
+
+    // `N(round) && !state.info?.boss` → 点 (510,50) 打开本局信息页读 BOSS，再关掉
+    {
+        const bool boss_round_pre = (m_current_round == m_last_round);
+        if (boss_round_pre && m_current_boss.empty()) {
+            tap(510, 50, 500);
+            ScreenInfo si = classify_screen(shot());
+            for (int k = 0; si.screen != ScreenState::Info && k < 5; ++k) {
+                sleep_ms(500);
+                si = classify_screen(shot());
+            }
+            if (si.screen == ScreenState::Info) {
+                tap(1805, 65, 500);
+                wait_for([](const ScreenInfo& s) { return s.screen == ScreenState::Prep; }, 5000);
+            }
+            if (m_current_boss.empty()) {
+                log_info("BOSS 未识别，按普通 BOSS（靠右）处理");
+            }
+        }
+    }
+
+    StageTrafficMap traffic = build_stage_traffic(m_stage_id, m_current_round <= 3);
+    // `we` 的 `e.recommend({...})` 参数
+    const bool boss_round = (m_current_round == m_last_round);
+    const bool mob_boss = boss_round && m_current_boss.find("矩兽") != std::string::npos;
+    PlacementEvalOptions extra = default_eval_options(true);
+    extra.focus_bond_mul = (m_goal != "medal") ? 6.0 : 2.0; // `be()` 为真时 6
+    extra.exclude_left_cols = mob_boss ? 0 : 3;
+    extra.left_half_only = mob_boss;
+    extra.avoid_right_col = !boss_round;
+    extra.boss_side = boss_round ? "right" : "";
+    extra.strategy = boss_round ? "defense" : "balance";
+    (void)advance_mode;
+    // `we` 里 `maxDeploy: 8` 是硬编码的，不走 `m_deploy_cap`
+    auto [assigns, moves] = solve_placement(traffic, 8, true, &extra);
     if (moves.empty()) {
-        return 0;
+        // JS `we` 里 `Pe.length === 0` 只让移动循环空转，后面的 `Dt`(召唤物) 与 `on`(装备) 仍继续执行；
+        // 这里不能静默 return，否则整备阶段的装备分发会被一并跳过。
+        log_info("第 " + std::to_string(m_current_round) + " 回合 · 布阵 0 名角色，仍继续召唤物与装备");
     }
 
     auto pre_mv_st = wait_stable_board(5000);
@@ -5146,7 +7572,9 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
     }
     cur_cam = CameraDetectResult { pre_mv_st->camera, pre_mv_st->raw_H, pre_mv_st->fit };
 
-    // Resolve move ordering and break swap cycles using a free bench/board cell (`L9815-9898`)
+    // `we` L9798-9900：先跑 `tt`（把方案外的场上单位撤到整备区空格），
+    // 再跑 `pt`（把方案内单位移到目标格）。`Re()`=H 行空格，`xe()`=棋盘临时空格，
+    // `Je`=放弃部署的单位，`$t`=每个单位最多中转 2 次，总循环上限 40。
     std::set<std::pair<int, int>> occupied_cells;
     for (const auto& u : m_units) {
         if ((u.area == "board" && !u.ghost) || u.area == "bench") {
@@ -5154,27 +7582,156 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
         }
     }
 
-    auto find_temp_cell = [&]() -> std::optional<std::tuple<std::string, int, int>> {
-        for (int bc = 3; bc <= 11; ++bc) {
-            if (occupied_cells.count({ 6, bc }) == 0) {
-                return std::make_tuple(std::string("bench"), 6, bc);
+    // `Ze = Ae.rows.findIndex(re => re.includes("H"))`
+    int bench_row = -1;
+    for (int r = 0; r < traffic.rows; ++r) {
+        if (traffic.grid[r].find('H') != std::string::npos) {
+            bench_row = r;
+            break;
+        }
+    }
+
+    // `Re()`：整备区 H 行里第一个未被占用的 H 格
+    auto find_bench_cell = [&]() -> std::optional<std::pair<int, int>> {
+        if (bench_row < 0) {
+            return std::nullopt;
+        }
+        for (int c = 0; c < traffic.cols; ++c) {
+            if (traffic.grid[bench_row][c] == 'H' && occupied_cells.count({ bench_row, c }) == 0) {
+                return std::make_pair(bench_row, c);
             }
         }
-        for (int r = 1; r <= 4 && r < traffic.rows; ++r) {
+        return std::nullopt;
+    };
+
+    // `xe(re)`：棋盘上 'a'/'b'/'h'、非 H 行、未被占用、且不在目标方案里的临时格
+    auto find_board_cell = [&]() -> std::optional<std::pair<int, int>> {
+        std::set<std::pair<int, int>> targets;
+        for (const auto& p : moves) {
+            if (p.to_area == "board") {
+                targets.emplace(p.to_r, p.to_c);
+            }
+        }
+        for (int r = 0; r < traffic.rows; ++r) {
+            if (r == bench_row) {
+                continue;
+            }
             for (int c = 0; c < traffic.cols; ++c) {
-                char ch = traffic.grid[r][c];
-                if ((ch == 'a' || ch == 'b' || ch == 'h') && occupied_cells.count({ r, c }) == 0) {
-                    return std::make_tuple(std::string("board"), r, c);
+                const char ch = traffic.grid[r][c];
+                if ((ch == 'a' || ch == 'b' || ch == 'h') && occupied_cells.count({ r, c }) == 0
+                    && targets.count({ r, c }) == 0) {
+                    return std::make_pair(r, c);
                 }
             }
         }
         return std::nullopt;
     };
 
-    std::vector<PlacementMove> pending = moves;
+    // `tt` = 方案外的场上单位 → bench；`pt` = 方案内的目标站位
+    std::vector<PlacementMove> bench_moves;
+    std::vector<PlacementMove> pending;
+    for (const auto& mv : moves) {
+        if (mv.type == "bench") {
+            bench_moves.push_back(mv);
+        }
+        else {
+            pending.push_back(mv);
+        }
+    }
+
+    // `we` 的失败路径（L9810-9827）：
+    //   非 retry → 把该格的单位名清空并抛 `wa`，外层 `we(!0)` 重跑一次
+    //   retry    → 记日志、跳过该单位，不再重试
+    bool need_restart = false;
+    auto on_move_fail = [&](const PlacementMove& mv) {
+        if (retry) {
+            log_info((mv.unit.empty() ? std::string("对象") : mv.unit) + " 仍无法部署，本回合跳过");
+            return;
+        }
+        log_info((mv.unit.empty() ? std::string("对象") : mv.unit) + " 无法部署，重新识别该格后重排");
+        for (auto& u : m_units) {
+            if (u.r == mv.to_r && u.c == mv.to_c) {
+                u.name.clear();
+                u.source.clear();
+                u.verified = false;
+                break;
+            }
+        }
+        need_restart = true;
+    };
+
     int executed = 0;
-    while (!pending.empty() && !need_exit()) {
-        // 1. Find a move whose destination is currently unoccupied (or is an in-place orient)
+    auto do_move = [&](const PlacementMove& mv) -> bool {
+        log_info(
+            "布阵动作: " + mv.type + " " + mv.unit + " -> ("
+            + std::to_string(mv.to_r) + "," + std::to_string(mv.to_c) + ") 朝向:" + mv.facing);
+        if (execute_placement_move(mv, cur_cam)) {
+            occupied_cells.erase({ mv.from_r, mv.from_c });
+            occupied_cells.emplace(mv.to_r, mv.to_c);
+            ++executed;
+            return true;
+        }
+        on_move_fail(mv);
+        return false;
+    };
+
+    std::set<std::string> skipped; // `Je`
+    // ---- `tt` (L9822-9838)：先撤下多余单位，腾出棋盘格 ----
+    for (size_t bi = 0; bi < bench_moves.size() && !need_exit() && !need_restart; ++bi) {
+        PlacementMove mv = bench_moves[bi];
+        auto cell = find_bench_cell();
+        if (!cell) {
+            // `Oe && ze.filter(He => He.area === "board" && !He.auxiliary).length < 8 && await nt(Oe.unit, Oe)`
+            // 场上不足 8 人时，先把一个方案内的 bench 单位上场，腾出整备区格
+            int board_cnt = 0;
+            for (const auto& u : m_units) {
+                if (u.area == "board" && !u.auxiliary) {
+                    ++board_cnt;
+                }
+            }
+            if (board_cnt < 8) {
+                for (size_t j = 0; j < pending.size(); ++j) {
+                    const auto& up = pending[j];
+                    if (up.from_area != "bench" || skipped.count(up.unit) > 0
+                        || occupied_cells.count({ up.to_r, up.to_c }) > 0) {
+                        continue;
+                    }
+                    PlacementMove up_mv = up;
+                    pending.erase(pending.begin() + static_cast<long>(j));
+                    if (do_move(up_mv)) {
+                        cell = find_bench_cell();
+                    }
+                    break;
+                }
+            }
+        }
+        if (!cell) {
+            // `整备区已满，X 留在场上不换下`；并把最后一个 bench 目标动作加入 `Je`
+            log_info("整备区已满，" + (mv.unit.empty() ? std::string("对象") : mv.unit) + " 留在场上不换下");
+            for (auto it = pending.rbegin(); it != pending.rend(); ++it) {
+                if (it->from_area == "bench" && skipped.count(it->unit) == 0) {
+                    skipped.insert(it->unit);
+                    break;
+                }
+            }
+            continue;
+        }
+        // `At(Ve, re, _e, _e.r === Ze)`：目标必须是 H 行的具体空格，不能是棋盘 (0,0)
+        mv.to_r = cell->first;
+        mv.to_c = cell->second;
+        mv.facing = "RIGHT";
+        do_move(mv);
+    }
+    pending.erase(
+        std::remove_if(pending.begin(), pending.end(), [&](const PlacementMove& m) {
+            return skipped.count(m.unit) > 0;
+        }),
+        pending.end());
+
+    // ---- `pt` (L9839-9900)：把方案内单位移到目标格 ----
+    std::unordered_map<std::string, int> park_count; // `$t`
+    for (int loop = 0; loop < 40 && !pending.empty() && !need_exit() && !need_restart; ++loop) {
+        // 1. `pt.findIndex(He => !ze.some(lt => lt !== He.unit && lt.r === He.r && lt.c === He.c))`
         int ready_idx = -1;
         for (size_t i = 0; i < pending.size(); ++i) {
             const auto& mv = pending[i];
@@ -5185,41 +7742,44 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
                 break;
             }
         }
-
         if (ready_idx >= 0) {
             PlacementMove mv = pending[ready_idx];
             pending.erase(pending.begin() + ready_idx);
-            log_info(
-                "布阵动作: " + mv.type + " " + mv.unit + " -> ("
-                + std::to_string(mv.to_r) + "," + std::to_string(mv.to_c) + ") 朝向:" + mv.facing);
-            if (execute_placement_move(mv, cur_cam)) {
-                occupied_cells.erase({ mv.from_r, mv.from_c });
-                occupied_cells.emplace(mv.to_r, mv.to_c);
-                ++executed;
-            }
+            do_move(mv);
             continue;
         }
 
-        // 2. Cycle detected: park `pending.front()` to a temporary free cell first
-        auto temp_cell = find_temp_cell();
-        if (!temp_cell.has_value()) {
-            PlacementMove mv = pending.front();
-            pending.erase(pending.begin());
-            if (execute_placement_move(mv, cur_cam)) {
-                ++executed;
+        // 2. `Re() ?? xe(...)`
+        auto bench_cell = find_bench_cell();
+        const bool to_bench = bench_cell.has_value();
+        std::pair<int, int> cell = to_bench ? *bench_cell : std::make_pair(-1, -1);
+        if (!to_bench) {
+            if (auto board_cell = find_board_cell()) {
+                cell = *board_cell;
             }
-            continue;
+            else {
+                // `整备区已满，保留当前站位`
+                log_info("整备区已满，保留当前站位");
+                break;
+            }
         }
 
-        auto [t_area, tr, tc] = *temp_cell;
+        // `$t.get(He) < 2` / `站位调整陷入循环，保留剩余单位原位`
+        const std::string& cyc_unit = pending.front().unit;
+        if (++park_count[cyc_unit] > 2) {
+            log_info("站位调整陷入循环，保留剩余单位原位");
+            break;
+        }
+
+        auto [tr, tc] = cell;
         PlacementMove& cyc_mv = pending.front();
         PlacementMove park_mv {
-            t_area == "bench" ? "bench" : "reposition",
+            to_bench ? "bench" : "reposition",
             cyc_mv.unit,
             cyc_mv.from_area,
             cyc_mv.from_r,
             cyc_mv.from_c,
-            t_area,
+            to_bench ? "bench" : "board",
             tr,
             tc,
             cyc_mv.facing.empty() ? "LEFT" : cyc_mv.facing
@@ -5227,14 +7787,26 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
         if (execute_placement_move(park_mv, cur_cam)) {
             occupied_cells.erase({ cyc_mv.from_r, cyc_mv.from_c });
             occupied_cells.emplace(tr, tc);
-            cyc_mv.from_area = t_area;
+            cyc_mv.from_area = to_bench ? "bench" : "board";
             cyc_mv.from_r = tr;
             cyc_mv.from_c = tc;
-            cyc_mv.type = (t_area == "bench") ? "deploy" : "reposition";
+            cyc_mv.type = to_bench ? "deploy" : "reposition";
+            ++executed;
         }
         else {
+            log_info("布阵动作: " + park_mv.type + " " + park_mv.unit + " -> ("
+                     + std::to_string(tr) + "," + std::to_string(tc) + ") 朝向:" + park_mv.facing);
+            on_move_fail(cyc_mv);
             pending.erase(pending.begin());
         }
+    }
+    if (!pending.empty()) {
+        log_info("站位调整未全部完成（剩 " + std::to_string(pending.size()) + " 项），按当前站位开战");
+    }
+
+    if (need_restart) {
+        close_detail_panel();
+        return -1; // 外层按 `wa` 处理：`we(!0)` 重跑一次
     }
 
     sleep_ms(static_cast<int>(std::lround(300.0 * m_step_scale)));
@@ -5245,6 +7817,38 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
     }
     cur_cam = CameraDetectResult { post_st->camera, post_st->raw_H, post_st->fit };
     refresh_board_snapshot(post_st->img, cur_cam, false);
+
+    // `!H && (N(round) || benchCount >= Wt(state) - 2) && await o("deploy.summons", Dt(state, H))`
+    {
+        int summon_bench_cnt = 0;
+        for (const auto& u : m_units) {
+            if (u.area == "bench") {
+                ++summon_bench_cnt;
+            }
+        }
+        int summon_bench_cap = 10;
+        for (const auto& stg : m_stages) {
+            if (stg.stage_id != m_stage_id) {
+                continue;
+            }
+            for (const auto& row : stg.rows) {
+                if (row.find('H') == std::string::npos) {
+                    continue;
+                }
+                const int cnt = static_cast<int>(std::count(row.begin(), row.end(), 'H'));
+                summon_bench_cap = (cnt > 0) ? cnt : 10;
+                break;
+            }
+            break;
+        }
+        // `!H && (N(round) || benchCount >= Wt(state) - 2)` → `Dt(state, H)`
+        if (!mob_boss && (boss_round || summon_bench_cnt >= summon_bench_cap - 2)) {
+            deploy_summons(traffic);
+        }
+    }
+
+    // `X.useEquipment` → `await o("deploy.equip", on(state, H))`
+    scan_and_distribute_equipment(post_st->img, cur_cam);
     return executed;
 }
 
@@ -5252,7 +7856,7 @@ int SPAFarmTaskPlugin::run_auto_place(const CameraDetectResult& cam, bool advanc
 // Shop Multi-Step Action Planner & Execution (`_r`, `gs`, `ps`, `Lr`, `ha`, `ur`, `ct`, `oe`)
 // ============================================================================
 
-SPAFarmTaskPlugin::RoundPacing SPAFarmTaskPlugin::get_round_pacing(int round)
+SPAFarmTaskPlugin::RoundPacing SPAFarmTaskPlugin::get_round_pacing(int round) const
 {
     // Exact 1:1 port of `hs(a)` in service.pretty.mjs lines 7972-7982
     int r = std::max(1, round);
@@ -5265,267 +7869,1383 @@ SPAFarmTaskPlugin::RoundPacing SPAFarmTaskPlugin::get_round_pacing(int round)
     if (r == 3) {
         return { 3, 5, 4, false };
     }
-    return { r, 6, 5, r >= 9 };
+    // `hs` L7971：`boss: a === _t.lastRound`（quick=9 / standard=14）
+    return { r, 6, 5, r == m_last_round };
 }
 
-double SPAFarmTaskPlugin::score_operator_for_plan(
-    const OperatorInfo& op,
-    const std::unordered_map<std::string, int>& owned_counts,
-    const std::unordered_set<std::string>& active_bonds) const
+
+
+// ============================================================================
+// Shop Planning —— 严格对齐 service.pretty.mjs
+//
+// 调用链：`je`（准备阶段）→ `ha`（模拟执行 12 步）→ `ps`（单步决策）→ `Lr`（卡牌评分）
+//
+// 关键事实（决定了这里为什么只买干员）：
+//   L10137  `f = e === "medal" || s.mode === "quick" ? "quick" : "standard"`
+//           → goal 为 medal 时模式被强制 quick，`$e()` 恒 false，`ha` 收到的 `std` 为 undefined
+//   L8303   `const E = m && Lt && _t.mode === "standard" ? gs(...) : ps(...)`
+//           → 只有标准模式才走 `gs`；`gs` 的 L8044 才是唯一的装备购买入口
+//   L8250   `Lr` 只对 `kind === "operator"` 的卡评分
+//   → 因而 `ps` 路径（刷刻章）**从不买装备**。装备在刷章模式下只来自三选一奖励，
+//     随后由 `on`（scan_and_distribute_equipment）分配给场上干员。
+// ============================================================================
+
+int SPAFarmTaskPlugin::bond_need(const std::string& bond) const
 {
-    // Combines `ps` (quick/medal mode, lines 8184-8267) and `gs` (task mode, lines 7984-8105)
-    double score = op.tier * 2.5 + op.dps_weight * 4.0;
-    int copies = 0;
-    if (auto it = owned_counts.find(op.name); it != owned_counts.end()) {
-        copies = it->second;
+    // `xn.get(bond) ?? 3`：`en()` 用 bonds.json 的 `thresholds[0]` 填充
+    if (const auto* b = find_bond(bond)) {
+        if (!b->thresholds.empty()) {
+            return b->thresholds.front();
+        }
+    }
+    return 3;
+}
+
+std::optional<std::string> SPAFarmTaskPlugin::active_focus_bond(
+    const ShopSimState& sim,
+    bool include_bench) const
+{
+    // `fa(a, s, e = false)`  L7975-7980
+    // 在聚焦盟约里找第一个「场上（或全部）持有该盟约的不同干员数 >= 阈值」的盟约
+    std::unordered_set<std::string> names;
+    for (const auto& u : sim.units) {
+        if (u.name.empty()) {
+            continue;
+        }
+        if (!include_bench && u.area != "board") {
+            continue;
+        }
+        names.insert(u.name);
+    }
+    for (const auto& focus : m_active_core_bonds) {
+        int cnt = 0;
+        for (const auto& n : names) {
+            if (const auto* op = find_operator(n)) {
+                if (std::find(op->bond_names.begin(), op->bond_names.end(), focus) != op->bond_names.end()) {
+                    ++cnt;
+                }
+            }
+        }
+        if (cnt >= bond_need(focus)) {
+            return focus;
+        }
+    }
+    return std::nullopt;
+}
+
+SPAFarmTaskPlugin::ShopSimState SPAFarmTaskPlugin::make_shop_sim(const ShopHeaderState& header) const
+{
+    ShopSimState sim;
+    for (const auto& u : m_units) {
+        if (u.name.empty()) {
+            continue; // JS `t = s.units.map(c => c.name)` 允许 null，但后续都按有名字处理
+        }
+        sim.units.push_back(ShopSimUnit { u.name, u.area, u.elite, u.auxiliary, u.item });
+    }
+    sim.shop = m_shop;
+    sim.level = header.level.value_or(m_current_shop_level);
+    sim.gold = header.gold.value_or(m_current_gold);
+    if (header.upgrade_cost.has_value()) {
+        sim.upgrade_cost = header.upgrade_cost;
+    }
+    else if (header.upgrade_btn.has_value()) {
+        sim.upgrade_cost = std::nullopt; // 按钮在但读不到价 → 视为未知
+    }
+    sim.refreshes = m_shop_refreshes;
+    return sim;
+}
+
+std::vector<SPAFarmTaskPlugin::ScoredShopCard> SPAFarmTaskPlugin::score_shop_cards(
+    const ShopSimState& sim) const
+{
+    // 1:1 port of `Lr(a, s, e)` —— service.pretty.mjs L8243-8286
+    const int round = std::max(1, m_current_round);
+    const bool medal_mode = (m_goal == "medal"); // JS `Lt` 的反面
+
+    std::unordered_map<std::string, int> owned;   // t: 名字出现次数
+    std::unordered_set<std::string> elite_names;  // `g` 用
+    int melee_owned = 0;                          // `u`
+    bool has_healer = false;
+    for (const auto& u : sim.units) {
+        if (u.name.empty()) {
+            continue;
+        }
+        owned[u.name]++;
+        if (u.elite) {
+            elite_names.insert(u.name);
+        }
+        if (const auto* op = find_operator(u.name)) {
+            if (op->position == "MELEE") {
+                ++melee_owned;
+            }
+            if (op->is_healer) {
+                has_healer = true;
+            }
+        }
     }
 
-    if (m_goal == "medal") {
-        const bool is_stacker = std::find(kQuickStackers.begin(), kQuickStackers.end(), op.name) != kQuickStackers.end();
-        const bool is_finisher = std::find(kQuickFinishers.begin(), kQuickFinishers.end(), op.name) != kQuickFinishers.end();
-        bool has_core_bond = false;
-        for (const auto& cb : m_active_core_bonds) {
-            if (std::find(op.bond_names.begin(), op.bond_names.end(), cb) != op.bond_names.end()) {
-                has_core_bond = true;
+    // `m = /矩兽/.test(boss) && !ownedHealer`
+    const bool boss_is_ju = m_current_boss.find("矩兽") != std::string::npos;
+    const bool need_healer = boss_is_ju && !has_healer;
+
+    // `w`：盟约 → 持有该盟约的干员数
+    std::unordered_map<std::string, int> bond_owned;
+    for (const auto& u : sim.units) {
+        if (u.name.empty()) {
+            continue;
+        }
+        if (const auto* op = find_operator(u.name)) {
+            for (const auto& b : op->bond_names) {
+                bond_owned[b]++;
+            }
+        }
+    }
+
+    const std::vector<std::string>& active = m_active_bond_names;
+
+    auto in_focus = [&](const std::string& bond) {
+        if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), bond) == m_active_core_bonds.end()) {
+            return false;
+        }
+        // `(!f.length || f.includes(y))`
+        if (active.empty()) {
+            return true;
+        }
+        return std::find(active.begin(), active.end(), bond) != active.end();
+    };
+
+    std::vector<ScoredShopCard> out;
+    for (const auto& card : sim.shop) {
+        if (card.kind != "operator" || card.source != "ocr" || card.name.empty()) {
+            continue;
+        }
+        const auto* op = find_operator(card.name);
+        if (op == nullptr) {
+            out.push_back(ScoredShopCard { card, -1.0, 0 });
+            continue;
+        }
+        // `if (!l || Et.has(l.name)) return {score:-1}`
+        if (elite_names.count(op->name) > 0) {
+            out.push_back(ScoredShopCard { card, -1.0, op->purchase_price });
+            continue;
+        }
+
+        std::vector<std::string> hit_focus; // `E`
+        for (const auto& b : op->bond_names) {
+            if (in_focus(b)) {
+                hit_focus.push_back(b);
+            }
+        }
+        const int copies = owned.count(op->name) ? owned[op->name] : 0; // `d`
+        const bool has_elite_copy = elite_names.count(op->name) > 0;    // `g`
+
+        double n = static_cast<double>(hit_focus.size()) * 80.0 + static_cast<double>(op->tier) * 2.0;
+
+        // + 迅捷（`or`）命中数 * 40；medal 目标下 `or` 就是 {"迅捷"}
+        int swift = 0;
+        for (const auto& b : op->bond_names) {
+            if (b == "迅捷" && (active.empty() || std::find(active.begin(), active.end(), b) != active.end())) {
+                ++swift;
+            }
+        }
+        n += static_cast<double>(swift) * 40.0;
+
+        // + (ht.includes(name) && (E.length || Lt)) ? 90 : 0
+        const bool is_stacker =
+            in_stacker_list(op->name);
+        if (is_stacker && (!hit_focus.empty() || !medal_mode)) {
+            n += 90.0;
+        }
+        // + l.bondNames.some(y => f.includes(y)) ? 20 : 0
+        if (!active.empty()) {
+            bool any_active = false;
+            for (const auto& b : op->bond_names) {
+                if (std::find(active.begin(), active.end(), b) != active.end()) {
+                    any_active = true;
+                    break;
+                }
+            }
+            if (any_active) {
+                n += 20.0;
+            }
+        }
+        // + er.includes(name) ? (round >= 6 ? 110 : 15) : 0
+        if (std::find(kQuickFinishers.begin(), kQuickFinishers.end(), op->name) != kQuickFinishers.end()) {
+            n += (round >= 6) ? 110.0 : 15.0;
+        }
+        // + round === 1 && ["灰喉","卡达"].includes(name) ? 180 : 0
+        if (round == 1 && (op->name == "灰喉" || op->name == "卡达")) {
+            n += 180.0;
+        }
+        // + round <= 2 && position === "RANGED" ? 30 : 0
+        if (round <= 2 && op->position == "RANGED") {
+            n += 30.0;
+        }
+        // + E.some(b => w.get(b) === 2) && !d ? 150 : 0
+        if (copies == 0) {
+            bool two_bond = false;
+            for (const auto& b : hit_focus) {
+                auto it = bond_owned.find(b);
+                if (it != bond_owned.end() && it->second == 2) {
+                    two_bond = true;
+                    break;
+                }
+            }
+            if (two_bond) {
+                n += 150.0;
+            }
+        }
+        // + healsAllies ? (m ? 240 : round >= 6 && st.includes("聚合") ? 45 : 0) : 0
+        if (op->is_healer) {
+            if (need_healer) {
+                n += 240.0;
+            }
+            else if (round >= 6
+                     && std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), "聚合") != m_active_core_bonds.end()) {
+                n += 45.0;
+            }
+        }
+        // d === 2 ? +100 : (d ? (shop 同名 >= 2 ? 0 : -120) : 0)
+        if (copies == 2) {
+            n += 100.0;
+        }
+        else if (copies > 0) {
+            int same_in_shop = 0;
+            for (const auto& c2 : sim.shop) {
+                if (c2.name == op->name) {
+                    ++same_in_shop;
+                }
+            }
+            if (same_in_shop < 2) {
+                n -= 120.0;
+            }
+        }
+        // - (g ? 220 : 0)
+        if (has_elite_copy) {
+            n -= 220.0;
+        }
+        // - (round >= 6 && !E.length && !迅捷 && !er && !healsAllies && !(Lt && ht)) ? 120 : 0
+        if (round >= 6 && hit_focus.empty() && swift == 0
+            && std::find(kQuickFinishers.begin(), kQuickFinishers.end(), op->name) == kQuickFinishers.end()
+            && !op->is_healer && !(!medal_mode && is_stacker)) {
+            n -= 120.0;
+        }
+        // + round >= 4 && melee_owned < 2 && position === "MELEE" ? 220 : 0
+        if (round >= 4 && melee_owned < 2 && op->position == "MELEE") {
+            n += 220.0;
+        }
+
+        out.push_back(ScoredShopCard { card, n, op->purchase_price });
+    }
+
+    // `.sort((c, l) => l.score - c.score || c.card.x - l.card.x)`
+    std::sort(out.begin(), out.end(), [](const ScoredShopCard& a, const ScoredShopCard& b) {
+        if (a.score != b.score) {
+            return a.score > b.score;
+        }
+        return a.card.x < b.card.x;
+    });
+    return out;
+}
+
+// `tr(a)` —— service.pretty.mjs L7924-7935
+// 取所有特质里「层数+N」的最大值；`至多叠加M层` 覆盖 N；`每有/每名/...` 记 8；
+// `自身及(身前|身后)一格` 且无上限时 ×2。
+int SPAFarmTaskPlugin::stack_potential(const OperatorInfo& op)
+{
+    static const std::regex kLayer(R"(层数\+([0-9]+))", std::regex::ECMAScript);
+    static const std::regex kCap(R"(至多叠加([0-9]+)层)", std::regex::ECMAScript);
+    static const std::regex kPer(R"(每有|每名|每获得|每进行|每消耗|每击倒|存活的我方)", std::regex::ECMAScript);
+    static const std::regex kSelfAdj(R"(自身及(身前|身后)一格)", std::regex::ECMAScript);
+
+    int best = 0;
+    for (const auto& tr : op.traits) {
+        std::string t = tr.text;
+        std::string clean;
+        clean.reserve(t.size());
+        for (size_t k = 0; k < t.size();) {
+            const unsigned char ch = static_cast<unsigned char>(t[k]);
+            if (ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' || ch == '\v') {
+                ++k;
+                continue;
+            }
+            if (t.compare(k, 3, "　") == 0) {
+                k += 3;
+                continue;
+            }
+            clean.push_back(t[k]);
+            ++k;
+        }
+        if (clean.rfind("<获得时>", 0) == 0) {
+            continue;
+        }
+        std::smatch m;
+        if (!std::regex_search(clean, m, kLayer)) {
+            continue;
+        }
+        int i = 0;
+        std::smatch cap;
+        const bool has_cap = std::regex_search(clean, cap, kCap);
+        if (has_cap) {
+            i = std::stoi(cap[1].str());
+        }
+        else if (std::regex_search(clean, m, kPer)) {
+            i = 8;
+        }
+        else {
+            i = std::stoi(m[1].str());
+        }
+        if (!has_cap && std::regex_search(clean, kSelfAdj)) {
+            i *= 2;
+        }
+        best = std::max(best, i);
+    }
+    return best;
+}
+
+// `Bn(a)` —— L7979：叠层名单里的干员，且叠层潜力 > 3
+bool SPAFarmTaskPlugin::is_stacker(const OperatorInfo& op) const
+{
+    // `Bn = a => !!a && ht.includes(a.name) && tr(a) > 3` —— L7978
+    if (!in_stacker_list(op.name)) {
+        return false;
+    }
+    return stack_potential(op) > 3;
+}
+
+// `_r(a, s)` —— service.pretty.mjs L7984-8015
+std::vector<SPAFarmTaskPlugin::ShopCandidate> SPAFarmTaskPlugin::rank_shop_candidates(
+    const ShopSimState& sim) const
+{
+    const auto& focus = m_active_core_bonds;
+    const auto& active = m_active_bond_names;
+
+    // `t(c)`：卡牌盟约里既属于聚焦盟约、又（若已读到激活列表）已激活的那些
+    auto focus_active_bonds = [&](const std::vector<std::string>& names) {
+        std::vector<std::string> r;
+        for (const auto& n : names) {
+            if (std::find(focus.begin(), focus.end(), n) == focus.end()) {
+                continue;
+            }
+            if (!active.empty() && std::find(active.begin(), active.end(), n) == active.end()) {
+                continue;
+            }
+            r.push_back(n);
+        }
+        return r;
+    };
+
+    std::unordered_set<std::string> owned; // `f`
+    for (const auto& u : sim.units) {
+        if (!u.name.empty()) {
+            owned.insert(u.name);
+        }
+    }
+    for (const auto& n : m_bought_operators) {
+        owned.insert(n);
+    }
+
+    std::vector<const OperatorInfo*> stackers; // `w`
+    for (const auto& n : owned) {
+        if (const auto* op = find_operator(n); op != nullptr && is_stacker(*op)) {
+            stackers.push_back(op);
+        }
+    }
+    const OperatorInfo* weakest = nullptr; // `i`
+    for (const auto* op : stackers) {
+        if (weakest == nullptr || stack_potential(*op) < stack_potential(*weakest)) {
+            weakest = op;
+        }
+    }
+
+    auto owned_count = [&](const std::string& name) {
+        int c = 0;
+        for (const auto& u : sim.units) {
+            if (u.name == name) {
+                ++c;
+            }
+        }
+        return c;
+    };
+
+    std::vector<ShopCandidate> out;
+    for (const auto& card : sim.shop) {
+        if (card.kind != "operator" || card.source != "ocr" || card.name.empty()) {
+            continue;
+        }
+        if (m_elite_units.count(card.name) > 0) {
+            continue;
+        }
+        const auto* op = find_operator(card.name);
+        if (op == nullptr) {
+            continue;
+        }
+        ShopCandidate cand;
+        cand.card = card;
+        cand.unit_name = op->name;
+        cand.unit_tier = op->tier;
+        cand.unit_price = op->purchase_price;
+
+        const auto tl = focus_active_bonds(op->bond_names);
+        const bool have = owned.count(op->name) > 0;
+
+        if (!tl.empty() && !have) {
+            cand.tier = 1;
+            out.push_back(cand);
+        }
+        else if (is_stacker(*op) && !have) {
+            if (static_cast<int>(stackers.size()) < 2) {
+                cand.tier = 2;
+                out.push_back(cand);
+            }
+            else if (weakest != nullptr && stack_potential(*weakest) < stack_potential(*op)) {
+                cand.tier = 2;
+                cand.sell = weakest->name;
+                cand.has_sell = true;
+                out.push_back(cand);
+            }
+        }
+        else if ((!tl.empty() || is_stacker(*op)) && have && owned_count(op->name) < 3) {
+            cand.tier = 3;
+            out.push_back(cand);
+        }
+    }
+
+    // JS：`c.tier - l.tier || tr(l.unit) - tr(c.unit) || l.unit.tier - c.unit.tier`
+    std::stable_sort(out.begin(), out.end(), [&](const ShopCandidate& a, const ShopCandidate& b) {
+        if (a.tier != b.tier) {
+            return a.tier < b.tier;
+        }
+        const auto* oa = find_operator(a.unit_name);
+        const auto* ob = find_operator(b.unit_name);
+        const int ta = oa == nullptr ? 0 : stack_potential(*oa);
+        const int tb = ob == nullptr ? 0 : stack_potential(*ob);
+        if (ta != tb) {
+            return tb < ta;
+        }
+        return b.unit_tier < a.unit_tier;
+    });
+    return out;
+}
+
+// `gs(a, s, e, t)` —— service.pretty.mjs L8017-8140（标准模式决策）
+SPAFarmTaskPlugin::ShopPlanStep SPAFarmTaskPlugin::gs_step(ShopSimState& sim, PrepTrackState& prep) const
+{
+    const int round = m_current_round;
+    const auto cands = rank_shop_candidates(sim);
+
+    std::unordered_set<std::string> owned_now; // `i`
+    for (const auto& u : sim.units) {
+        if (!u.name.empty()) {
+            owned_now.insert(u.name);
+        }
+    }
+    for (const auto& n : m_bought_operators) {
+        owned_now.insert(n);
+    }
+
+    int named_count = 0;
+    for (const auto& u : sim.units) {
+        if (!u.name.empty() && !u.auxiliary && !u.item) {
+            ++named_count;
+        }
+    }
+    int bench_count = 0;
+    for (const auto& u : sim.units) {
+        if (u.area == "bench") {
+            ++bench_count;
+        }
+    }
+
+    std::string filler_present; // `E`
+    for (const auto& n : m_filler_units) {
+        for (const auto& u : sim.units) {
+            if (u.name == n) {
+                filler_present = n;
                 break;
             }
         }
-        if (is_finisher) {
-            score += 48.0;
+        if (!filler_present.empty()) {
+            break;
         }
-        if (is_stacker) {
-            score += 36.0;
+    }
+
+    const bool bonus_gold = (named_count >= 8 && !filler_present.empty());
+
+    std::vector<int> m_idx; // 买得起的候选下标
+    for (int k = 0; k < static_cast<int>(cands.size()); ++k) {
+        const int extra = (cands[k].has_sell || bonus_gold) ? 1 : 0;
+        if (cands[k].unit_price <= sim.gold + extra) {
+            m_idx.push_back(k);
         }
-        if (has_core_bond) {
-            score += (copies == 0) ? 28.0 : 12.0;
+    }
+    const bool bench_full = bench_count >= 9;
+
+    std::optional<int> first_pick;
+    if (!bench_full && !m_idx.empty()) {
+        first_pick = m_idx.front();
+    }
+
+    auto make_step = [&](int idx) -> ShopPlanStep {
+        const auto& c = cands[idx];
+        ShopPlanStep st;
+        st.target = c.card.name;
+        st.kind = c.card.kind;
+        st.x = c.card.x;
+        st.cost = c.unit_price;
+        if (c.has_sell) {
+            st.action = "swap";
+            st.sell_name = c.sell;
+            for (const auto& un : m_units) {
+                if (un.name == c.sell) {
+                    st.sell_slot = un.slot;
+                    break;
+                }
+            }
+            st.reason = "换更强叠层手 " + c.card.name;
         }
-        // Check profile priority list (`kPriorityFull` / `kPriorityLow`)
-        const auto& prio_list = (m_profile == "low") ? kPriorityLow : kPriorityFull;
-        for (size_t i = 0; i < prio_list.size(); ++i) {
-            if (op.name.find(prio_list[i].first) != std::string::npos
-                || op.name.find(prio_list[i].second) != std::string::npos) {
-                score += std::max(8.0, 32.0 - static_cast<double>(i) * 1.2);
+        else if (named_count >= 8 && !filler_present.empty()) {
+            st.action = "swap";
+            st.sell_name = filler_present;
+            for (const auto& un : m_units) {
+                if (un.name == filler_present) {
+                    st.sell_slot = un.slot;
+                    break;
+                }
+            }
+            st.reason = "整备区已满，卖补位 " + filler_present;
+        }
+        else {
+            st.action = "buy";
+            st.reason = "标准模式";
+        }
+        return st;
+    };
+
+    const bool can_upgrade =
+        sim.upgrade_cost.has_value() && sim.level < 6 && sim.gold >= *sim.upgrade_cost;
+    const bool can_refresh = sim.gold >= 1 && sim.refreshes < 30;
+
+    std::optional<int> overflow; // `y`：买不起的第一张（留着冻结）
+    for (int k = 0; k < static_cast<int>(cands.size()); ++k) {
+        if (std::find(m_idx.begin(), m_idx.end(), k) == m_idx.end()) {
+            overflow = k;
+            break;
+        }
+    }
+
+    // 物品卡（`b` / `C()`）
+    std::optional<int> item_idx;
+    if (prep.use_items && !prep.item_bought) {
+        for (int k = 0; k < static_cast<int>(sim.shop.size()); ++k) {
+            const auto& c = sim.shop[k];
+            if (c.kind == "item" && !c.name.empty() && c.name.find("寻呼") == std::string::npos) {
+                item_idx = k;
                 break;
             }
         }
     }
-    else {
-        for (const auto& gt : kGoalTasks) {
-            if (gt.id == m_goal) {
-                bool has_goal_bond = false;
-                for (const auto& gb : gt.bonds) {
-                    if (std::find(op.bond_names.begin(), op.bond_names.end(), gb) != op.bond_names.end()) {
-                        score += (copies == 0) ? 42.0 : 18.0;
-                        has_goal_bond = true;
+    int item_price = 99;
+    if (item_idx.has_value()) {
+        const auto* it = find_item(sim.shop[*item_idx].name);
+        item_price = it == nullptr ? 99 : it->price;
+    }
+    auto try_item = [&]() -> std::optional<ShopPlanStep> {
+        if (!item_idx.has_value() || sim.gold < item_price) {
+            return std::nullopt;
+        }
+        const auto& c = sim.shop[*item_idx];
+        ShopPlanStep st;
+        st.action = "buy";
+        st.kind = c.kind;
+        st.target = c.name;
+        st.x = c.x;
+        st.cost = item_price;
+        st.reason = "装备";
+        return st;
+    };
+    auto finish = [&]() -> ShopPlanStep {
+        if (auto st = try_item(); st.has_value()) {
+            return *st;
+        }
+        if (overflow.has_value()) {
+            ShopPlanStep st;
+            st.action = "freeze";
+            st.target = cands[*overflow].unit_name;
+            st.reason = "冻结保留";
+            return st;
+        }
+        ShopPlanStep st;
+        st.action = "done";
+        return st;
+    };
+
+    // `me()`：能买到的干员卡，按 tier 降序
+    struct ShopOp
+    {
+        int card_index = 0;
+        const OperatorInfo* op = nullptr;
+    };
+    std::vector<ShopOp> op_cards;
+    for (int k = 0; k < static_cast<int>(sim.shop.size()); ++k) {
+        const auto& c = sim.shop[k];
+        if (c.kind != "operator" || c.source != "ocr" || c.name.empty()) {
+            continue;
+        }
+        if (m_elite_units.count(c.name) > 0) {
+            continue;
+        }
+        const auto* op = find_operator(c.name);
+        if (op == nullptr) {
+            continue;
+        }
+        op_cards.push_back(ShopOp { k, op });
+    }
+    std::stable_sort(op_cards.begin(), op_cards.end(), [](const ShopOp& a, const ShopOp& b) {
+        return b.op->tier < a.op->tier;
+    });
+
+    // `Be()`：2 块钱时买一名补位
+    auto try_filler = [&]() -> std::optional<ShopPlanStep> {
+        if (bench_full || sim.gold != 2 || prep.filler_bought) {
+            return std::nullopt;
+        }
+        for (const auto& so : op_cards) {
+            if (so.op->purchase_price > sim.gold || owned_now.count(so.op->name) > 0) {
+                continue;
+            }
+            const auto& c = sim.shop[so.card_index];
+            ShopPlanStep st;
+            st.action = "buy";
+            st.kind = c.kind;
+            st.target = c.name;
+            st.x = c.x;
+            st.cost = so.op->purchase_price;
+            st.reason = "前期补位";
+            st.filler = true;
+            return st;
+        }
+        return std::nullopt;
+    };
+
+    auto upgrade_step = [&]() {
+        ShopPlanStep st;
+        st.action = "upgrade";
+        st.cost = *sim.upgrade_cost;
+        st.reason = "升商店";
+        return st;
+    };
+    auto refresh_step = [&]() {
+        ShopPlanStep st;
+        st.action = "refresh";
+        st.reason = "刷新";
+        return st;
+    };
+
+    if (round == 1) {
+        if (prep.bought >= 2) {
+            return finish();
+        }
+        if (first_pick.has_value()) {
+            return make_step(*first_pick);
+        }
+        if (!bench_full) {
+            const auto scored = score_shop_cards(sim);
+            for (const auto& sc : scored) {
+                if (sc.score <= 0) {
+                    continue;
+                }
+                const auto* op = find_operator(sc.card.name);
+                if (op == nullptr || op->purchase_price > sim.gold) {
+                    continue;
+                }
+                ShopPlanStep st;
+                st.action = "buy";
+                st.kind = sc.card.kind;
+                st.target = sc.card.name;
+                st.x = sc.card.x;
+                st.cost = op->purchase_price;
+                st.reason = "评分最高";
+                return st;
+            }
+        }
+        return finish();
+    }
+
+    if (round == 2) {
+        static const std::vector<std::string> kFront = { "TANK", "PIONEER", "WARRIOR" };
+        std::vector<ShopOp> fronts;
+        for (const auto& so : op_cards) {
+            if (std::find(kFront.begin(), kFront.end(), so.op->profession) != kFront.end()) {
+                fronts.push_back(so);
+            }
+        }
+        bool have_front = false;
+        for (const auto& n : owned_now) {
+            const auto* op = find_operator(n);
+            if (op != nullptr && std::find(kFront.begin(), kFront.end(), op->profession) != kFront.end()) {
+                have_front = true;
+                break;
+            }
+        }
+        if (prep.front_plan || (!have_front && !fronts.empty() && prep.upgrades == 0)) {
+            prep.front_plan = true;
+            if (prep.bought >= 2) {
+                return finish();
+            }
+            if (first_pick.has_value()) {
+                return make_step(*first_pick);
+            }
+            for (const auto& so : fronts) {
+                if (so.op->purchase_price > sim.gold) {
+                    continue;
+                }
+                const auto& c = sim.shop[so.card_index];
+                ShopPlanStep st;
+                st.action = "buy";
+                st.kind = c.kind;
+                st.target = c.name;
+                st.x = c.x;
+                st.cost = so.op->purchase_price;
+                st.reason = "补前排";
+                return st;
+            }
+            for (const auto& so : op_cards) {
+                if (so.op->purchase_price > sim.gold) {
+                    continue;
+                }
+                const auto& c = sim.shop[so.card_index];
+                ShopPlanStep st;
+                st.action = "buy";
+                st.kind = c.kind;
+                st.target = c.name;
+                st.x = c.x;
+                st.cost = so.op->purchase_price;
+                st.reason = "补人";
+                return st;
+            }
+            return finish();
+        }
+        if (first_pick.has_value()) {
+            return make_step(*first_pick);
+        }
+        if (prep.bought == 0 && prep.upgrades == 0 && can_upgrade) {
+            return upgrade_step();
+        }
+        if (auto st = try_filler(); st.has_value()) {
+            return *st;
+        }
+        return finish();
+    }
+
+    if (round == 3) {
+        if (first_pick.has_value()) {
+            return make_step(*first_pick);
+        }
+        if (overflow.has_value()) {
+            ShopPlanStep st;
+            st.action = "freeze";
+            st.target = cands[*overflow].unit_name;
+            st.reason = "冻结保留";
+            return st;
+        }
+        if (auto st = try_filler(); st.has_value()) {
+            return *st;
+        }
+        return can_refresh ? refresh_step() : finish();
+    }
+
+    if (first_pick.has_value()) {
+        return make_step(*first_pick);
+    }
+    if (overflow.has_value()) {
+        return finish();
+    }
+    if (prep.upgrades == 0 && sim.upgrade_cost.has_value() && sim.level < 6) {
+        if (prep.bought == 0 && *sim.upgrade_cost + 2 >= prep.start_gold) {
+            const int reserve = prep.start_gold - *sim.upgrade_cost;
+            if (sim.refreshes < reserve && sim.gold - 1 >= *sim.upgrade_cost) {
+                return refresh_step();
+            }
+            if (can_upgrade) {
+                return upgrade_step();
+            }
+        }
+        else if (can_upgrade) {
+            return upgrade_step();
+        }
+    }
+    if (auto st = try_item(); st.has_value()) {
+        return *st;
+    }
+    return can_refresh ? refresh_step() : finish();
+}
+
+// `bs(a, s)` —— service.pretty.mjs L8387-8390：挑一张最值得冻结的卡
+std::optional<std::string> SPAFarmTaskPlugin::pick_freeze_target(const ShopSimState& sim) const
+{
+    const auto& focus = m_active_core_bonds;
+    const auto& active = m_active_bond_names;
+    for (const auto& sc : score_shop_cards(sim)) {
+        if (sc.score <= 0) {
+            continue;
+        }
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr) {
+            continue;
+        }
+        if (is_stacker(*op)) {
+            return op->name;
+        }
+        for (const auto& b : op->bond_names) {
+            if (std::find(focus.begin(), focus.end(), b) == focus.end()) {
+                continue;
+            }
+            if (!active.empty() && std::find(active.begin(), active.end(), b) == active.end()) {
+                continue;
+            }
+            return op->name;
+        }
+    }
+    return std::nullopt;
+}
+
+SPAFarmTaskPlugin::ShopPlanStep SPAFarmTaskPlugin::ps_step(ShopSimState& sim) const
+{
+    // `ps(a, s, e)` —— service.pretty.mjs L8142-8241，逐分支对齐
+    const int round = std::max(1, m_current_round);
+    const RoundPacing pacing = get_round_pacing(round);
+    const bool not_medal = (m_goal != "medal"); // `Lt`
+    const int level = sim.level;
+    const int gold = sim.gold;
+
+    // `w`
+    const bool want_upgrade = level < (not_medal ? std::min(pacing.target_shop_level, 5) : pacing.target_shop_level);
+
+    int combat_units = 0;
+    int bench_units = 0;
+    std::vector<const ShopSimUnit*> real_units; // !auxiliary && !item
+    std::unordered_set<std::string> owned;     // `c`
+    std::unordered_set<std::string> elite_names; // `Et`
+    for (const auto& u : sim.units) {
+        if (!u.auxiliary) {
+            ++combat_units;
+        }
+        if (u.area == "bench") {
+            ++bench_units;
+        }
+        if (!u.name.empty()) {
+            owned.insert(u.name);
+            if (u.elite) {
+                elite_names.insert(u.name);
+            }
+            if (!u.auxiliary && !u.item) {
+                real_units.push_back(&u);
+            }
+        }
+    }
+    const bool need_units = combat_units < pacing.min_deploy; // `i`
+
+    // `m` / `u`
+    std::vector<ScoredShopCard> scored = score_shop_cards(sim);
+    std::vector<ScoredShopCard> affordable;
+    for (const auto& sc : scored) {
+        if (sc.score <= 0.0)
+            continue;
+        if (sc.price <= 0 || sc.price > gold)
+            continue;
+        if (bench_units >= 9)
+            continue;
+        affordable.push_back(sc);
+    }
+
+    const std::vector<std::string>& active = m_active_bond_names;
+    auto in_focus = [&](const std::string& bond) {
+        if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), bond) == m_active_core_bonds.end())
+            return false;
+        if (active.empty())
+            return true;
+        return std::find(active.begin(), active.end(), bond) != active.end();
+    };
+    // `E(unit)`
+    auto unit_focus_bonds = [&](const OperatorInfo& op) {
+        std::vector<std::string> out;
+        for (const auto& b : op.bond_names) {
+            if (in_focus(b))
+                out.push_back(b);
+        }
+        return out;
+    };
+    auto bond_need_count = [&](const std::string& bond) { return bond_need(bond); };
+    // `b(bond)`：还差几个
+    auto shortage = [&](const std::string& bond) {
+        std::set<std::string> names;
+        for (const auto& u : sim.units) {
+            if (u.name.empty() || owned.count(u.name) == 0)
+                continue;
+            const auto* op = find_operator(u.name);
+            if (op == nullptr)
+                continue;
+            if (std::find(op->bond_names.begin(), op->bond_names.end(), bond) != op->bond_names.end())
+                names.insert(op->name);
+        }
+        return bond_need_count(bond) - static_cast<int>(names.size());
+    };
+    std::vector<std::string> focus_list; // `M`
+    for (const auto& b : m_active_core_bonds) {
+        if (active.empty() || std::find(active.begin(), active.end(), b) != active.end())
+            focus_list.push_back(b);
+    }
+    bool any_focus_done = false; // `C`
+    for (const auto& b : focus_list) {
+        if (shortage(b) <= 0) {
+            any_focus_done = true;
+            break;
+        }
+    }
+
+    auto buy = [](const ScoredShopCard& sc) {
+        ShopPlanStep st;
+        st.action = "buy";
+        st.target = sc.card.name;
+        st.kind = sc.card.kind;
+        st.x = sc.card.x;
+        st.cost = sc.price;
+        return st;
+    };
+    auto refresh = [](const std::string& reason) {
+        ShopPlanStep st;
+        st.action = "refresh";
+        st.kind = "refresh";
+        st.cost = 1;
+        st.reason = reason;
+        return st;
+    };
+
+    // 1) `g`：某聚焦盟约已凑到 2 名，再买一名即可激活
+    for (const auto& sc : affordable) {
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr || owned.count(op->name) > 0)
+            continue;
+        for (const auto& b : unit_focus_bonds(*op)) {
+            int cnt = 0;
+            for (const auto& n : owned) {
+                const auto* o = find_operator(n);
+                if (o != nullptr && std::find(o->bond_names.begin(), o->bond_names.end(), b) != o->bond_names.end())
+                    ++cnt;
+            }
+            if (cnt == 2)
+                return buy(sc);
+        }
+    }
+
+    // 2) `Lt && cs && level>=3 && M.length && !C`
+    if (not_medal && level >= 3 && !focus_list.empty() && !any_focus_done) {
+        auto min_shortage = [&](const OperatorInfo& op) {
+            int best = std::numeric_limits<int>::max();
+            for (const auto& b : unit_focus_bonds(op))
+                best = std::min(best, shortage(b));
+            return best;
+        };
+        const ScoredShopCard* pick = nullptr;
+        int pick_s = std::numeric_limits<int>::max();
+        for (const auto& sc : affordable) {
+            const auto* op = find_operator(sc.card.name);
+            if (op == nullptr)
+                continue;
+            if (unit_focus_bonds(*op).empty() || owned.count(op->name) > 0)
+                continue;
+            const int s = min_shortage(*op);
+            if (s < pick_s) {
+                pick_s = s;
+                pick = &sc;
+            }
+        }
+        if (pick != nullptr)
+            return buy(*pick);
+        for (const auto& sc : affordable) {
+            if (in_stacker_list(sc.card.name)
+                && owned.count(sc.card.name) == 0)
+                return buy(sc);
+        }
+        if (gold >= 3 && sim.refreshes < 20)
+            return refresh("补盟约刷新");
+    }
+
+    // 3) `t <= 2 && i && u.length`
+    if (round <= 2 && need_units && !affordable.empty())
+        return buy(affordable.front());
+
+    // 4) `Be`：三合一
+    for (const auto& sc : affordable) {
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr || elite_names.count(op->name) > 0)
+            continue;
+        int own = 0;
+        for (const auto& u : sim.units) {
+            if (u.name == op->name && !u.elite)
+                ++own;
+        }
+        if (own >= 3)
+            continue;
+        int in_shop = 0;
+        for (const auto& c2 : sim.shop) {
+            if (c2.name == op->name)
+                ++in_shop;
+        }
+        if (own + in_shop < 3)
+            continue;
+        if ((3 - own) * sc.price > gold)
+            continue;
+        return buy(sc);
+    }
+
+    // 5) `Lt`：先补盟约，再补叠层
+    if (not_medal) {
+        for (const auto& sc : affordable) {
+            const auto* op = find_operator(sc.card.name);
+            if (op != nullptr && !unit_focus_bonds(*op).empty() && owned.count(op->name) == 0)
+                return buy(sc);
+        }
+        for (const auto& sc : affordable) {
+            if (in_stacker_list(sc.card.name)
+                && owned.count(sc.card.name) == 0)
+                return buy(sc);
+        }
+    }
+
+    // 6) `X`：极速 4~6 回合补人
+    const bool rush = (m_mode == "quick" && round >= 4 && round <= 6 && combat_units < 5);
+    if (rush && !affordable.empty())
+        return buy(affordable.front());
+
+    // 7) 升商店
+    if (!rush && want_upgrade && sim.upgrade_cost.has_value() && gold >= *sim.upgrade_cost) {
+        ShopPlanStep st;
+        st.action = "upgrade";
+        st.kind = "upgrade";
+        st.cost = *sim.upgrade_cost;
+        st.target = "商店Lv" + std::to_string(level + 1);
+        return st;
+    }
+
+    // 8) `Lt && (!C || !w)` 刷新
+    auto is_useful = [&](const ScoredShopCard& sc) {
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr)
+            return false;
+        return in_stacker_list(op->name)
+            || !unit_focus_bonds(*op).empty();
+    };
+    if (not_medal && (!any_focus_done || !want_upgrade) && round >= 2 && sim.refreshes < 10 && gold >= 3
+        && !std::any_of(affordable.begin(), affordable.end(), is_useful))
+        return refresh("补盟约刷新");
+
+    // 9) `N`：叠层干员（medal 需命中聚焦盟约）
+    for (const auto& sc : affordable) {
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr)
+            continue;
+        const bool stacker = in_stacker_list(op->name);
+        if (stacker && (not_medal || !unit_focus_bonds(*op).empty()))
+            return buy(sc);
+    }
+
+    // 10) `U` / `q`：矩兽 BOSS 补治疗
+    const bool boss_is_ju = m_current_boss.find("矩兽") != std::string::npos;
+    const ScoredShopCard* healer = nullptr;
+    for (const auto& sc : affordable) {
+        const auto* op = find_operator(sc.card.name);
+        if (op != nullptr && op->is_healer && owned.count(op->name) == 0) {
+            healer = &sc;
+            break;
+        }
+    }
+    bool has_healer = false;
+    for (const auto& u : sim.units) {
+        if (u.name.empty())
+            continue;
+        const auto* op = find_operator(u.name);
+        if (op != nullptr && op->is_healer && owned.count(op->name) > 0)
+            has_healer = true;
+    }
+    if (healer != nullptr && !has_healer && boss_is_ju)
+        return buy(*healer);
+
+    // 11) `p`：第 6 回合后补终结者
+    if (round >= 6) {
+        for (const auto& sc : affordable) {
+            const auto* op = find_operator(sc.card.name);
+            if (op == nullptr)
+                continue;
+            if (std::find(kQuickFinishers.begin(), kQuickFinishers.end(), op->name) != kQuickFinishers.end()
+                && !unit_focus_bonds(*op).empty() && owned.count(op->name) == 0)
+                return buy(sc);
+        }
+        if ((healer != nullptr) && !has_healer
+            && std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), "聚合") != m_active_core_bonds.end())
+            return buy(*healer);
+    }
+
+    // 12) 近战不足 2
+    int melee_owned = 0;
+    for (const auto& u : real_units) {
+        const auto* op = find_operator(u->name);
+        if (op != nullptr && op->position == "MELEE")
+            ++melee_owned;
+    }
+    if (round >= 4 && melee_owned < 2) {
+        for (const auto& sc : affordable) {
+            const auto* op = find_operator(sc.card.name);
+            if (op != nullptr && op->position == "MELEE")
+                return buy(sc);
+        }
+    }
+
+    // 13) `!Lt && quick && d && !w`
+    const bool bond_done = active_focus_bond(sim, true).has_value(); // `d`
+    if (!not_medal && m_mode == "quick" && bond_done && !want_upgrade) {
+        for (const auto& sc : affordable) {
+            const auto* op = find_operator(sc.card.name);
+            if (op == nullptr || elite_names.count(op->name) > 0 || owned.count(op->name) > 0)
+                continue;
+            bool ok = !unit_focus_bonds(*op).empty();
+            if (!ok) {
+                for (const auto& b : op->bond_names) {
+                    if (b == "迅捷") {
+                        ok = true;
+                        break;
                     }
                 }
-                if (has_goal_bond && (op.trait_text.find("叠加") != std::string::npos || op.trait_text.find("层数") != std::string::npos)) {
-                    score += 32.0;
+            }
+            if (!ok && in_stacker_list(op->name))
+                ok = true;
+            if (ok)
+                return buy(sc);
+        }
+        // 买同名凑三连
+        struct DupPick
+        {
+            const ShopCard* card = nullptr;
+            int price = 0;
+            int own = 0;
+            int tier = 0;
+        };
+        std::optional<DupPick> best_dup;
+        const bool bench_room = bench_units < 9;
+        for (const auto& card : sim.shop) {
+            if (card.kind != "operator" || card.source != "ocr" || card.name.empty())
+                continue;
+            if (owned.count(card.name) == 0)
+                continue;
+            if (elite_names.count(card.name) > 0)
+                continue;
+            int own = 0;
+            for (const auto& u : sim.units) {
+                if (u.name == card.name && !u.auxiliary)
+                    ++own;
+            }
+            if (own >= 3)
+                continue;
+            if (!(bench_room || own == 2))
+                continue;
+            const auto* op = find_operator(card.name);
+            if (op == nullptr)
+                continue;
+            const int price = op->purchase_price;
+            if (price > gold)
+                continue;
+            bool useful = !unit_focus_bonds(*op).empty();
+            if (!useful) {
+                for (const auto& b : op->bond_names) {
+                    if (b == "迅捷") {
+                        useful = true;
+                        break;
+                    }
                 }
-                break;
+            }
+            if (!useful && in_stacker_list(op->name))
+                useful = true;
+            if (!useful)
+                continue;
+            if (!best_dup.has_value() || own < best_dup->own
+                || (own == best_dup->own && op->tier > best_dup->tier)) {
+                best_dup = DupPick { &card, price, own, op->tier };
             }
         }
+        if (best_dup.has_value()) {
+            ShopPlanStep st;
+            st.action = "buy";
+            st.target = best_dup->card->name;
+            st.kind = best_dup->card->kind;
+            st.x = best_dup->card->x;
+            st.cost = best_dup->price;
+            return st;
+        }
+        if (gold >= 3 && sim.refreshes < 20)
+            return refresh("凑同名刷新");
     }
 
-    if (!op.stack_info.rules.empty() || op.stack_info.on_skill || op.stack_info.on_deploy) {
-        score += 18.0;
+    // 14) `Ee` / `ds` 刷新
+    auto is_valuable = [&](const ScoredShopCard& sc) {
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr)
+            return false;
+        if (!unit_focus_bonds(*op).empty())
+            return true;
+        if (in_stacker_list(op->name))
+            return true;
+        if (std::find(kQuickFinishers.begin(), kQuickFinishers.end(), op->name) != kQuickFinishers.end())
+            return true;
+        return op->is_healer && !has_healer && boss_is_ju;
+    };
+    if (gold >= 3 && sim.refreshes < 10 && round >= 3 && !affordable.empty()
+        && !is_valuable(affordable.front()) && gold - 1 >= affordable.front().price
+        && (need_units || (!want_upgrade && round >= 6 && !bond_done)))
+        return refresh("低质商店刷新");
+
+    // 15) 兜底
+    if (!affordable.empty()) {
+        const bool cond_a = need_units || (!want_upgrade && round >= 6 && !bond_done);
+        const bool can_upgrade = want_upgrade && sim.upgrade_cost.has_value() && gold >= *sim.upgrade_cost;
+        if (cond_a || rush || !can_upgrade)
+            return buy(affordable.front());
     }
-    if (copies == 1) {
-        score += 10.0; // pair bonus
-    }
-    else if (copies == 2) {
-        score += 38.0; // triple merge to elite!
-    }
-    for (const auto& b : op.bond_names) {
-        if (active_bonds.count(b) > 0) {
-            score += 6.0;
+
+    // 16) 冻结
+    for (const auto& sc : scored) {
+        const auto* op = find_operator(sc.card.name);
+        if (op == nullptr)
+            continue;
+        if (in_stacker_list(op->name)
+            && !unit_focus_bonds(*op).empty()) {
+            ShopPlanStep st;
+            st.action = "freeze";
+            st.target = op->name;
+            st.kind = "operator";
+            return st;
         }
     }
-    return score;
+    if (!want_upgrade && round >= 6 && !bond_done && gold >= 4 && sim.refreshes < 8)
+        return refresh("末期搜卡");
+
+    ShopPlanStep done;
+    done.action = "done";
+    return done;
 }
 
 std::vector<SPAFarmTaskPlugin::ShopPlanStep> SPAFarmTaskPlugin::plan_shop_Steps(
     const ShopHeaderState& header,
     const std::vector<ShopCard>& shop)
 {
-    // Exact 1:1 port of `ha` (`Lr` / `_r`) in service.pretty.mjs lines 8106-8390
+    // `ha(a, s, e)` —— service.pretty.mjs L8292-8382
+    // `je` L10040：`Je = { ...Ve, shop: Ve.shop.filter(De => !Xe.has(Math.round(De.x / 100))) }`
+    // 规划用的卡面是「剔除买失败槽位」之后的副本，不是完整 `m_shop`。
+    // 在状态副本上模拟最多 12 步，避免「执行一步再重读」带来的状态漂移。
+    ShopSimState sim = make_shop_sim(header);
+    sim.shop = shop;
+
+    // `$e()`：只有 task 目标 + standard 模式才走 `gs`；medal 恒走 `ps`（`Lt` 为假）
+    const bool standard = (m_mode == "standard" && m_goal != "medal");
+    if (m_prep_track_round != m_current_round) {
+        m_prep_track_round = m_current_round;
+        m_prep_track = PrepTrackState {};
+        m_prep_track.start_gold = -1;
+    }
+    PrepTrackState prep = m_prep_track;
+    if (prep.start_gold < 0) {
+        prep.start_gold = sim.gold; // `$e() && Ce.startGold < 0 && (Ce.startGold = xe.gold)`
+    }
+    prep.use_items = true; // JS 默认 `X.useEquipment = true`
+
     std::vector<ShopPlanStep> steps;
-    int gold = header.gold.value_or(m_current_gold);
-    int shop_lv = header.level.value_or(m_current_shop_level);
-    int up_cost = header.upgrade_cost.value_or(99);
-    const RoundPacing pacing = get_round_pacing(std::max(1, m_current_round));
+    for (int l = 0; l < 12; ++l) {
+        ShopPlanStep E = standard ? gs_step(sim, prep) : ps_step(sim);
 
-    std::unordered_map<std::string, int> owned_counts;
-    int board_cnt = 0;
-    int bench_cnt = 0;
-    for (const auto& u : m_units) {
-        if (!u.name.empty() && !u.auxiliary) {
-            owned_counts[u.name]++;
-        }
-        if (u.area == "board" && !u.auxiliary) {
-            ++board_cnt;
-        }
-        else if (u.area == "bench") {
-            ++bench_cnt;
-        }
-    }
+        auto drop_card = [&](const ShopCard& card) {
+            for (auto it = sim.shop.begin(); it != sim.shop.end(); ++it) {
+                if (it->x == card.x && it->name == card.name) {
+                    sim.shop.erase(it);
+                    return;
+                }
+            }
+        };
 
-    std::unordered_set<std::string> active_bonds(m_active_core_bonds.begin(), m_active_core_bonds.end());
-
-    // 1. Always claim free cards (`freeCards`) first!
-    for (const auto& card : shop) {
-        if (card.free_card && !card.name.empty() && bench_cnt < 9) {
-            steps.push_back(ShopPlanStep {
-                "buy", card.name, card.kind, card.x, 0, "", "", "免费卡牌0费必拿" });
-            owned_counts[card.name]++;
-            ++bench_cnt;
-        }
-    }
-
-    // 2. Check if we should upgrade shop toward `pacing.target_shop_level`
-    const int total_combat_units = board_cnt + bench_cnt;
-    if (shop_lv < pacing.target_shop_level && header.upgrade_btn.has_value() && gold >= up_cost) {
-        bool defense_safe = (total_combat_units >= pacing.min_deploy)
-            || (m_current_round <= 2 && gold >= up_cost + 2)
-            || (up_cost <= 3);
-        if (defense_safe) {
-            steps.push_back(ShopPlanStep {
-                "upgrade",
-                "商店Lv" + std::to_string(shop_lv + 1),
-                "upgrade",
-                header.upgrade_btn->first,
-                up_cost,
-                "",
-                "",
-                "按回合节奏升本至Lv" + std::to_string(pacing.target_shop_level) });
-            gold -= up_cost;
-            ++shop_lv;
-        }
-    }
-
-    // 3. Score remaining shop cards and buy high-value operators / bond items
-    struct ScoredCard
-    {
-        ShopCard card;
-        double score = 0.0;
-    };
-    std::vector<ScoredCard> scored;
-    for (const auto& card : shop) {
-        if (card.free_card || card.name.empty()) {
+        if (E.action == "swap") {
+            steps.push_back(E);
+            sim.gold += 1 - E.cost; // 卖价恒为 1（`soldPrice` 最低 1；JS `w += 1 - E.price`）
+            for (auto it = sim.units.begin(); it != sim.units.end(); ++it) {
+                if (it->name == E.sell_name) {
+                    sim.units.erase(it);
+                    break;
+                }
+            }
+            ShopCard sold_card;
+            sold_card.x = E.x;
+            sold_card.name = E.target;
+            drop_card(sold_card);
+            ShopSimUnit nu;
+            nu.name = E.target;
+            nu.area = "bench";
+            sim.units.push_back(nu);
+            if (standard) {
+                ++prep.bought;
+            }
             continue;
         }
-        if (card.kind == "operator") {
-            if (const auto* op = find_operator(card.name)) {
-                double sc = score_operator_for_plan(*op, owned_counts, active_bonds);
-                if (total_combat_units < pacing.min_deploy) {
-                    sc += 30.0; // Need bodies to fill min_deploy
-                }
-                scored.push_back(ScoredCard { card, sc });
-            }
+        if (E.action == "done") {
+            break;
         }
-        else if (card.kind == "item") {
-            if (const auto* it = find_item(card.name)) {
-                const std::string cat = it->category.empty()
-                    ? classify_item_category(it->name, it->effect)
-                    : it->category;
-                if (it->is_debuff || cat == "debuff" || m_bought_items.count(it->name) > 0) {
+        if (E.action == "freeze" || E.action == "refresh") {
+            steps.push_back(E);
+            break;
+        }
+        if (E.action == "upgrade") {
+            steps.push_back(E);
+            sim.gold -= E.cost;
+            ++sim.level;
+            if (standard) {
+                ++prep.upgrades;
+            }
+            // `i = e.knownUpgradeCosts?.[f] ?? null`：只有 `!verifyUpgrade && level===1 && round===1`
+            // 时 JS 才把价格表传进来，其余情况一律视为未知并停止本批
+            const bool has_known_costs = !m_verify_upgrade && m_current_shop_level == 1 && m_current_round == 1;
+            if (has_known_costs) {
+                if (auto it = m_shop_upgrade_costs.find(sim.level); it != m_shop_upgrade_costs.end()) {
+                    sim.upgrade_cost = it->second;
                     continue;
                 }
-                double item_sc = -1.0;
-                if (!it->granted_bond_name.empty()) {
-                    bool useful_bond = std::find(
-                                           m_active_core_bonds.begin(),
-                                           m_active_core_bonds.end(),
-                                           it->granted_bond_name)
-                        != m_active_core_bonds.end();
-                    if (useful_bond) {
-                        item_sc = (m_goal == "medal") ? 46.0 : 95.0;
-                    }
-                }
-                else if (cat == "stack") {
-                    item_sc = 42.0;
-                }
-                else if (cat == "utility" && (it->effect.find("最大可部署人数") != std::string::npos || it->effect.find("晋升") != std::string::npos || it->effect.find("资金") != std::string::npos)) {
-                    item_sc = 38.0;
-                }
-                else if ((cat == "output" || cat == "defense") && shop_lv >= pacing.target_shop_level && m_current_round >= 4) {
-                    item_sc = 28.0;
-                }
-                if (item_sc > 0.0) {
-                    scored.push_back(ScoredCard { card, item_sc });
-                }
+            }
+            sim.upgrade_cost.reset();
+            break;
+        }
+
+        // buy
+        steps.push_back(E);
+        sim.gold -= E.cost;
+        if (standard) {
+            if (E.kind == "item") {
+                prep.item_bought = true;
+            }
+            else {
+                ++prep.bought;
+            }
+            if (E.filler) {
+                prep.filler_bought = true;
             }
         }
-    }
-
-    std::sort(scored.begin(), scored.end(), [](const ScoredCard& a, const ScoredCard& b) {
-        return a.score > b.score;
-    });
-
-    const double buy_threshold = (shop_lv < pacing.target_shop_level) ? 42.0 : 26.0;
-    for (const auto& sc : scored) {
-        if (gold < sc.card.cost) {
-            continue;
-        }
-        if (sc.score < buy_threshold && total_combat_units >= pacing.min_deploy) {
-            continue;
-        }
-        if (sc.card.kind == "operator" && bench_cnt >= 9) {
-            // Find weakest bench filler to swap (`swap` step)
-            std::string weakest_slot;
-            std::string weakest_name;
-            double weakest_score = 1e9;
-            for (const auto& u : m_units) {
-                if (u.area == "bench" && !u.name.empty() && !u.elite) {
-                    if (const auto* uop = find_operator(u.name)) {
-                        double usc = score_operator_for_plan(*uop, owned_counts, active_bonds);
-                        if (usc < weakest_score) {
-                            weakest_score = usc;
-                            weakest_slot = u.slot;
-                            weakest_name = u.name;
-                        }
-                    }
-                }
-            }
-            if (!weakest_slot.empty() && sc.score > weakest_score + 18.0) {
-                steps.push_back(ShopPlanStep {
-                    "swap",
-                    sc.card.name,
-                    sc.card.kind,
-                    sc.card.x,
-                    sc.card.cost,
-                    weakest_slot,
-                    weakest_name,
-                    "出售低分候补换购高优干员" });
-                gold = gold + 1 - sc.card.cost;
-                owned_counts[sc.card.name]++;
-            }
-            continue;
-        }
-
-        steps.push_back(ShopPlanStep {
-            "buy",
-            sc.card.name,
-            sc.card.kind,
-            sc.card.x,
-            sc.card.cost,
-            "",
-            "",
-            "评分:" + std::to_string(static_cast<int>(sc.score)) });
-        gold -= sc.card.cost;
-        if (sc.card.kind == "operator") {
-            owned_counts[sc.card.name]++;
-            ++bench_cnt;
+        ShopCard bought_card;
+        bought_card.x = E.x;
+        bought_card.name = E.target;
+        drop_card(bought_card);
+        if (E.kind != "item") {
+            ShopSimUnit nu;
+            nu.name = E.target;
+            nu.area = "bench";
+            sim.units.push_back(nu);
         }
     }
-
-    // 4. Refresh if shop is at target level and gold is sufficient
-    if (steps.empty() && shop_lv >= pacing.target_shop_level && gold >= 4) {
-        steps.push_back(ShopPlanStep { "refresh", "刷新商店", "refresh", 1786, 2, "", "", "高本搜卡" });
-    }
-    else if (steps.empty()) {
-        steps.push_back(ShopPlanStep { "done", "", "", 0, 0, "", "", "本轮商店操作完成" });
-    }
+    m_prep_track = prep;
     return steps;
 }
 
@@ -5580,7 +9300,19 @@ bool SPAFarmTaskPlugin::buy_shop_card(int card_x, const std::string& expected_na
 
     tap(B + 65, 1025, 380);
     if (!expected_name.empty()) {
+        // `ke.add(k), Gt = k, rr = !0` —— `ke` 即 Nr，`Gt` 记录最近一次买到的干员
+        m_last_bought_name = expected_name;
         if (find_operator(expected_name)) {
+            // `if (state.units.filter(x => x.name === k && !x.elite).length >= 2) p.add(k)`
+            int same_cnt = 0;
+            for (const auto& u : m_units) {
+                if (u.name == expected_name && !u.elite) {
+                    ++same_cnt;
+                }
+            }
+            if (same_cnt >= 2) {
+                m_pending_merge.insert(expected_name);
+            }
             m_recent_bought_names.push_back(expected_name);
             if (m_recent_bought_names.size() > 10) {
                 m_recent_bought_names.erase(m_recent_bought_names.begin());
@@ -5595,46 +9327,132 @@ bool SPAFarmTaskPlugin::buy_shop_card(int card_x, const std::string& expected_na
 
 bool SPAFarmTaskPlugin::upgrade_shop(const ShopHeaderState& header)
 {
-    // Exact 1:1 port of `ct(I)` in service.pretty.mjs lines 9057-9084:
-    // Taps upgrade button (k, D), then polls up to 1500ms in [k - 130, D - 120, 260, 200]
-    // for `/确认升级/` and clicks its center if present.
+    // 1:1 port of `ct(I)` in service.pretty.mjs L9055-9088（非 pc 设备路径）。
+    //
+    // `ct` 点升级 → 轮询「确认升级」弹窗 → 点了之后调 `_()`；
+    // 没出现弹窗时按「等级 +1 / 金币扣减」二选一，都不满足才 `return !1`。
+    // `_()` 是 pc 专属的 3 秒等级复核，非 pc 首行直接 `return !0`，
+    // 所以 MAA 上升级成功与否只由「确认升级弹窗 / 等级 / 金币」判定。
     if (!header.upgrade_btn.has_value()) {
         return false;
     }
     const int k = header.upgrade_btn->first;
     const int D = header.upgrade_btn->second;
+    const std::optional<int> level_before = header.level;
+    const std::optional<int> gold_before = header.gold;
+    const int up_cost = header.upgrade_cost.value_or(-1);
+
+    // `ct(I)` 里的 `_()`（service.pretty.mjs L9057-9063）首行是
+    //     `if (e.getState().device?.kind !== "pc") return !0;`
+    // MAA 走 Win32Controller，设备恒为非 pc（实测 pc 分支不可达，按用户要求不移植），
+    // 因此 `_()` 恒返回 true：不做 3 秒等级轮询、不把 `i.level` 置 null、
+    // 也不抛「PC 升级结果未确认」。旧实现漏掉这个守卫，把 pc 专属逻辑无条件执行，
+    // 升级后只要 OCR 一帧没读到新等级就置 level=0 并抛错，导致整回合商店批处理被 break。
+    auto verify_level_up = []() -> bool {
+        return true;
+    };
+
     tap(k, D, 200);
 
-    const std::array<int, 4> confirm_roi = {
-        std::max(0, k - 130),
-        std::max(0, D - 120),
-        260,
-        200
-    };
     const auto t0 = std::chrono::steady_clock::now();
-    while (std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count() < 1500
+    while (std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now() - t0).count() < 1500
            && !need_exit()) {
+        sleep_ms(80);
+        const int rx = std::max(0, static_cast<int>(std::lround(static_cast<double>(k) - 130.0)));
+        const int ry = std::max(0, static_cast<int>(std::lround(static_cast<double>(D) - 120.0)));
         cv::Mat cur = shot();
-        auto items = ocr(cur, confirm_roi);
+        if (cur.empty()) {
+            continue;
+        }
+        auto items = ocr(
+            cur,
+            std::array<int, 4> { rx,
+                                 ry,
+                                 260,
+                                 std::min(std::max(0, 1080 - ry), 200) });
         if (auto hit = find_ocr(items, { "确认升级" })) {
-            tap(hit->cx, hit->cy, 350);
-            return true;
+            tap(hit->cx, hit->cy, 0);
+            sleep_ms(250);
+            return verify_level_up();
         }
-        // Check if upgrade already took effect without a popup
-        auto next_hdr = read_shop_header(cur, ocr(cur));
-        if ((header.level.has_value() && next_hdr.level.has_value() && *next_hdr.level > *header.level)
-            || (header.gold.has_value() && next_hdr.gold.has_value() && *next_hdr.gold < *header.gold)) {
-            return true;
+    }
+
+    cv::Mat cur = shot();
+    ShopHeaderState now_hdr;
+    if (!cur.empty()) {
+        now_hdr = read_shop_header(cur, ocr(cur));
+    }
+    if (level_before.has_value() && now_hdr.level.has_value()
+        && *now_hdr.level == *level_before + 1) {
+        return true;
+    }
+    if (gold_before.has_value() && up_cost > 0 && now_hdr.gold.has_value()
+        && *now_hdr.gold == *gold_before - up_cost) {
+        return verify_level_up();
+    }
+    log_info("点击升级后未出现确认升级，跳过本次升级");
+    tap(1450, 300, 300);
+    return false;
+}
+
+// `lr(a)` —— service.pretty.mjs L8939-8942：过渡期干员（不追盟约、不叠层、不是核心）
+bool SPAFarmTaskPlugin::is_transition_unit(std::string_view name) const
+{
+    const auto* op = find_operator(name);
+    if (op == nullptr || op->golden) {
+        return false;
+    }
+    static const std::vector<std::string> kStackers = {
+        "伺夜", "空弦", "黑键", "雪猎", "旅骨", "霍尔海雅",
+        "迷迭香", "鸿雪", "Miss.Christine", "溯光星源", "逻各斯", "夕"
+    };
+    static const std::vector<std::string> kFinishers = { "蕾缪安", "塔露拉", "艾雅法拉", "维伊" };
+
+    for (const auto& b : op->bond_names) {
+        if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), b) != m_active_core_bonds.end()) {
+            return false;
         }
-        sleep_ms(140);
+        if (m_goal == "medal" && b == "迅捷") {
+            return false; // `or`：medal 目标是 ["迅捷"]
+        }
+    }
+    if (std::find(kStackers.begin(), kStackers.end(), op->name) != kStackers.end()) {
+        return false;
+    }
+    if (std::find(kFinishers.begin(), kFinishers.end(), op->name) != kFinishers.end()) {
+        return false;
     }
     return true;
 }
 
-bool SPAFarmTaskPlugin::sell_unit_slot(const std::string& slot, const CameraDetectResult& cam)
+// `F(I, k)` —— service.pretty.mjs L8944-8948：挑一名可卖的过渡干员（精英/高费靠后）
+const SPAFarmTaskPlugin::UnitSlot* SPAFarmTaskPlugin::pick_sell_bench_unit(std::string_view except_name) const
 {
-    // Exact 1:1 port of `oe(I)` in service.pretty.mjs lines 8968-9015 (including `waitStableBoard(4e3)` L8970)
-    (void)cam;
+    auto rank = [&](const UnitSlot& u) {
+        const int elite = (u.elite || m_elite_units.count(u.name) > 0) ? 1 : 0;
+        const auto* op = find_operator(u.name);
+        return std::pair<int, int> { elite, op == nullptr ? 9 : op->tier };
+    };
+    const UnitSlot* best = nullptr;
+    for (const auto& u : m_units) {
+        if (u.area != "bench" || u.name.empty() || u.auxiliary || u.item) {
+            continue;
+        }
+        if (u.name == except_name || !is_transition_unit(u.name)) {
+            continue;
+        }
+        if (best == nullptr || rank(u) < rank(*best)) {
+            best = &u;
+        }
+    }
+    return best;
+}
+
+bool SPAFarmTaskPlugin::sell_unit_slot(const std::string& slot, int gold_baseline)
+{
+    // `oe(I, k)` —— service.pretty.mjs L8969-8989
+    //   拖到 (1780,930) → 700ms → 收起详情 → 重读商店头 → **金币必须比基准大** 才算卖掉
     auto it = std::find_if(m_units.begin(), m_units.end(), [&](const UnitSlot& u) {
         return u.slot == slot;
     });
@@ -5643,27 +9461,58 @@ bool SPAFarmTaskPlugin::sell_unit_slot(const std::string& slot, const CameraDete
     }
     auto st = wait_stable_board(4000);
     if (!st.has_value()) {
-        close_detail_panel();
-        st = wait_stable_board(4000);
-    }
-    if (!st.has_value()) {
         return false;
     }
     auto [fx, fy] = project_point(st->H, it->c + 0.5, it->r + 0.5);
-    cv::Mat held_img = drag_board_unit(fx, fy, 1780, 930, true);
-    if (!held_img.empty()) {
-        auto sell_ocr = ocr(held_img, std::array<int, 4> { 1550, 780, 350, 260 });
-        if (has_ocr(sell_ocr, { "不可出售" })) {
-            it->auxiliary = true;
-            m_remembered_units[it->slot] = *it;
-            close_detail_panel();
-            return false;
-        }
-    }
+    drag_segments(fx, fy, 1780, 930, 16, 25, 400);
     sleep_ms(static_cast<int>(std::lround(700.0 * m_step_scale)));
     close_detail_panel();
-    m_remembered_units.erase(slot);
-    m_units.erase(it);
+
+    // `Rt(await Ke(await h()))`：收起面板后读商店头
+    {
+        cv::Mat cur = shot();
+        auto items = ocr(cur);
+        if (auto hit = find_text_regex(items, "^.?展开$")) {
+            tap(hit->cx, hit->cy, 250);
+        }
+        cv::Mat hdr_img = shot();
+        auto hdr = read_shop_header(hdr_img, ocr(hdr_img));
+        const bool sold = hdr.gold.has_value() && *hdr.gold > gold_baseline;
+        if (!sold) {
+            return false;
+        }
+        if (hdr.gold.has_value()) {
+            m_current_gold = *hdr.gold;
+        }
+    }
+
+    // `removeUnit(slot)`
+    {
+        const std::string sold_name = it->name;
+        const bool ghost = it->ghost;
+        m_remembered_units.erase(slot);
+        if (ghost) {
+            m_units.erase(it);
+        }
+        else {
+            it->name.clear();
+            it->source.clear();
+            it->verified = false;
+        }
+        // `ke.delete(name)`：场上没有同名（除自己）时，从「已买过」里移除
+        if (!sold_name.empty()) {
+            bool other_same = false;
+            for (const auto& u : m_units) {
+                if (u.slot != slot && u.name == sold_name) {
+                    other_same = true;
+                    break;
+                }
+            }
+            if (!other_same) {
+                m_bought_operators.erase(sold_name);
+            }
+        }
+    }
     return true;
 }
 
@@ -5704,11 +9553,12 @@ std::string SPAFarmTaskPlugin::classify_item_category(std::string_view name, std
     if (effect.find("装备时销毁") != std::string_view::npos) {
         return match_ma ? "stack" : "utility";
     }
-    if (match_Es) {
-        return "debuff";
-    }
+    // 原文顺序：`Fs`（utility）在 `Es`（debuff）之前
     if (match_Fs) {
         return "utility";
+    }
+    if (match_Es) {
+        return "debuff";
     }
     if (match_ma) {
         return "stack";
@@ -5719,235 +9569,1108 @@ std::string SPAFarmTaskPlugin::classify_item_category(std::string_view name, std
     return "output";
 }
 
-const SPAFarmTaskPlugin::UnitSlot* SPAFarmTaskPlugin::pick_equipment_target(
-    std::string_view category,
-    const ItemInfo* item_info) const
+int SPAFarmTaskPlugin::equip_cap(const std::string& name) const
 {
-    // Exact 1:1 port of `ga(a, s, e, t, f = null)` in service.pretty.mjs lines 8401-8414
-    if (category == "debuff") {
+    // `Ct(I)` —— service.pretty.mjs L9289-9291
+    //   !$e()（goal=="medal"）|| strategy!=="杰西卡" || round>13 → 2
+    //   否则「是寻呼目标」→ 1，其余 2
+    if (m_goal == "medal" || m_current_strategy.find("杰西卡") == std::string::npos || m_current_round > 13) {
+        return 2;
+    }
+    auto tgt = pick_pager_target();
+    return (tgt.has_value() && tgt->name == name) ? 1 : 2;
+}
+
+std::vector<SPAFarmTaskPlugin::EquipTarget> SPAFarmTaskPlugin::build_equip_targets() const
+{
+    // `on` 的 `B` —— L9434-9440
+    std::vector<EquipTarget> out;
+    for (const auto& u : m_units) {
+        if (u.area != "board" || u.name.empty() || u.auxiliary) {
+            continue;
+        }
+        int eq = 0;
+        if (auto it = m_unit_equipped_count.find(u.name); it != m_unit_equipped_count.end()) {
+            eq = it->second;
+        }
+        if (eq >= equip_cap(u.name)) {
+            continue;
+        }
+        out.push_back(EquipTarget { u.slot, u.name, u.elite, eq, u.r, u.c });
+    }
+    return out;
+}
+
+const SPAFarmTaskPlugin::EquipTarget* SPAFarmTaskPlugin::pick_equipment_target(
+    std::string_view category,
+    const std::vector<EquipTarget>& targets,
+    const EquipTarget* exclude)
+{
+    // Exact 1:1 port of `ga(a, s, e, t, f)` in service.pretty.mjs lines 8401-8414
+    if (category == "debuff" || targets.empty()) {
         return nullptr;
     }
 
-    const UnitSlot* best_target = nullptr;
-    double best_score = -1e18;
-
-    for (const auto& c : m_units) {
-        if (c.area != "board" || c.auxiliary || c.ghost || c.name.empty()) {
-            continue;
-        }
+    auto score = [&](const EquipTarget& c) -> double {
         const auto* op = find_operator(c.name);
-        if (!op) {
+        if (op == nullptr) {
+            return -1e9; // JS: `l ? ... : -1e9`
+        }
+        const double val_i = 200.0 * (1.0 + 0.25 * (op->tier - 1)) * (c.elite ? 1.4 : 1.0);
+        const double val_m = -static_cast<double>(c.equipped) * 150.0;
+        if (category == "stack") {
+            const double keep = in_stacker_list(op->name) ? 1000.0 : 0.0;
+            bool has_focus = false;
+            for (const auto& b : op->bond_names) {
+                if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), b) != m_active_core_bonds.end()) {
+                    has_focus = true;
+                    break;
+                }
+            }
+            return keep + (has_focus ? 500.0 : 0.0) + val_i / 10.0 + val_m;
+        }
+        if (category == "defense") {
+            return (op->position == "MELEE" ? 1000.0 : 0.0) + op->block_cnt * 100.0 + op->max_hp / 100.0 + val_m;
+        }
+        if (category == "utility") {
+            return val_m;
+        }
+        return val_i + (op->position == "RANGED" ? 50.0 : 0.0) + val_m;
+    };
+
+    const EquipTarget* best = nullptr;
+    double best_score = 0.0;
+    for (const auto& c : targets) {
+        if (exclude != nullptr && &c == exclude) {
             continue;
         }
-        if (item_info && !item_info->granted_bond_name.empty()) {
-            if (std::find(op->bond_names.begin(), op->bond_names.end(), item_info->granted_bond_name)
-                != op->bond_names.end()) {
+        const double sc = score(c);
+        if (best == nullptr || sc > best_score) { // JS `sort` 稳定，取首个最大值
+            best = &c;
+            best_score = sc;
+        }
+    }
+    return best;
+}
+
+// `Pt(I, k, D, B)` —— service.pretty.mjs L9197-9206：以格心为中心取 80×60 灰度 patch
+std::vector<uint8_t> SPAFarmTaskPlugin::capture_item_patch(
+    const cv::Mat& img,
+    const std::array<double, 9>& H,
+    int r,
+    int c)
+{
+    std::vector<uint8_t> out(80 * 60, 0);
+    if (img.empty()) {
+        return out;
+    }
+    auto [px, py] = project_point(H, c + 0.5, r + 0.5);
+    const int left = std::max(0, static_cast<int>(std::lround(px - 40)));
+    const int top = std::max(0, static_cast<int>(std::lround(py - 45)));
+    const int w = std::min(80, img.cols - left);
+    const int h = std::min(60, img.rows - top);
+    if (w <= 0 || h <= 0) {
+        return out;
+    }
+    cv::Mat gray;
+    if (img.channels() == 3) {
+        cv::cvtColor(img(cv::Rect(left, top, w, h)), gray, cv::COLOR_BGR2GRAY);
+    }
+    else {
+        gray = img(cv::Rect(left, top, w, h)).clone();
+    }
+    for (int y = 0; y < h; ++y) {
+        std::memcpy(out.data() + static_cast<size_t>(y) * 80, gray.ptr<uint8_t>(y), static_cast<size_t>(w));
+    }
+    return out;
+}
+
+// `zr(I, k)` —— service.pretty.mjs L9207-9209：逐像素平均绝对差
+double SPAFarmTaskPlugin::patch_diff(const std::vector<uint8_t>& a, const std::vector<uint8_t>& b)
+{
+    if (a.empty() || a.size() != b.size()) {
+        return 1e9;
+    }
+    double sum = 0.0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        sum += std::abs(static_cast<int>(a[i]) - static_cast<int>(b[i]));
+    }
+    return sum / static_cast<double>(a.size());
+}
+
+// `Vt(I, k, D)` —— service.pretty.mjs L9248-9283
+//   扫棋盘里所有 `Q` 格：patch 未变（<18）跳过；未缓存时只有第 1 回合或 force 才继续；
+//   名字靠 `cr` 缓存（patch 差 <10）或 `inspectCell` 现读；物品进返回值，干员进 `wr`。
+std::vector<SPAFarmTaskPlugin::EquipCell> SPAFarmTaskPlugin::detect_item_slots(
+    const std::vector<std::string>& rows,
+    const std::array<double, 9>& H,
+    bool force)
+{
+    std::vector<EquipCell> items;
+    std::vector<std::pair<int, int>> cells;
+    for (int r = 0; r < static_cast<int>(rows.size()); ++r) {
+        for (int c = 0; c < static_cast<int>(rows[r].size()); ++c) {
+            if (rows[r][c] == 'Q') {
+                cells.emplace_back(r, c);
+            }
+        }
+    }
+    cv::Mat cap = shot();
+    const int round = m_current_round > 0 ? m_current_round : 9; // `(i.round ?? 9)`
+
+    for (const auto& [r, c] : cells) {
+        if (need_exit()) {
+            break;
+        }
+        const std::string key = std::to_string(r) + "," + std::to_string(c);
+        const auto patch = capture_item_patch(cap, H, r, c);
+
+        auto pc = m_equip_patch_cache.find(key);
+        if (pc != m_equip_patch_cache.end()) {
+            if (patch_diff(patch, pc->second) < 18.0) {
+                continue;
+            }
+        }
+        else {
+            if (round <= 1) {
+                m_equip_patch_cache[key] = patch;
+                continue;
+            }
+            if (!force) {
                 continue;
             }
         }
 
-        const double val_i = 200.0 * (1.0 + 0.25 * (op->tier - 1)) * (c.elite ? 1.4 : 1.0);
-        int eq_cnt = 0;
-        if (auto eq_it = m_unit_equipped_count.find(c.name); eq_it != m_unit_equipped_count.end()) {
-            eq_cnt = eq_it->second;
-        }
-        const double val_m = -static_cast<double>(eq_cnt) * 150.0;
-
-        const bool is_stacker = !op->stack_info.rules.empty() || op->stack_info.on_skill
-            || op->stack_info.on_deploy || op->stack_info.end_of_prep
-            || (std::find(kQuickStackers.begin(), kQuickStackers.end(), op->name) != kQuickStackers.end());
-        bool has_core_bond = false;
-        for (const auto& cb : m_active_core_bonds) {
-            if (std::find(op->bond_names.begin(), op->bond_names.end(), cb) != op->bond_names.end()) {
-                has_core_bond = true;
-                break;
-            }
-        }
-
-        double u_sc = 0.0;
-        if (category == "stack") {
-            u_sc = (is_stacker ? 1000.0 : 0.0) + (has_core_bond ? 500.0 : 0.0) + val_i / 10.0 + val_m;
-        }
-        else if (category == "defense") {
-            u_sc = (op->position == "MELEE" ? 1000.0 : 0.0) + op->block_cnt * 100.0 + op->max_hp / 100.0 + val_m;
-        }
-        else if (category == "utility") {
-            u_sc = val_m;
+        std::string name;
+        auto nc = m_equip_name_cache.find(key);
+        if (nc != m_equip_name_cache.end() && patch_diff(patch, nc->second.patch) < 10.0) {
+            name = nc->second.name;
         }
         else {
-            u_sc = val_i + (op->position == "RANGED" ? 50.0 : 0.0) + val_m;
+            auto got = inspect_cell_name(H, r, c);
+            if (got.has_value()) {
+                name = *got;
+            }
         }
-
-        if (u_sc > best_score) {
-            best_score = u_sc;
-            best_target = &c;
+        if (!name.empty()) {
+            m_equip_name_cache[key] = EquipNameCache { patch, name };
+        }
+        if (!name.empty() && find_item(name) != nullptr) {
+            items.push_back(EquipCell { r, c, name });
+        }
+        else if (!name.empty() && find_operator(name) != nullptr) {
+            m_overflow_equip_units.push_back(EquipCell { r, c, name }); // `wr.push`
         }
     }
-    return best_target;
+    return items;
 }
 
-void SPAFarmTaskPlugin::handle_overflow_units(const CameraDetectResult& cam)
+// `sn(I, k)` —— service.pretty.mjs L9300-9351：两张全屏差分找「拖拽预览框」
+//   960×540 上按 4×4 块（亮度差 >30 的像素 ≥60%）打点 → 连通域 → 尺寸筛选 → 取最大
+std::optional<std::array<double, 4>> SPAFarmTaskPlugin::detect_drop_popup(const cv::Mat& before, const cv::Mat& after)
 {
-    // Exact 1:1 port of `nn(I)` in service.pretty.mjs lines 9209-9248 (with `waitStableBoard(4e3)` L9213, L9232)
-    (void)cam;
+    if (before.empty() || after.empty()) {
+        return std::nullopt;
+    }
+    cv::Mat a, b;
+    cv::resize(before, a, cv::Size(960, 540), 0.0, 0.0, cv::INTER_AREA);
+    cv::resize(after, b, cv::Size(960, 540), 0.0, 0.0, cv::INTER_AREA);
+    cv::Mat ga, gb;
+    cv::cvtColor(a, ga, cv::COLOR_BGR2GRAY);
+    cv::cvtColor(b, gb, cv::COLOR_BGR2GRAY);
+
+    constexpr int kGw = 240;
+    constexpr int kGh = 135;
+    std::vector<uint8_t> mask(static_cast<size_t>(kGw) * kGh, 0);
+    for (int gy = 0; gy < kGh; ++gy) {
+        const int y0 = gy * 4;
+        for (int gx = 0; gx < kGw; ++gx) {
+            const int x0 = gx * 4;
+            if (x0 < 360 || y0 < 50 || y0 > 460 || (x0 > 800 && y0 > 330)) {
+                continue;
+            }
+            int cnt = 0;
+            for (int dy = 0; dy < 4 && cnt < 10; ++dy) {
+                const uint8_t* pa = ga.ptr<uint8_t>(y0 + dy) + x0;
+                const uint8_t* pb = gb.ptr<uint8_t>(y0 + dy) + x0;
+                for (int dx = 0; dx < 4; ++dx) {
+                    if (static_cast<int>(pa[dx]) - static_cast<int>(pb[dx]) > 30) {
+                        ++cnt;
+                    }
+                }
+            }
+            if (cnt >= 16 * 0.6) {
+                mask[static_cast<size_t>(gy) * kGw + gx] = 1;
+            }
+        }
+    }
+
+    std::vector<uint8_t> seen(mask.size(), 0);
+    struct Box
+    {
+        int x0 = 1 << 30;
+        int y0 = 1 << 30;
+        int x1 = -1;
+        int y1 = -1;
+        int n = 0;
+    };
+    std::optional<Box> best;
+    std::vector<int> stack;
+    for (int idx = 0; idx < static_cast<int>(mask.size()); ++idx) {
+        if (mask[static_cast<size_t>(idx)] == 0 || seen[static_cast<size_t>(idx)] != 0) {
+            continue;
+        }
+        stack.clear();
+        stack.push_back(idx);
+        seen[static_cast<size_t>(idx)] = 1;
+        Box box;
+        while (!stack.empty()) {
+            const int cur = stack.back();
+            stack.pop_back();
+            const int cx = cur % kGw;
+            const int cy = cur / kGw;
+            ++box.n;
+            box.x0 = std::min(box.x0, cx);
+            box.x1 = std::max(box.x1, cx);
+            box.y0 = std::min(box.y0, cy);
+            box.y1 = std::max(box.y1, cy);
+            const std::array<std::pair<int, int>, 4> nb = {
+                std::pair<int, int> { cx + 1, cy },
+                std::pair<int, int> { cx - 1, cy },
+                std::pair<int, int> { cx, cy + 1 },
+                std::pair<int, int> { cx, cy - 1 }
+            };
+            for (const auto& [nx, ny] : nb) {
+                if (nx < 0 || ny < 0 || nx >= kGw || ny >= kGh) {
+                    continue;
+                }
+                const size_t ni = static_cast<size_t>(ny) * kGw + nx;
+                if (mask[ni] != 0 && seen[ni] == 0) {
+                    seen[ni] = 1;
+                    stack.push_back(static_cast<int>(ni));
+                }
+            }
+        }
+        const int wpx = (box.x1 - box.x0 + 1) * 8;
+        const int hpx = (box.y1 - box.y0 + 1) * 8;
+        if (wpx >= 120 && wpx <= 520 && hpx >= 40 && hpx <= 220 && (!best.has_value() || box.n > best->n)) {
+            best = box;
+        }
+    }
+    if (!best.has_value()) {
+        return std::nullopt;
+    }
+    const int wpx = (best->x1 - best->x0 + 1) * 8;
+    const int hpx = (best->y1 - best->y0 + 1) * 8;
+    if (wpx < 120 || wpx > 520 || hpx < 40 || hpx > 220) {
+        return std::nullopt;
+    }
+    return std::array<double, 4> {
+        (best->x0 + best->x1 + 1) / 2.0 * 8.0,
+        (best->y0 + best->y1 + 1) / 2.0 * 8.0,
+        static_cast<double>(wpx),
+        static_cast<double>(hpx)
+    };
+}
+
+// `ot(j, J, K, ce, {steps, stepMs, hold, press, beforeUp})` —— service.pretty.mjs L7319-7345
+void SPAFarmTaskPlugin::drag_with_hook(
+    double x1,
+    double y1,
+    double x2,
+    double y2,
+    int steps,
+    int step_ms,
+    int hold_ms,
+    int press_ms,
+    const std::function<std::optional<DragHookResult>(const std::pair<double, double>&)>& before_up)
+{
+    steps = std::max(1, steps);
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), x1, y1);
+    sleep_ms(static_cast<int>(std::lround(press_ms * m_step_scale)));
+    for (int i = 1; i <= steps; ++i) {
+        const double r = static_cast<double>(i) / static_cast<double>(steps);
+        touch_event(
+            static_cast<int>(InputEvent::Type::TOUCH_MOVE),
+            x1 + (x2 - x1) * r,
+            y1 + (y2 - y1) * r);
+        sleep_ms(static_cast<int>(std::lround(step_ms * m_step_scale)));
+    }
+    sleep_ms(static_cast<int>(std::lround(hold_ms * m_step_scale)));
+
+    std::pair<double, double> pos = { x2, y2 };
+    for (int b = 0; before_up && b < 8; ++b) {
+        auto ret = before_up(pos);
+        if (!ret.has_value()) {
+            break;
+        }
+        const auto to = ret->to;
+        for (int i = 1; i <= 8; ++i) {
+            const double r = static_cast<double>(i) / 8.0;
+            touch_event(
+                static_cast<int>(InputEvent::Type::TOUCH_MOVE),
+                pos.first + (to.first - pos.first) * r,
+                pos.second + (to.second - pos.second) * r);
+            sleep_ms(static_cast<int>(std::lround(step_ms * m_step_scale)));
+        }
+        pos = to;
+        sleep_ms(static_cast<int>(std::lround(hold_ms * m_step_scale)));
+        if (ret->final) {
+            break;
+        }
+    }
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), pos.first, pos.second);
+}
+
+// `Cr(I, k, D, B, _)` —— service.pretty.mjs L9352-9408
+//   拖拽全程核对：先核「拿起的是不是这件」，再核「预览框在不在目标头顶」；
+//   偏了就按 delta 修正，连续失败换 4 个候选落点，最后放回原格（`Ar` 置位供 miss-rescan）
+bool SPAFarmTaskPlugin::equip_drag_verified(
+    const std::string& tag,
+    const std::array<double, 9>& H,
+    const EquipCell& src,
+    const EquipTarget& tgt,
+    const std::string& expected_name)
+{
+    constexpr double kPopupOffset = 145.0; // `qr`
+    auto [sx, sy] = project_point(H, src.c + 0.5, src.r + 0.5);
+    auto [tx, ty] = project_point(H, tgt.c + 0.5, tgt.r + 0.5);
+    const std::array<double, 2> expect = { tx, ty - kPopupOffset };
+    std::array<std::array<double, 2>, 4> fallback;
+    const std::array<double, 4> offsets = { 0.85, 0.65, 1.05, 0.4 };
+    for (size_t i = 0; i < offsets.size(); ++i) {
+        auto [px, py] = project_point(H, tgt.c + 0.5, tgt.r + offsets[i]);
+        fallback[i] = { px, py };
+    }
+    auto offscreen = [](const std::array<double, 2>& p) -> bool {
+        return (p[0] > 1630 && p[1] > 760) || p[1] > 1040 || p[1] < 120 || p[0] < 20 || p[0] > 1900;
+    };
+
+    cv::Mat base = shot(); // `Q = await e.capture()`
+    int tries = 0;         // `H`
+    bool ok = false;       // `ve`
+    bool name_checked = false; // `Pe`（`_` 恒非空，所以首轮必查）
+
+    m_equip_drag_missed = false; // `Ar = !1`
+
+    // 诊断文件名只保留 ASCII（日志里仍用带中文的原始 tag）
+    auto ascii_tag = [](std::string s) {
+        for (char& ch : s) {
+            const unsigned char u = static_cast<unsigned char>(ch);
+            const bool keep = (u >= '0' && u <= '9') || (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z')
+                || ch == '-' || ch == '_' || ch == '.';
+            if (!keep) {
+                ch = '_';
+            }
+        }
+        return s;
+    };
+    const std::string file_tag = ascii_tag(tag);
+
+    auto hook = [&](const std::pair<double, double>& finger) -> std::optional<DragHookResult> {
+        cv::Mat cur = shot();
+        if (!name_checked) {
+            auto ocr_items = ocr(cur, std::array<int, 4> { 20, 270, 400, 60 });
+            std::string grabbed;
+            for (const auto& it : ocr_items) {
+                grabbed += strip_ws(it.text);
+            }
+            const std::string head = expected_name.substr(0, std::min<size_t>(3, expected_name.size()));
+            if (grabbed.find(head) == std::string::npos) {
+                m_equip_drag_missed = true;
+                std::error_code ec;
+                std::filesystem::create_directories("debug/spa_farm", ec);
+                cv::imwrite("debug/spa_farm/" + file_tag + "-grab.png", cur);
+                log_info("[drop] " + tag + " 拿起的是「" + grabbed + "」不是 " + expected_name + "，放回原处");
+                return DragHookResult { { sx, sy }, true };
+            }
+            name_checked = true;
+        }
+        auto popup = detect_drop_popup(base, cur);
+        const bool at_target = popup.has_value() && std::abs((*popup)[0] - expect[0]) < 60
+            && std::abs((*popup)[1] - expect[1]) < 55;
+        {
+            std::error_code ec;
+            std::filesystem::create_directories("debug/spa_farm", ec);
+            cv::imwrite("debug/spa_farm/" + file_tag + "-t" + std::to_string(tries) + ".png", cur);
+        }
+        std::string popup_desc = popup.has_value()
+            ? (std::to_string(static_cast<int>(std::lround((*popup)[0]))) + ","
+               + std::to_string(static_cast<int>(std::lround((*popup)[1]))) + " "
+               + std::to_string(static_cast<int>(std::lround((*popup)[2]))) + "x"
+               + std::to_string(static_cast<int>(std::lround((*popup)[3]))))
+            : "-";
+        log_info(
+            "[drop] " + tag + " t" + std::to_string(tries) + " finger("
+            + std::to_string(static_cast<int>(std::lround(finger.first))) + ","
+            + std::to_string(static_cast<int>(std::lround(finger.second))) + ") popup(" + popup_desc + ") expect("
+            + std::to_string(static_cast<int>(std::lround(expect[0]))) + ","
+            + std::to_string(static_cast<int>(std::lround(expect[1]))) + ") " + (at_target ? "OK" : "miss"));
+        if (at_target) {
+            ok = true;
+            return std::nullopt;
+        }
+        ++tries;
+        std::optional<std::array<double, 2>> next;
+        if (tries < static_cast<int>(fallback.size())) {
+            if (popup.has_value() && tries == 1) {
+                next = std::array<double, 2> {
+                    finger.first + (expect[0] - (*popup)[0]),
+                    finger.second + (expect[1] - (*popup)[1])
+                };
+            }
+            else {
+                next = fallback[tries];
+            }
+        }
+        if (next.has_value() && offscreen(*next)) {
+            if (tries < static_cast<int>(fallback.size())) {
+                next = fallback[tries];
+            }
+            else {
+                next.reset();
+            }
+        }
+        if (next.has_value() && !offscreen(*next)) {
+            return DragHookResult { { (*next)[0], (*next)[1] }, false };
+        }
+        return DragHookResult { { sx, sy }, true };
+    };
+
+    drag_with_hook(sx, sy, fallback[0][0], fallback[0][1], 16, 25, 400, 300, hook);
+    if (!ok) {
+        log_info(
+            "拖放核对：预览框不在 " + std::to_string(tgt.r) + "," + std::to_string(tgt.c) + " 头顶，已放回原格（不装给别人）");
+    }
+    return ok;
+}
+
+// `Dt(I, k)` —— service.pretty.mjs L9124-9201：把整备区的召唤物拖上场
+//   `D` = 整备区里 auxiliary、非装备、有名字、且不在 chess.json 里的单位
+//   落点：地面路线上的空 `b` 格（排除已占格 + `front1`/`back1` 干员的前/后一格），按 groundProgress 升序
+void SPAFarmTaskPlugin::deploy_summons(const StageTrafficMap& traffic)
+{
+    std::vector<UnitSlot> summons;
+    for (const auto& u : m_units) {
+        if (u.area != "bench" || !u.auxiliary || u.item || u.name.empty()) {
+            continue;
+        }
+        if (find_operator(u.name) != nullptr) {
+            continue; // `!e.chess.some(v => v.name === x.name)`
+        }
+        summons.push_back(u);
+    }
+    if (summons.empty()) {
+        return;
+    }
+
+    std::set<std::string> occupied;
+    for (const auto& u : m_units) {
+        if (u.area == "board") {
+            occupied.insert(std::to_string(u.r) + "," + std::to_string(u.c));
+        }
+    }
+    for (int uid = 0; uid < static_cast<int>(m_units.size()); ++uid) {
+        (void)uid;
+    }
+    // `front1` / `back1` 干员的前后一格也视为占用
+    {
+        auto delta_of = [](const std::string& facing) -> std::pair<int, int> {
+            if (facing == "LEFT") {
+                return { 0, -1 };
+            }
+            if (facing == "UP") {
+                return { -1, 0 };
+            }
+            if (facing == "DOWN") {
+                return { 1, 0 };
+            }
+            return { 0, 1 };
+        };
+        for (const auto& u : m_units) {
+            if (u.area != "board" || u.name.empty() || u.auxiliary) {
+                continue;
+            }
+            const auto* op = find_operator(u.name);
+            if (op == nullptr || op->golden) {
+                continue;
+            }
+            const auto [dr, dc] = delta_of(u.facing.empty() ? "RIGHT" : u.facing);
+            for (const auto& tr : op->traits) {
+                const bool front = std::find(tr.tags.begin(), tr.tags.end(), "front1") != tr.tags.end();
+                const bool back = std::find(tr.tags.begin(), tr.tags.end(), "back1") != tr.tags.end();
+                if (front) {
+                    occupied.insert(std::to_string(u.r + dr) + "," + std::to_string(u.c + dc));
+                }
+                if (back) {
+                    occupied.insert(std::to_string(u.r - dr) + "," + std::to_string(u.c - dc));
+                }
+            }
+        }
+    }
+
+    struct Cell
+    {
+        int r = 0;
+        int c = 0;
+        double prog = 0.0;
+    };
+    std::vector<Cell> cells;
+    for (int r = 0; r < traffic.rows && r < static_cast<int>(traffic.grid.size()); ++r) {
+        const std::string& line = traffic.grid[r];
+        for (int c = 0; c < static_cast<int>(line.size()) && c < traffic.cols; ++c) {
+            if (line[c] != 'b') {
+                continue;
+            }
+            if (traffic.ground[r][c] <= 0.0) {
+                continue;
+            }
+            if (occupied.count(std::to_string(r) + "," + std::to_string(c)) > 0) {
+                continue;
+            }
+            cells.push_back(Cell { r, c, traffic.ground_progress[r][c] });
+        }
+    }
+    std::sort(cells.begin(), cells.end(), [](const Cell& a, const Cell& b) {
+        return a.prog < b.prog;
+    });
+
     auto st = wait_stable_board(4000);
     if (!st.has_value()) {
         return;
     }
-    for (int c = 4; c <= 9 && !need_exit(); ++c) {
-        auto [fx, fy] = project_point(st->H, c + 0.5, 5.5);
-        int x0 = std::clamp(static_cast<int>(std::lround(fx - 22)), 0, st->img.cols);
-        int y0 = std::clamp(static_cast<int>(std::lround(fy - 22)), 0, st->img.rows);
-        int x1 = std::clamp(static_cast<int>(std::lround(fx + 22)), 0, st->img.cols);
-        int y1 = std::clamp(static_cast<int>(std::lround(fy + 22)), 0, st->img.rows);
-        if (x1 <= x0 || y1 <= y0) {
-            continue;
-        }
-        cv::Scalar mean, stddev;
-        cv::meanStdDev(st->img(cv::Rect(x0, y0, x1 - x0, y1 - y0)), mean, stddev);
-        if ((stddev[0] + stddev[1] + stddev[2]) / 3.0 < 28.0) {
-            continue;
-        }
-        tap(fx, fy, 220);
-        cv::Mat pimg = shot();
-        if (!is_detail_panel_open(pimg)) {
-            continue;
-        }
-        auto [det_name, unused_facing] = read_unit_detail_panel(pimg);
-        (void)unused_facing;
-        close_detail_panel();
 
-        const auto* op = det_name.empty() ? nullptr : find_operator(det_name);
-        if (!op) {
-            continue; // Not an operator overflow (normal equipment item)
+    std::vector<std::string> deployed;
+    size_t next_cell = 0;
+    for (const auto& s : summons) {
+        if (need_exit() || next_cell >= cells.size()) {
+            break;
         }
+        const Cell target = cells[next_cell++];
 
-        // Find an empty bench slot `3..11`
-        int free_bc = -1;
-        for (int bc = 3; bc <= 11; ++bc) {
-            bool taken = false;
-            for (const auto& u : m_units) {
-                if (u.area == "bench" && u.c == bc) {
-                    taken = true;
-                    break;
+        // 朝向：落点四邻中地面流量最小的那个方向（`Dt` 里的 Q 计算）
+        std::string facing = "RIGHT";
+        {
+            static const std::pair<const char*, std::pair<int, int>> kDirs[] = {
+                { "RIGHT", { 0, 1 } }, { "LEFT", { 0, -1 } }, { "UP", { -1, 0 } }, { "DOWN", { 1, 0 } }
+            };
+            double best = std::numeric_limits<double>::max();
+            for (const auto& [name, off] : kDirs) {
+                const int rr = target.r + off.first;
+                const int cc = target.c + off.second;
+                if (rr < 0 || cc < 0 || rr >= traffic.rows || cc >= traffic.cols) {
+                    continue;
+                }
+                if (traffic.ground[rr][cc] <= 0.0) {
+                    continue;
+                }
+                const double prog = traffic.ground_progress[rr][cc];
+                if (prog < best) {
+                    best = prog;
+                    facing = name;
                 }
             }
-            if (!taken) {
-                free_bc = bc;
+        }
+
+        auto [sx, sy] = project_point(st->H, s.c + 0.5, 6.5);
+        auto [tx, ty] = project_point(st->H, target.c + 0.5, target.r + 0.5);
+        drag_board_unit(sx, sy, tx, ty, false);
+        sleep_ms(250);
+
+        // 摆正朝向（同 `we` 的 orient）
+        {
+            auto after = wait_stable_board(3000);
+            if (after.has_value()) {
+                auto [cx, cy] = project_point(after->H, target.c + 0.5, target.r + 0.5);
+                double dx = 210.0;
+                double dy = 0.0;
+                if (facing == "LEFT") {
+                    dx = -210.0;
+                }
+                else if (facing == "UP") {
+                    dx = 0.0;
+                    dy = -180.0;
+                }
+                else if (facing == "DOWN") {
+                    dx = 0.0;
+                    dy = 180.0;
+                }
+                drag_segments(cx, cy, cx + dx, cy + dy, 4, 12, 40);
+                sleep_ms(200);
+                close_detail_panel();
+            }
+        }
+
+        // 状态更新：整备区该格变为场上
+        for (auto& u : m_units) {
+            if (u.slot == s.slot) {
+                const std::string old_slot = u.slot;
+                u.slot = "board:" + std::to_string(target.r) + "," + std::to_string(target.c);
+                u.area = "board";
+                u.r = target.r;
+                u.c = target.c;
+                u.facing = facing;
+                m_remembered_units[u.slot] = u;
+                m_remembered_units.erase(old_slot);
                 break;
             }
         }
-        if (free_bc >= 0) {
-            if (auto mv_st = wait_stable_board(4000)) {
-                auto [sx, sy] = project_point(mv_st->H, c + 0.5, 5.5);
-                auto [tx, ty] = project_point(mv_st->H, free_bc + 0.5, 6.5);
-                log_info("回收暂存区干员: " + det_name + " -> 候补席 " + std::to_string(free_bc + 1));
-                drag_board_unit(sx, sy, tx, ty, false);
-                sleep_ms(300);
+        deployed.push_back(s.name + "→" + std::to_string(target.r) + "," + std::to_string(target.c));
+    }
+    if (!deployed.empty()) {
+        std::string joined;
+        for (const auto& d : deployed) {
+            joined += (joined.empty() ? "" : "、") + d;
+        }
+        log_info("召唤物上场：" + joined);
+    }
+}
+
+void SPAFarmTaskPlugin::handle_overflow_units(const CameraDetectResult& cam)
+{
+    // Exact 1:1 port of `nn(I)` in service.pretty.mjs lines 9212-9245
+    //   `Vt(I, k.H, !0)` 扫临时格（装备行为干员的格子）→ 卖一个整备区腾位 → 把该干员拖进整备区
+    auto st = wait_stable_board(4000);
+    if (!st.has_value()) {
+        return;
+    }
+    const StageInfo* stage = find_stage(m_stage_id);
+    static const std::vector<std::string> kNoRows;
+    const std::vector<std::string>& rows = (stage != nullptr) ? stage->rows : kNoRows;
+
+    m_overflow_equip_units.clear(); // `wr = []`
+    detect_item_slots(rows, st->H, true);
+
+    // `_`：名字在 `chess.json` 里，且（首个盟约属于目标盟约 或 名字在叠层手名单里）
+    auto is_keeper = [&](const std::string& name) -> bool {
+        const auto* op = find_operator(name);
+        if (op == nullptr) {
+            return false;
+        }
+        for (const auto& b : op->bond_names) {
+            if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), b) != m_active_core_bonds.end()) {
+                return true;
             }
         }
+        return in_stacker_list(name);
+    };
+    auto tier_of = [&](const std::string& name) -> int {
+        const auto* op = find_operator(name);
+        return op != nullptr ? op->tier : 9;
+    };
+    // `Rt(await Ke(await h()))`：展开商店面板后读头部金币
+    auto read_gold = [&]() -> int {
+        cv::Mat cur = shot();
+        auto items = ocr(cur);
+        if (auto hit = find_text_regex(items, "^.?展开$")) {
+            tap(hit->cx, hit->cy, 250);
+            cur = shot();
+        }
+        auto hdr = read_shop_header(cur, ocr(cur));
+        return hdr.gold.value_or(0);
+    };
+
+    for (const auto& cell : m_overflow_equip_units) {
+        if (need_exit()) {
+            return;
+        }
+        // `ee`：整备区里可卖的（不是盟约/叠层主力，或是临时补位），按 tier 升序取第一个
+        const UnitSlot* sell = nullptr;
+        for (const auto& u : m_units) {
+            if (u.area != "bench" || u.name.empty() || u.item) {
+                continue;
+            }
+            if (is_keeper(u.name) && m_filler_units.count(u.name) == 0) {
+                continue;
+            }
+            if (sell == nullptr || tier_of(u.name) < tier_of(sell->name)) {
+                sell = &u;
+            }
+        }
+        if (sell == nullptr) {
+            log_info(cell.name + " 在临时格，整备区没有可卖的人，回合结束会被清空");
+            continue;
+        }
+        const std::string sell_slot = sell->slot;
+        const std::string sell_name = sell->name;
+        const int sell_r = sell->r;
+        const int sell_c = sell->c;
+
+        const int gold = read_gold();
+        if (!sell_unit_slot(sell_slot, gold)) {
+            log_info("卖 " + sell_name + " 腾位失败，" + cell.name + " 留在临时格");
+            continue;
+        }
+        auto st2 = wait_stable_board(4000);
+        if (!st2.has_value()) {
+            break;
+        }
+        auto [sx, sy] = project_point(st2->H, cell.c + 0.5, cell.r + 0.5);
+        auto [tx, ty] = project_point(st2->H, sell_c + 0.5, sell_r + 0.5);
+        drag_with_hook(sx, sy, tx, ty, 12, 20, 200, 150, nullptr);
+        sleep_ms(600);
+        m_filler_units.erase(sell_name); // `It.delete(ee.name)`
+        log_info("整备区已满：卖掉 " + sell_name + "，把临时格里的 " + cell.name + " 移进整备区");
     }
+    if (!m_overflow_equip_units.empty()) {
+        // `e.snapshot({ force: !0 })`：重新标定当前帧后再强制重读
+        cv::Mat img = shot();
+        auto fresh = detect_camera(img, goal_only_allowed());
+        refresh_board_snapshot(img, fresh.camera.empty() ? cam : fresh, true);
+    }
+}
+
+// `br(I)` —— service.pretty.mjs L9409-9418
+//   「装备已满，请选择 / 销毁并替换」弹窗：点 (1846,284) 关闭（**不销毁**），并把该干员装备数记为 2
+bool SPAFarmTaskPlugin::close_equip_full_dialog(const std::string& unit_name)
+{
+    for (int k = 0; k < 2; ++k) {
+        cv::Mat cur = shot();
+        auto items = ocr(cur);
+        bool full = false;
+        for (const auto& it : items) {
+            if (it.score < 0.55) {
+                continue;
+            }
+            if (it.text.find("装备已满") != std::string::npos || it.text.find("销毁并替换") != std::string::npos) {
+                full = true;
+                break;
+            }
+        }
+        if (full) {
+            tap(1846, 284, 800);
+            m_unit_equipped_count[unit_name] = 2;
+            log_info(unit_name + " 装备槽已满（关闭替换框，不销毁）");
+            return true;
+        }
+        if (k == 0) {
+            sleep_ms(500);
+        }
+    }
+    return false;
 }
 
 void SPAFarmTaskPlugin::scan_and_distribute_equipment(const cv::Mat& img, const CameraDetectResult& cam)
 {
-    // Exact 1:1 port of `Vt` + `on` + `Cr` in service.pretty.mjs lines 9419-9515 (including `waitStableBoard` L9420, L9432, L9458, L9461)
+    // Exact 1:1 port of `on(I, k)` in service.pretty.mjs lines 9419-9487
     (void)img;
     (void)cam;
-    handle_overflow_units(cam);
 
-    auto init_st = wait_stable_board(3000);
-    auto st = wait_stable_board(4000, init_st ? std::optional<std::array<double, 4>>(init_st->pts) : std::nullopt);
-    if (!st.has_value()) {
+    std::vector<EquipCell> items; // `D`
+    for (const auto& u : m_units) {
+        if (u.item && !u.name.empty()) {
+            items.push_back(EquipCell { u.r, u.c, u.name });
+        }
+    }
+
+    const StageInfo* stage = find_stage(m_stage_id);
+    static const std::vector<std::string> kNoRows;
+    const std::vector<std::string>& rows = (stage != nullptr) ? stage->rows : kNoRows;
+
+    if (auto board3 = wait_stable_board(3000)) { // `if (k)`
+        auto found = detect_item_slots(rows, board3->H, m_equip_patch_cache.empty());
+        for (const auto& e : found) {
+            if (e.name.find("寻呼") != std::string::npos) {
+                continue;
+            }
+            items.push_back(e);
+        }
+    }
+    if (items.empty()) {
+        return;
+    }
+
+    auto targets = build_equip_targets(); // `B`
+    auto board = wait_stable_board(4000); // `_`
+    if (!board.has_value()) {
         log_info("装备：棋盘未稳定，本回合跳过");
         return;
     }
 
-    std::vector<int> active_cols;
-    for (int c = 4; c <= 9; ++c) {
-        auto [px, py] = project_point(st->H, c + 0.5, 5.5);
-        int x0 = std::clamp(static_cast<int>(std::lround(px - 22)), 0, st->img.cols);
-        int y0 = std::clamp(static_cast<int>(std::lround(py - 22)), 0, st->img.rows);
-        int x1 = std::clamp(static_cast<int>(std::lround(px + 22)), 0, st->img.cols);
-        int y1 = std::clamp(static_cast<int>(std::lround(py + 22)), 0, st->img.rows);
-        if (x1 <= x0 || y1 <= y0) {
-            continue;
-        }
-        cv::Scalar mean, stddev;
-        cv::meanStdDev(st->img(cv::Rect(x0, y0, x1 - x0, y1 - y0)), mean, stddev);
-        double avg_std = (stddev[0] + stddev[1] + stddev[2]) / 3.0;
-        if (avg_std >= 28.0) {
-            active_cols.push_back(c);
-        }
-    }
-
-    for (int c : active_cols) {
+    std::vector<std::string> equipped; // `Y`
+    for (const auto& it : items) {
         if (need_exit()) {
             return;
         }
-        auto slot_st = wait_stable_board(3000);
-        if (!slot_st.has_value()) {
+        const auto* item_info = find_item(it.name);
+        if (item_info == nullptr || it.name.find("寻呼") != std::string::npos) {
             continue;
         }
-        auto [fx, fy] = project_point(slot_st->H, c + 0.5, 5.5);
-        tap(fx, fy, 220);
-        cv::Mat pimg = shot();
-        if (!is_detail_panel_open(pimg)) {
-            continue;
-        }
-        auto [item_name, unused_facing] = read_unit_detail_panel(pimg);
-        (void)unused_facing;
-        close_detail_panel();
+        const std::string cat = classify_item_category(item_info->name, item_info->effect); // `An(te)`
 
-        if (item_name.empty()) {
-            continue;
-        }
-        m_equip_slots[c] = EquipSlotInfo { c, "item", item_name, m_current_round };
-        if (item_name.find("寻呼") != std::string::npos) {
-            continue; // Handled by `try_use_jessica_pager`
-        }
-
-        const auto* item_info = find_item(item_name);
-        const std::string cat = item_info
-            ? (item_info->category.empty() ? classify_item_category(item_info->name, item_info->effect) : item_info->category)
-            : classify_item_category(item_name, "");
-
-        // If debuff equipment (`Es` / `An == "debuff"`), drag to `(1785, 900)` to destroy (`L9444-9448`)
-        if (cat == "debuff" || (item_info && item_info->is_debuff)) {
-            if (auto destroy_st = wait_stable_board(3000)) {
-                auto [sx, sy] = project_point(destroy_st->H, c + 0.5, 5.5);
-                log_info("销毁负面装备: " + item_name + " -> (1785, 900)");
-                drag_board_unit(sx, sy, 1785, 900, false);
-                sleep_ms(300);
-                m_equip_slots.erase(c);
-            }
+        if (cat == "debuff") {
+            auto [sx, sy] = project_point(board->H, it.c + 0.5, it.r + 0.5);
+            drag_with_hook(sx, sy, 1785, 900, 16, 25, 400, 300, nullptr);
+            sleep_ms(700);
+            log_info("装备 " + it.name + "（减益）不使用，已销毁");
             continue;
         }
 
-        const UnitSlot* best_target = pick_equipment_target(cat, item_info);
-        if (best_target) {
-            if (auto drag_st = wait_stable_board(3000)) {
-                auto [sx, sy] = project_point(drag_st->H, c + 0.5, 5.5);
-                auto [tx, ty] = project_point(drag_st->H, best_target->c + 0.5, best_target->r + 0.5);
-                log_info("穿戴装备 [" + cat + "]: " + item_name + " -> " + best_target->name);
-                drag_board_unit(sx, sy, tx, ty, false);
-                sleep_ms(300);
-                m_unit_equipped_count[best_target->name]++;
-                if (item_info && !item_info->granted_bond_name.empty()) {
-                    m_unit_equipped_bond[best_target->name] = item_info->granted_bond_name;
+        EquipCell src = it; // JS 直接改 `L.r / L.c`
+        auto attempt = [&](const EquipTarget& t) -> std::string {
+            auto st3 = wait_stable_board(3000); // `ve`
+            const std::array<double, 9> H3 = st3.has_value() ? st3->H : board->H;
+            const std::string tag = "equip-r" + std::to_string(m_current_round) + "-" + src.name + "-" + t.name;
+            bool ok = equip_drag_verified(tag, H3, src, t, src.name);
+            if (!ok && m_equip_drag_missed) { // `!Ae && Ar && k` 的 miss-rescan
+                auto st2 = wait_stable_board(3000);
+                const std::array<double, 9> H2 = st2.has_value() ? st2->H : H3;
+                auto again = detect_item_slots(rows, H2, true);
+                for (const auto& e : again) {
+                    if (e.name != src.name) {
+                        continue;
+                    }
+                    src.r = e.r;
+                    src.c = e.c;
+                    ok = equip_drag_verified(tag + "-rescan", H2, src, t, src.name);
+                    break;
                 }
-                wait_stable_board(3000);
+            }
+            if (!ok) {
+                return "miss";
+            }
+            sleep_ms(700);
+            if (close_equip_full_dialog(t.name)) { // `br`
+                return "full";
+            }
+            return "ok";
+        };
+
+        const EquipTarget* tgt = pick_equipment_target(cat, targets, nullptr);
+        if (tgt == nullptr) {
+            log_info("装备 " + it.name + "（无合适对象）不使用");
+            continue;
+        }
+        const size_t tgt_idx = static_cast<size_t>(tgt - targets.data());
+        const std::string first_name = targets[tgt_idx].name;
+        std::string used_name = first_name;
+        const std::string r1 = attempt(targets[tgt_idx]);
+        bool success = (r1 == "ok");
+        if (r1 == "full") {
+            targets.erase(targets.begin() + static_cast<long>(tgt_idx)); // `B.splice`
+        }
+        if (!success) {
+            const EquipTarget* alt = (r1 == "full")
+                ? pick_equipment_target(cat, targets, nullptr)
+                : pick_equipment_target(cat, targets, &targets[tgt_idx]);
+            if (alt != nullptr) {
+                const size_t alt_idx = static_cast<size_t>(alt - targets.data());
+                const std::string alt_name = targets[alt_idx].name;
+                const std::string r2 = attempt(targets[alt_idx]);
+                if (r2 == "ok") {
+                    log_info("装备 " + it.name + " 装不上 " + first_name + "，改装给 " + alt_name);
+                    success = true;
+                    used_name = alt_name;
+                }
+                else if (r2 == "full") {
+                    targets.erase(targets.begin() + static_cast<long>(alt_idx));
+                }
+            }
+        }
+        if (!success) {
+            log_info("装备 " + it.name + " 拖给 " + first_name + " 未生效");
+            continue;
+        }
+        ++m_unit_equipped_count[used_name]; // `v.equipped++` + `Se.set(v.name, ... + 1)`
+        equipped.push_back(it.name + "→" + used_name);
+    }
+
+    if (equipped.empty()) {
+        return;
+    }
+    std::string msg;
+    for (size_t i = 0; i < equipped.size(); ++i) {
+        if (i > 0) {
+            msg += "、";
+        }
+        msg += equipped[i];
+    }
+    const int left = static_cast<int>(items.size()) - static_cast<int>(equipped.size());
+    if (left > 0) {
+        msg += "（" + std::to_string(left) + " 件未装，留在装备栏）";
+    }
+    log_info("装备：" + msg);
+}
+
+// `fr()` —— service.pretty.mjs L9490-9504
+//   在「场上、非召唤物、装备数 < 2、首个盟约属于目标盟约」的干员里，
+//   按 (盟约还差几人, 副盟约优先级, 场上优先) 排序取第一个。
+std::optional<SPAFarmTaskPlugin::UnitSlot> SPAFarmTaskPlugin::pick_pager_target() const
+{
+    std::set<std::string> owned;
+    for (const auto& u : m_units) {
+        if (!u.name.empty()) {
+            owned.insert(u.name);
+        }
+    }
+    for (const auto& n : m_bought_operators) {
+        owned.insert(n);
+    }
+    auto bond_gap = [&](const std::string& bond_name) {
+        int th = 3;
+        for (const auto& b : m_bonds) {
+            if (b.name == bond_name && !b.thresholds.empty()) {
+                th = b.thresholds.front();
+                break;
+            }
+        }
+        std::set<std::string> have;
+        for (const auto& op : m_operators) {
+            if (!owned.count(op.name) || op.golden) {
+                continue;
+            }
+            if (std::find(op.bond_names.begin(), op.bond_names.end(), bond_name) != op.bond_names.end()) {
+                have.insert(op.name);
+            }
+        }
+        return th - static_cast<int>(have.size());
+    };
+    auto sub_rank = [](const OperatorInfo& op) {
+        if (op.bond_names.size() == 1) {
+            return -1;
+        }
+        static const std::vector<std::string> kPref = { "远见", "精准", "奥术" };
+        int best = 9;
+        for (size_t k = 1; k < op.bond_names.size(); ++k) {
+            auto it = std::find(kPref.begin(), kPref.end(), op.bond_names[k]);
+            best = std::min(best, it == kPref.end() ? 9 : static_cast<int>(it - kPref.begin()));
+        }
+        return best;
+    };
+
+    const UnitSlot* best = nullptr;
+    int best_gap = 0;
+    int best_sub = 0;
+    for (const auto& u : m_units) {
+        if (u.area != "board" || u.name.empty() || u.auxiliary || u.item) {
+            continue;
+        }
+        auto eq = m_unit_equipped_count.find(u.name);
+        if (eq != m_unit_equipped_count.end() && eq->second >= 2) {
+            continue;
+        }
+        const auto* op = find_operator(u.name);
+        if (op == nullptr || op->golden || op->bond_names.empty()) {
+            continue;
+        }
+        if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), op->bond_names.front())
+            == m_active_core_bonds.end()) {
+            continue;
+        }
+        const int gap = std::max(0, bond_gap(op->bond_names.front()));
+        const int sr = sub_rank(*op);
+        if (best == nullptr || gap < best_gap || (gap == best_gap && sr < best_sub)) {
+            best = &u;
+            best_gap = gap;
+            best_sub = sr;
+        }
+    }
+    if (best == nullptr) {
+        return std::nullopt;
+    }
+    return *best;
+}
+
+// `e.inspectCell(H, r, c)` = 引擎里的 `fr(j, J, K)`（L7741-7751）：
+//   点格子 → `xt(screen==="detail", 1500)` 轮询 → 读面板名 → 关面板
+std::optional<std::string> SPAFarmTaskPlugin::inspect_cell_name(const std::array<double, 9>& H, int r, int c)
+{
+    auto [px, py] = project_point(H, c + 0.5, r + 0.5);
+    tap(px, py, 0);
+    std::optional<cv::Mat> detail;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (need_exit()) {
+            break;
+        }
+        cv::Mat img = shot();
+        if (is_detail_panel_open(img)) {
+            detail = img;
+            break;
+        }
+        sleep_ms(100);
+    }
+    std::optional<std::string> out;
+    if (detail.has_value()) {
+        auto [nm, facing] = read_unit_detail_panel(*detail);
+        (void)facing;
+        if (!nm.empty()) {
+            out = nm;
+        }
+    }
+    close_detail_panel();
+    return out;
+}
+
+// `Ur(I)` —— service.pretty.mjs L9501-9510：包一层「收起 → 正文 → 还原来收起」
+bool SPAFarmTaskPlugin::try_use_jessica_pager(const CameraDetectResult& cam)
+{
+    bool collapse_open = has_text_regex(ocr(shot()), "^收起");
+    bool ok = jessica_pager_body(cam);
+    if (collapse_open) {
+        auto items = ocr(shot());
+        if (!has_text_regex(items, "^收起")) {
+            if (auto hit = find_text_regex(items, "^收起")) {
+                tap(hit->cx, hit->cy, 400);
             }
         }
     }
+    return ok;
 }
 
-bool SPAFarmTaskPlugin::try_use_jessica_pager(const CameraDetectResult& cam)
+// `Dr(I)` —— service.pretty.mjs L9512-9624
+bool SPAFarmTaskPlugin::jessica_pager_body(const CameraDetectResult& cam)
 {
-    // Exact 1:1 port of `Ur` + `Dr` in service.pretty.mjs lines 9522-9575 (including `waitStableBoard` L9525, L9540, L9550, L9551, L9560, L9568)
-    (void)cam;
-    if (m_current_strategy.find("杰西卡") == std::string::npos && m_pager_used_round == m_current_round) {
+    if (m_goal == "medal") {
+        return false; // `$e()` 为假
+    }
+    if (m_current_strategy.find("杰西卡") == std::string::npos) {
         return false;
+    }
+    static const int kRounds[] = { 4, 7, 10, 13 };
+    for (int r : kRounds) {
+        if (m_current_round == r && m_pager_round != m_current_round) {
+            ++m_pager_uses;
+            m_pager_round = m_current_round;
+        }
+    }
+    if (m_pager_uses <= 0 && !m_pager_started && m_current_round >= 4) {
+        m_pager_uses = 1;
+    }
+    m_pager_started = true;
+    if (m_pager_uses <= 0) {
+        return false;
+    }
+
+    auto target = pick_pager_target();
+    if (!target.has_value()) {
+        bool has_unknown = false;
+        for (const auto& u : m_units) {
+            if (u.name.empty()) {
+                has_unknown = true;
+                break;
+            }
+        }
+        if (has_unknown) {
+            auto reread_st = wait_stable_board(3000);
+            if (reread_st.has_value()) {
+                CameraDetectResult rc { reread_st->camera, reread_st->raw_H, reread_st->fit };
+                refresh_board_snapshot(reread_st->img, rc, false);
+                inspect_unknown_units(rc, false, false);
+            }
+            target = pick_pager_target();
+        }
+    }
+    if (!target.has_value()) {
+        log_info("寻呼模块 ×" + std::to_string(m_pager_uses) + " 保留：场上没有第一盟约是主盟约、且装备槽未满的干员");
+        return false;
+    }
+
+    {
+        auto items = ocr(shot());
+        if (auto hit = find_text_regex(items, "^收起")) {
+            tap(hit->cx, hit->cy, 400);
+        }
     }
     auto st = wait_stable_board(4000);
     if (!st.has_value()) {
@@ -5955,54 +10678,214 @@ bool SPAFarmTaskPlugin::try_use_jessica_pager(const CameraDetectResult& cam)
         return false;
     }
 
-    int pager_col = -1;
-    for (const auto& [c, eq] : m_equip_slots) {
-        if (eq.name.find("寻呼") != std::string::npos) {
-            pager_col = c;
-            break;
+    const StageInfo* stage = find_stage(m_stage_id);
+    static const std::vector<std::string> kNoRows;
+    const std::vector<std::string>& rows = (stage != nullptr) ? stage->rows : kNoRows;
+
+    // `Vt(I, H, !0)` 后按 /寻呼/ 过滤
+    auto pager_cells = [&](const std::array<double, 9>& H) {
+        std::vector<EquipCell> out;
+        for (const auto& e : detect_item_slots(rows, H, true)) {
+            if (e.name.find("寻呼") != std::string::npos) {
+                out.push_back(e);
+            }
         }
-    }
-    if (pager_col < 0) {
+        return out;
+    };
+
+    auto pagers = pager_cells(st->H); // `_`
+    if (pagers.empty()) {
+        log_info("寻呼模块：装备栏里没找到，跳过");
+        m_pager_uses = 0;
         return false;
     }
+    m_pager_uses = static_cast<int>(pagers.size());
 
-    const UnitSlot* target_unit = nullptr;
-    for (const auto& u : m_units) {
-        if (u.area == "board" && !u.name.empty() && !u.auxiliary) {
-            if (const auto* op = find_operator(u.name)) {
-                for (const auto& cb : m_active_core_bonds) {
-                    if (std::find(op->bond_names.begin(), op->bond_names.end(), cb) != op->bond_names.end()) {
-                        target_unit = &u;
+    int retries = 0; // `Y`
+    for (size_t pi = 0; pi < pagers.size(); ++pi) {
+        const EquipCell pager = pagers[pi]; // `ee`
+        auto tgt = pick_pager_target();     // `L`
+        for (int ve = 0; tgt.has_value() && ve < 3; ++ve) {
+            auto vst = wait_stable_board(4000);
+            if (!vst.has_value()) {
+                break;
+            }
+            auto actual = inspect_cell_name(vst->H, tgt->r, tgt->c);
+            close_detail_panel();
+            if (!actual.has_value() || *actual == tgt->name) {
+                break;
+            }
+            log_info("寻呼目标核对：" + std::to_string(tgt->r) + "," + std::to_string(tgt->c) + " 实际是 " + *actual
+                + "（不是 " + tgt->name + "），改正后重新挑选");
+            for (auto& u : m_units) {
+                if (u.slot == tgt->slot) {
+                    u.name = *actual;
+                    u.confirmed = true;
+                    break;
+                }
+            }
+            tgt = pick_pager_target();
+        }
+        if (!tgt.has_value()) {
+            log_info("寻呼模块 ×" + std::to_string(m_pager_uses) + " 保留：主盟约干员的装备槽都满了");
+            break;
+        }
+        if (!wait_stable_board(4000).has_value()) {
+            break;
+        }
+
+        // `x`：拖之前装备栏里还剩几张寻呼
+        auto st_before = wait_stable_board(3000);
+        const int before_cnt = static_cast<int>(pager_cells(st_before.has_value() ? st_before->H : st->H).size());
+
+        // `v()`：拖完后确认「寻呼被消耗」或「免费卡可选」
+        auto still_pending = [&]() -> bool {
+            {
+                auto items0 = ocr(shot());
+                if (auto hit = find_text_regex(items0, "^.?展开$")) {
+                    tap(hit->cx, hit->cy, 250);
+                }
+            }
+            sleep_ms(400);
+            {
+                cv::Mat snap_img = shot();
+                auto fresh = detect_camera(snap_img, goal_only_allowed());
+                refresh_board_snapshot(snap_img, fresh.camera.empty() ? cam : fresh, true);
+            }
+            {
+                auto items0 = ocr(shot());
+                if (auto hit = find_text_regex(items0, "^.?展开$")) {
+                    tap(hit->cx, hit->cy, 250);
+                }
+            }
+            cv::Mat snap = shot();
+            if (!snap.empty()) {
+                auto shop_cards = read_shop_cards(snap);
+                int free_cards = 0;
+                for (const auto& c : shop_cards) {
+                    if (c.free_card) {
+                        ++free_cards;
+                    }
+                }
+                if (free_cards >= 2) {
+                    return false;
+                }
+            }
+            auto items1 = ocr(shot());
+            if (auto hit = find_text_regex(items1, "^收起")) {
+                tap(hit->cx, hit->cy, 400);
+            }
+            auto pb = wait_stable_board(3000);
+            if (!pb.has_value()) {
+                return true;
+            }
+            return static_cast<int>(pager_cells(pb->H).size()) >= before_cnt;
+        };
+
+        bool consumed = false;   // `ie`
+        bool equip_full = false; // `Q`
+        {
+            auto items = ocr(shot());
+            if (auto hit = find_text_regex(items, "^收起")) {
+                tap(hit->cx, hit->cy, 400);
+            }
+            auto pe_st = wait_stable_board(4000);
+            if (!pe_st.has_value()) {
+                break;
+            }
+            const std::string tag = "pager-r" + std::to_string(m_current_round) + "-" + tgt->name;
+            if (!equip_drag_verified(
+                    tag,
+                    pe_st->H,
+                    pager,
+                    EquipTarget { tgt->slot, tgt->name, tgt->elite, 0, tgt->r, tgt->c },
+                    "寻呼模块")) {
+                break;
+            }
+            sleep_ms(900);
+
+            auto after_items = ocr(shot());
+            if (has_text_regex(after_items, "装备已满，请选择|销毁并替换")) {
+                // 从弹窗里读「实际落在谁身上」
+                std::string landed;
+                for (const auto& it : after_items) {
+                    if (it.x >= 1230 && it.x <= 1700 && it.y >= 250 && it.y <= 310
+                        && it.text.find("装备") == std::string::npos && it.text.find("销毁") == std::string::npos
+                        && it.text.find("替换") == std::string::npos) {
+                        landed = strip_ws(it.text);
+                        break;
+                    }
+                }
+                tap(1846, 284, 800);
+                const bool known = !landed.empty() && find_operator(landed) != nullptr;
+                const std::string who = known ? landed : tgt->name;
+                if (who != tgt->name) {
+                    log_info("寻呼模块拖向 " + tgt->name + "，实际落在 " + who + " 身上");
+                }
+                log_info("寻呼模块：" + who + " 装备槽已满，换人");
+                m_unit_equipped_count[who] = 2;
+                equip_full = true;
+            }
+            else if (!still_pending()) {
+                consumed = true;
+            }
+        }
+
+        if (equip_full && retries++ < 3) {
+            pagers.push_back(pager); // `_.push(ee)`：放回队尾再试
+            continue;
+        }
+        if (!consumed) {
+            std::string first_bond;
+            if (const auto* top = find_operator(tgt->name); top != nullptr && !top->bond_names.empty()) {
+                first_bond = top->bond_names.front();
+            }
+            log_info("寻呼模块拖到 " + tgt->name + " 未生效（可能【" + (first_bond.empty() ? "?" : first_bond)
+                + "】已没有可出的干员），保留");
+            break;
+        }
+        m_pager_uses = std::max(0, m_pager_uses - 1);
+        log_info("寻呼模块 → " + tgt->name);
+
+        // 领免费干员：3 次尝试
+        bool got = false;
+        for (int ve = 0; ve < 3 && !got; ++ve) {
+            auto items = ocr(shot());
+            if (auto hit = find_text_regex(items, "^收起")) {
+                tap(hit->cx, hit->cy, 400);
+            }
+            sleep_ms(500);
+            cv::Mat snap = shot();
+            auto cards = read_shop_cards(snap);
+            if (cards.empty()) {
+                sleep_ms(500);
+                continue;
+            }
+            ShopSimState sim = make_shop_sim(read_shop_header(snap, ocr(snap)));
+            sim.shop = cards;
+            std::optional<ShopCard> pick;
+            auto cands = rank_shop_candidates(sim);
+            if (!cands.empty()) {
+                pick = cands.front().card;
+            }
+            if (!pick.has_value()) {
+                for (const auto& c : cards) {
+                    if (c.kind == "operator" && m_elite_units.count(c.name) == 0) {
+                        pick = c;
                         break;
                     }
                 }
             }
-            if (target_unit) {
-                break;
+            if (!pick.has_value()) {
+                pick = cards.front();
             }
+            log_info("寻呼模块：领取 " + pick->name);
+            got = buy_shop_card(pick->x, pick->name, m_upgrade_x_Ref.value_or(0));
+        }
+        if (!got) {
+            log_info("寻呼模块用后没领到免费干员（识别失败）");
         }
     }
-    if (!target_unit) {
-        return false;
-    }
-
-    auto drag_st = wait_stable_board(4000);
-    if (!drag_st.has_value()) {
-        close_detail_panel();
-        drag_st = wait_stable_board(4000);
-    }
-    if (!drag_st.has_value()) {
-        return false;
-    }
-
-    auto [fx, fy] = project_point(drag_st->H, pager_col + 0.5, 5.5);
-    auto [tx, ty] = project_point(drag_st->H, target_unit->c + 0.5, target_unit->r + 0.5);
-    log_info("使用杰西卡寻呼模块 -> " + target_unit->name);
-    drag_board_unit(fx, fy, tx, ty, false);
-    sleep_ms(400);
-    wait_stable_board(3000);
-    m_pager_used_round = m_current_round;
-    m_equip_slots.erase(pager_col);
     return true;
 }
 
@@ -6041,58 +10924,7 @@ bool SPAFarmTaskPlugin::try_use_mob_skill(const CameraDetectResult& cam, int gol
     return true;
 }
 
-int SPAFarmTaskPlugin::deploy_summons(const CameraDetectResult& cam)
-{
-    // Exact 1:1 port of `Dt` in service.pretty.mjs lines 9130-9195 (with `waitStableBoard(4e3)` L9147 and `waitStableBoard(3e3)` L9170)
-    (void)cam;
-    std::vector<UnitSlot> bench_summons;
-    for (const auto& u : m_units) {
-        if (u.area == "bench" && u.auxiliary && !u.item) {
-            bench_summons.push_back(u);
-        }
-    }
-    if (bench_summons.empty()) {
-        return 0;
-    }
-    auto st = wait_stable_board(4000);
-    if (!st.has_value()) {
-        return 0;
-    }
-    CameraDetectResult cur_cam { st->camera, st->raw_H, st->fit };
-    StageTrafficMap traffic = build_stage_traffic(m_stage_id);
-    std::set<std::pair<int, int>> occupied;
-    for (const auto& u : m_units) {
-        if (u.area == "board") {
-            occupied.emplace(u.r, u.c);
-        }
-    }
 
-    int deployed = 0;
-    for (const auto& s : bench_summons) {
-        for (int r = 1; r <= 4 && r < traffic.rows; ++r) {
-            bool placed = false;
-            for (int c = 0; c < traffic.cols; ++c) {
-                char ch = traffic.grid[r][c];
-                if ((ch == 'a' || ch == 'b') && occupied.count({ r, c }) == 0) {
-                    PlacementMove mv { "deploy", s.name.empty() ? "召唤物" : s.name, "bench", s.r, s.c, "board", r, c, "LEFT" };
-                    if (execute_placement_move(mv, cur_cam)) {
-                        occupied.emplace(r, c);
-                        ++deployed;
-                        placed = true;
-                        if (auto after_st = wait_stable_board(3000)) {
-                            cur_cam = CameraDetectResult { after_st->camera, after_st->raw_H, after_st->fit };
-                        }
-                        break;
-                    }
-                }
-            }
-            if (placed) {
-                break;
-            }
-        }
-    }
-    return deployed;
-}
 
 void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectResult& cam)
 {
@@ -6113,23 +10945,372 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
 
     refresh_board_snapshot(cur_img, cur_cam, true);
 
-    for (int iter = 0; iter < 14 && !need_exit(); ++iter) {
+    // `je` 的整备批处理：最多 80 批，每批「读 → 买 → 部署」，状态连续两批不变就停
+    bool bench_full_flag = false;   // `v`
+    bool unknown_reread = false;    // `ze`
+    bool free_cards_taken = false;  // `Ee`
+    bool give_up_buys = false;      // `Y`
+    bool summon_deployed_flag = false; // `Ie`
+    int third_copy_tries = 0;       // `Pe`
+    std::string last_state_key;
+    int same_state = 0;
+    // `je` L10040：`const Xe = new Set` —— 买/换失败的卡槽位，后续批次从规划卡面里剔除
+    std::unordered_set<int> failed_card_buckets;
+
+    for (int iter = 0; iter < 80 && !need_exit() && !give_up_buys; ++iter) {
         cur_img = shot();
         auto full_items = ocr(cur_img);
         ShopHeaderState hdr = read_shop_header(cur_img, full_items);
+        // `je` L10034：`xe.level !== null && (i.level = xe.level)`
+        // 某一批没读到等级只沿用上一批的值，绝不中断循环。
+        // 「商店等级暂未识别」在 JS 里只出现在循环外的 `i.level === null` 分支
+        // （该分支由 pc 升级失败置 null 触发，非 pc 恒不可达）。
         if (hdr.level.has_value()) {
             m_current_shop_level = *hdr.level;
         }
-        if (hdr.gold.has_value()) {
-            m_current_gold = *hdr.gold;
+        // `je` L10033：`if (!xe || xe.gold === null) throw new et("商店资金识别失败")`
+        // → catch 里 `ne(...；跳过本回合剩余商店操作，继续部署), break`
+        if (!hdr.gold.has_value()) {
+            log_info("商店资金识别失败；跳过本回合剩余商店操作，继续部署");
+            break;
         }
+        m_current_gold = *hdr.gold;
         if (hdr.upgrade_btn.has_value()) {
             m_upgrade_x_Ref = hdr.upgrade_btn->first;
         }
 
+        const bool units_full_text = has_ocr(full_items, { "整备区已达上限", "干员已满" });
+        if (units_full_text) {
+            bench_full_flag = true;
+        }
+
         m_shop = read_shop_cards(cur_img);
-        auto steps = plan_shop_Steps(hdr, m_shop);
+
+        // `je` L10039：`Je = { ...Ve, shop: Ve.shop.filter(De => !Xe.has(Math.round(De.x / 100))) }`
+        // 规划与状态指纹都用过滤后的卡面；免费卡识别 `Mt(D, Ve.shop)` 仍用完整 `m_shop`。
+        std::vector<ShopCard> planning_shop;
+        planning_shop.reserve(m_shop.size());
+        for (const auto& c : m_shop) {
+            const int bucket = static_cast<int>(std::lround(c.x / 100.0));
+            if (failed_card_buckets.count(bucket) == 0) {
+                planning_shop.push_back(c);
+            }
+        }
+
+        // 连续两批状态完全不变 → 说明点了也没生效，停止购买
+        {
+            std::string key = std::to_string(m_current_gold) + "|" + std::to_string(m_current_shop_level) + "|";
+            for (const auto& c : planning_shop) {
+                key += c.name;
+                key += ",";
+            }
+            key += "|" + std::to_string(m_units.size());
+            if (key == last_state_key) {
+                ++same_state;
+            }
+            else {
+                same_state = 0;
+                last_state_key = key;
+            }
+            if (same_state >= 2) {
+                log_info("商店连续两批操作后资金、等级与卡面均未变化，跳过剩余购买，继续部署");
+                break;
+            }
+        }
+
+        // `Mt`：精锐免费选择（>=2 张时必领一张）
+        {
+            auto marked = m_shop;
+            detect_free_cards(cur_img, marked);
+            std::vector<ShopCard> free_only;
+            for (const auto& c : marked) {
+                if (c.free_card) {
+                    free_only.push_back(c);
+                }
+            }
+            if (!free_cards_taken && static_cast<int>(free_only.size()) >= 2) {
+                // `!(nt.every(同首盟约) && Kt === round) && Gt && !Et.has(Gt) && (Et.add(Gt), p.add(Gt), r())`
+                {
+                    bool all_same_first_bond = true;
+                    std::string first_bond;
+                    for (size_t k = 0; k < free_only.size(); ++k) {
+                        const auto* cop = find_operator(free_only[k].name);
+                        const std::string b = (cop != nullptr && !cop->bond_names.empty()) ? cop->bond_names.front() : std::string();
+                        if (k == 0) {
+                            first_bond = b;
+                        }
+                        else if (b != first_bond) {
+                            all_same_first_bond = false;
+                            break;
+                        }
+                    }
+                    const bool same_round = (m_pager_round == m_current_round);
+                    if (!(all_same_first_bond && same_round)
+                        && !m_last_bought_name.empty()
+                        && m_elite_units.count(m_last_bought_name) == 0) {
+                        m_elite_units.insert(m_last_bought_name);
+                        m_pending_merge.insert(m_last_bought_name);
+                    }
+                }
+                ShopSimState sim_free = make_shop_sim(hdr);
+                sim_free.shop = free_only;
+                std::optional<ShopCard> pick;
+                if (m_mode == "standard" && m_goal != "medal") {
+                    auto cands = rank_shop_candidates(sim_free);
+                    if (!cands.empty()) {
+                        pick = cands.front().card;
+                    }
+                }
+                if (!pick.has_value()) {
+                    for (const auto& sc : score_shop_cards(sim_free)) {
+                        if (sc.score > 0) {
+                            pick = sc.card;
+                            break;
+                        }
+                    }
+                }
+                if (!pick.has_value()) {
+                    for (const auto& c : free_only) {
+                        if (c.kind == "operator" && m_elite_units.count(c.name) == 0) {
+                            pick = c;
+                            break;
+                        }
+                    }
+                }
+                if (!pick.has_value()) {
+                    for (const auto& c : free_only) {
+                        if (m_elite_units.count(c.name) == 0) {
+                            pick = c;
+                            break;
+                        }
+                    }
+                }
+                if (!pick.has_value()) {
+                    pick = free_only.front();
+                }
+                free_cards_taken = true;
+                log_info("回合 " + std::to_string(m_current_round) + " · 精锐免费选择：领取 " + pick->name);
+                if (buy_shop_card(pick->x, pick->name, m_upgrade_x_Ref.value_or(0))) {
+                    m_bought_operators.insert(pick->name);
+                    continue;
+                }
+            }
+        }
+
+        // 整备区满 / 干员已满：优先凑第三张，其次按 `Lr` 买一名有用的并卖过渡
+        if (third_copy_tries < 4 && (bench_full_flag || units_full_text)) {
+            std::optional<ShopCard> third;
+            for (const auto& c : m_shop) {
+                if (c.kind != "operator" || c.name.empty() || m_elite_units.count(c.name) > 0) {
+                    continue;
+                }
+                if (is_transition_unit(c.name)) {
+                    continue;
+                }
+                int cnt = 0;
+                for (const auto& u : m_units) {
+                    if (u.name == c.name && !u.elite && !u.auxiliary) {
+                        ++cnt;
+                    }
+                }
+                if (cnt != 2) {
+                    continue;
+                }
+                const auto* op = find_operator(c.name);
+                if (op == nullptr || op->purchase_price > m_current_gold) {
+                    continue;
+                }
+                third = c;
+                break;
+            }
+
+            auto is_useful_for_plan = [&](std::string_view n) {
+                const auto* op = find_operator(n);
+                if (op == nullptr) {
+                    return false;
+                }
+                for (const auto& b : op->bond_names) {
+                    if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), b) != m_active_core_bonds.end()) {
+                        return true;
+                    }
+                    if (m_goal == "medal" && b == "迅捷") {
+                        return true;
+                    }
+                }
+                if (is_stacker(*op)) {
+                    return true;
+                }
+                static const std::vector<std::string> kFinishers = { "蕾缪安", "塔露拉", "艾雅法拉", "维伊" };
+                return std::find(kFinishers.begin(), kFinishers.end(), op->name) != kFinishers.end();
+            };
+
+            std::optional<ShopCard> alt;
+            if (!third.has_value()) {
+                if (m_mode == "standard" && m_goal != "medal") {
+                    ShopSimState sim_now = make_shop_sim(hdr);
+                    for (const auto& c : rank_shop_candidates(sim_now)) {
+                        if (c.unit_price <= m_current_gold + 1) {
+                            alt = c.card;
+                            break;
+                        }
+                    }
+                }
+                else {
+                    ShopSimState sim_now = make_shop_sim(hdr);
+                    for (const auto& sc : score_shop_cards(sim_now)) {
+                        if (sc.score <= 0 || !is_useful_for_plan(sc.card.name)) {
+                            continue;
+                        }
+                        const auto* op = find_operator(sc.card.name);
+                        if (op == nullptr || op->purchase_price > m_current_gold + 1) {
+                            continue;
+                        }
+                        bool owned = false;
+                        for (const auto& u : m_units) {
+                            if (u.name == sc.card.name) {
+                                owned = true;
+                                break;
+                            }
+                        }
+                        if (owned) {
+                            continue;
+                        }
+                        alt = sc.card;
+                        break;
+                    }
+                }
+            }
+
+            const std::optional<ShopCard> target = third.has_value() ? third : alt;
+            if (target.has_value()) {
+                bool unknown_bench = false;
+                for (const auto& u : m_units) {
+                    if (u.area == "bench" && (u.name.empty() || !u.confirmed)) {
+                        unknown_bench = true;
+                        break;
+                    }
+                }
+                if (!unknown_reread && unknown_bench) {
+                    unknown_reread = true;
+                    // `Te(Qe,/^收起/) && W(Qe,/^收起/,400)`
+                    if (auto col = find_text_regex(ocr(shot()), "^收起")) {
+                        tap(col->cx, col->cy, 400);
+                    }
+                    auto reread_img = shot();
+                    refresh_board_snapshot(reread_img, cur_cam, false);
+                    inspect_unknown_units(cur_cam, true);
+                    // `await Ke(await h())`：展开后等「升级 / 已满级」出现
+                    if (auto exp = find_text_regex(ocr(shot()), "^.?展开$")) {
+                        tap(exp->cx, exp->cy, 250);
+                        wait_for(
+                            [](const ScreenInfo& s) {
+                                return s.screen == ScreenState::Prep
+                                    && (has_ocr_exact(s.texts, { "升级" }) || has_ocr_exact(s.texts, { "已满级" }));
+                            },
+                            4000);
+                    }
+                    continue;
+                }
+                // `Ie`：整备区里有还没上场的召唤物 → 先 `Dt` 把它们放上去
+                {
+                    bool has_summon = false;
+                    for (const auto& u : m_units) {
+                        if (u.area == "bench" && u.auxiliary && !u.item && !u.name.empty()
+                            && find_operator(u.name) == nullptr) {
+                            has_summon = true;
+                            break;
+                        }
+                    }
+                    if (target.has_value() && has_summon && !summon_deployed_flag) {
+                        summon_deployed_flag = true;
+                        // `Te(Bt,/^收起/) && W(Bt,/^收起/,400)` → `Dt` → `snapshot({force:!0})` → `Ke`
+                        if (auto col = find_text_regex(ocr(shot()), "^收起")) {
+                            tap(col->cx, col->cy, 400);
+                        }
+                        auto sst = wait_stable_board(4000);
+                        if (sst.has_value()) {
+                            CameraDetectResult sc { sst->camera, sst->raw_H, sst->fit };
+                            refresh_board_snapshot(sst->img, sc, false);
+                            deploy_summons(build_stage_traffic(m_stage_id, m_current_round <= 3));
+                            refresh_board_snapshot(shot(), sc, true);
+                            if (auto exp = find_text_regex(ocr(shot()), "^.?展开$")) {
+                                tap(exp->cx, exp->cy, 250);
+                            }
+                        }
+                        continue;
+                    }
+                }
+
+                ++third_copy_tries;
+                if (third.has_value()) {
+                    log_info("整备区满：" + target->name + " 已有两张，买第三张凑精锐");
+                }
+                if (buy_shop_card(target->x, target->name, m_upgrade_x_Ref.value_or(0))) {
+                    m_bought_operators.insert(target->name);
+                    continue;
+                }
+                const UnitSlot* sell = pick_sell_bench_unit(target->name);
+                if (sell == nullptr) {
+                    log_info("整备区满，想买 " + target->name + " 但没有可卖的过渡期干员");
+                }
+                else {
+                    const std::string sell_slot = sell->slot;
+                    const std::string sell_name = sell->name;
+                    const int gold_before = m_current_gold;
+                    if (sell_unit_slot(sell_slot, gold_before)) {
+                        auto after_img = shot();
+                        auto after_items = ocr(after_img);
+                        auto after_hdr = read_shop_header(after_img, after_items);
+                        if (after_hdr.gold.has_value() && *after_hdr.gold > gold_before) {
+                            log_info("整备区满：卖掉过渡期干员 " + sell_name + "，腾位买 " + target->name);
+                            m_filler_units.erase(sell_name);
+                            buy_shop_card(target->x, target->name, m_upgrade_x_Ref.value_or(0));
+                            m_bought_operators.insert(target->name);
+                            cur_img = after_img;
+                            continue;
+                        }
+                        log_info("卖出 " + sell_name + " 未确认成功");
+                    }
+                }
+            }
+        }
+        auto steps = plan_shop_Steps(hdr, planning_shop);
+        if (units_full_text) {
+            steps.erase(
+                std::remove_if(steps.begin(), steps.end(), [](const ShopPlanStep& st) {
+                    return st.action == "buy" && st.kind != "item";
+                }),
+                steps.end());
+        }
         if (steps.empty() || steps.front().action == "done") {
+            // 计划已结束：冻结一张值得留的卡（`bs` / 标准模式下的 `_r` 买不起项）
+            if (m_current_round < m_last_round) {
+                std::optional<std::string> keep;
+                const ShopSimState sim_now = make_shop_sim(hdr);
+                if (m_mode == "standard" && m_goal != "medal") {
+                    for (const auto& c : rank_shop_candidates(sim_now)) {
+                        if (c.unit_price > m_current_gold) {
+                            keep = c.unit_name;
+                            break;
+                        }
+                    }
+                }
+                else {
+                    keep = pick_freeze_target(sim_now);
+                }
+                if (keep.has_value()) {
+                    const auto items_now = ocr(cur_img);
+                    const bool thawed = has_ocr(items_now, { "解冻" });
+                    auto freeze_btn = find_text_regex(items_now, "^冻结$");
+                    if (!thawed && freeze_btn.has_value()) {
+                        tap(freeze_btn->cx, freeze_btn->cy, 250);
+                        log_info("冻结商店，保留 " + *keep);
+                    }
+                    else {
+                        log_info("想冻结保留 " + *keep + "，但" + (thawed ? "商店已是冻结状态" : "没找到「冻结」按钮"));
+                    }
+                }
+            }
             break;
         }
 
@@ -6145,14 +11326,29 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
                 log_info("商店动作: 升级商店 -> " + step.target + " (费用:" + std::to_string(step.cost) + ")");
                 if (upgrade_shop(hdr)) {
                     acted = true;
+                    ++m_current_shop_level; // `je` L10204：`i.level++, Oe = !0, Ce.upgrades++`
                 }
+                // `ct` 返回 !1 时 JS 只 `break` 掉本批的 `for (const De of re)`，
+                // 外层 80 批循环继续；只有 `ct` 抛 `et`（pc 专属，MAA 不可达）
+                // 才会被 catch 成「跳过本回合剩余商店操作」并终止整轮。
                 break;
             }
             if (step.action == "swap") {
                 log_info("商店动作: 出售 " + step.sell_name + " 换购 " + step.target);
-                if (sell_unit_slot(step.sell_slot, cur_cam)) {
-                    buy_shop_card(step.x, step.target, m_upgrade_x_Ref.value_or(0));
-                    acted = true;
+                if (sell_unit_slot(step.sell_slot, m_current_gold)) {
+                    if (buy_shop_card(step.x, step.target, m_upgrade_x_Ref.value_or(0))) {
+                        m_filler_units.erase(step.sell_name);
+                        m_bought_operators.insert(step.target);
+                        acted = true;
+                    }
+                    else {
+                        // `je` L10197：`Xe.add(Math.round(De.card.x / 100))`
+                        failed_card_buckets.insert(static_cast<int>(std::lround(step.x / 100.0)));
+                    }
+                }
+                else {
+                    // `je` L10179：卖出未确认 → 同样把该卡从后续规划里剔除
+                    failed_card_buckets.insert(static_cast<int>(std::lround(step.x / 100.0)));
                 }
                 break;
             }
@@ -6160,9 +11356,25 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
                 log_info("商店动作: 购买 " + step.target + " (" + step.reason + ")");
                 if (buy_shop_card(step.x, step.target, m_upgrade_x_Ref.value_or(0))) {
                     acted = true;
+                    // 注意：`bought/upgrades/itemBought/fillerBought` 已在 `plan_shop_Steps`
+                    // 的推演里计入，这里只维护持久集合，避免重复计数。
+                    if (step.kind == "item") {
+                        m_bought_items.insert(step.target);
+                    }
+                    else {
+                        m_bought_operators.insert(step.target);
+                        if (step.filler) {
+                            m_filler_units.insert(step.target);
+                            log_info("前期补位：买 " + step.target + "（招第 9 名干员前卖掉）");
+                        }
+                    }
                     // Immediately refresh snapshot after purchase
                     cur_img = shot();
                     refresh_board_snapshot(cur_img, cur_cam, false);
+                }
+                else {
+                    // `je` L10193：`if (!await Tt(...)) Xe.add(Math.round(De.card.x / 100)); break`
+                    failed_card_buckets.insert(static_cast<int>(std::lround(step.x / 100.0)));
                 }
             }
             else if (step.action == "refresh") {
@@ -6177,33 +11389,85 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
                 break;
             }
         }
-        if (!acted) {
-            break;
-        }
+        // `je` 没有「本批无成功动作就终止整轮」这个分支：
+        // 动作失败时 JS 只 `break` 掉内层 `for (const De of re)`，
+        // 外层 80 批循环继续，由 `ar === L`（上面的 same_state>=2）与 80 批上限收敛。
+        // 旧实现在这里直接 break，导致一次点击失败就把本回合剩余购买/升级/装备/寻呼全跳过。
+        (void)acted;
     }
 
     // Collapse shop if needed to get clear view of board/bench for unit inspection & placement
     cur_img = shot();
     cur_cam = detect_camera(cur_img, goal_only_allowed());
     log_info(std::string(cur_cam.camera.empty() ? "校准失败（跳过部署/装备/召唤）: " : "校准: ") + cur_cam.detail);
+    if (cur_cam.camera.empty() && !cur_img.empty()) {
+        // 校准失败时落盘现场帧，便于离线核对 marker 的实际像素分布
+        static int dump_seq = 0;
+        if (dump_seq < 8) {
+            std::error_code ec;
+            std::filesystem::create_directories("debug/spa_farm", ec);
+            const std::string dump_path =
+                "debug/spa_farm/calib_fail_" + std::to_string(++dump_seq) + ".png";
+            if (cv::imwrite(dump_path, cur_img)) {
+                log_info("已保存校准失败帧: " + dump_path);
+            }
+        }
+    }
     if (!cur_cam.camera.empty()) {
         refresh_board_snapshot(cur_img, cur_cam, false);
         inspect_unknown_units(cur_cam, true);
-        scan_and_distribute_equipment(cur_img, cur_cam);
-        if (try_use_jessica_pager(cur_cam)) {
-            cur_img = shot();
-            m_shop = read_shop_cards(cur_img);
-            for (const auto& card : m_shop) {
-                if (card.free_card && !card.name.empty()) {
-                    buy_shop_card(card.x, card.name, m_upgrade_x_Ref.value_or(0));
+
+        // `je` L10223-10230：先跑寻呼模块（`Ur`），task 目标 + 杰西卡才走
+        if (m_goal != "medal" && m_current_strategy.find("杰西卡") != std::string::npos) {
+            auto stg = std::find_if(m_stages.begin(), m_stages.end(), [&](const StageInfo& st) {
+                return st.stage_id == m_stage_id;
+            });
+            if (stg != m_stages.end()) {
+                try_use_jessica_pager(cur_cam);
+            }
+        }
+        // `$e()`：整备区满 / 有无法放置的单位 → `nn`（回收暂存区到候补席）
+        if (m_goal != "medal") {
+            int bench_n = 0;
+            for (const auto& u : m_units) {
+                if (u.area == "bench") {
+                    ++bench_n;
                 }
             }
-            cur_img = shot();
-            refresh_board_snapshot(cur_img, cur_cam, false);
+            int h_cnt = 10;
+            for (const auto& stg : m_stages) {
+                if (stg.stage_id != m_stage_id) {
+                    continue;
+                }
+                for (const auto& row : stg.rows) {
+                    if (row.find('H') == std::string::npos) {
+                        continue;
+                    }
+                    const int cnt = static_cast<int>(std::count(row.begin(), row.end(), 'H'));
+                    h_cnt = (cnt > 0) ? cnt : 10;
+                    break;
+                }
+                break;
+            }
+            const bool cannot_place = has_ocr(ocr(shot()), { "无法放置的单位" });
+            if (cannot_place || bench_n >= h_cnt) {
+                handle_overflow_units(cur_cam);
+            }
         }
-        run_auto_place(cur_cam, false);
+
+        // `we()`：内部完成 部署 → 召唤物 → 装备（`on`）
+        //   失败（`wa`）→ `we(!0)` 重试一次，仍失败则保留当前阵容继续
+        if (run_auto_place(cur_cam, false) < 0) {
+            log_info("部署重排后仍失败，保留当前阵容继续游戏");
+            close_detail_panel();
+            run_auto_place(cur_cam, false, true);
+        }
+
+        // `$e() && strategy==="杰西卡" && vt > 0` → 再跑一次寻呼
+        if (m_goal != "medal" && m_current_strategy.find("杰西卡") != std::string::npos && m_pager_uses > 0) {
+            try_use_jessica_pager(cur_cam);
+        }
         try_use_mob_skill(cur_cam, m_current_gold);
-        deploy_summons(cur_cam);
     }
 
     // 收尾前重读一次商店头：升级/购买后等级与资金已经变了，
@@ -6253,98 +11517,160 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
 // Screen Classifier (`bi`) & Strategy / Squad / Popup Handlers (`Ot`, `Ft`, `Or`, `Vn`, `K`, `ce`, `ln`)
 // ============================================================================
 
-SPAFarmTaskPlugin::ScreenState SPAFarmTaskPlugin::classify_screen(
-    const cv::Mat& img,
-    const std::vector<OcrItem>& items) const
+SPAFarmTaskPlugin::ScreenInfo SPAFarmTaskPlugin::classify_screen(const cv::Mat& img) const
 {
-    // Exact 1:1 port of `bi(a)` in service.pretty.mjs lines 4727-4805
-    if (has_ocr(items, { "与神经网络连接中断", "连接已断开", "重新连接" })) {
-        return ScreenState::Reconnect;
+    // `bi(a, s=false)` —— service.pretty.mjs L4766-4806，逐行对齐（`pc` 分支已按实测结论删除）
+    ScreenInfo out;
+    out.png = img;
+    if (img.empty()) {
+        return out;
     }
-    if (has_ocr(items, { "暂时离开模拟", "放弃本次模拟", "确认放弃" }) && has_ocr(items, { "确认", "放弃", "确定", "取消" })) {
-        return ScreenState::Abandon;
-    }
-    if ((has_ocr(items, { "是否确认准备", "确认准备", "资金将在" }))
-        && (has_ocr(items, { "剩余资金", "未使用的", "指令", "本局不再提示" }) || has_ocr_exact(items, { "确认", "确定" }))) {
-        return ScreenState::Confirm;
-    }
-    if (has_ocr(items, { "装备已满，请选择", "销毁并替换", "穿戴装备已满" })) {
-        return ScreenState::EquipFull;
-    }
+    out.texts = ocr(img);
+    const std::vector<OcrItem>& e = out.texts;
 
-    // Three-choice overlay (`选择干员|选择战略|选择补给|选择支援|选择奖励` or >= 2 `选择` buttons in y: 550..920)
-    if (!has_ocr(items, { "选择策略", "确认本局信息" })) {
-        if (has_ocr(items, { "选择干员", "选择战略", "选择补给", "选择支援", "选择奖励", "选择一项策略" })) {
-            return ScreenState::ThreeChoice;
+    auto t = [&](const std::string& pattern) {
+        return has_text_regex(e, pattern);
+    };
+    const std::string kQuickRe = "极速模拟|规程等级[0-9]+";
+
+    // `w = t(/极速模拟|规程等级\d+/)`
+    bool w = t(kQuickRe);
+    std::string level_name;
+
+    // `m()`：左上角 260x80 放大 3 倍做一次 rec，用来确认极速模拟
+    auto read_corner = [&]() -> std::string {
+        cv::Mat crop = img_crop(img, 140, 20, 260, 80);
+        if (crop.empty()) {
+            return {};
         }
-        int choose_btns = 0;
-        for (const auto& it : items) {
-            if ((it.text == "选择" || it.text == "选取") && it.cy > 550 && it.cy < 920) {
-                ++choose_btns;
+        crop = img_resize_cubic(crop, 780, 240);
+        std::string joined;
+        for (const auto& it : ocr(crop)) {
+            if (it.score >= 0.65) {
+                joined += strip_ws(it.text);
             }
         }
-        if (choose_btns >= 2) {
-            return ScreenState::ThreeChoice;
+        return joined;
+    };
+
+    if (!w && t("确认本局信息|选择策略|回合|休息一下")) {
+        const std::string corner = read_corner();
+        w = regex_test(corner, kQuickRe);
+        if (auto m = regex_first(corner, kQuickRe)) {
+            level_name = *m;
         }
     }
 
-    if (has_ocr(items, { "战术决策", "抉择" }) && has_ocr(items, { "确认选择", "确认" })) {
-        return ScreenState::Decision;
-    }
-    if (has_ocr(items, { "点击任意位置继续", "点击屏幕继续", "点击空白处关闭", "获得奖励" })) {
-        return ScreenState::Reward;
-    }
-    if (has_ocr(items, { "返回主页" })
-        || (has_ocr(items, { "模拟完成", "模拟中断", "演习结束", "战斗结算" }) && has_ocr(items, { "返回", "退出", "统计" }))) {
-        return ScreenState::Result;
-    }
-    if (has_ocr(items, { "确定自选编队", "自选编队" }) && !has_ocr(items, { "选择策略" })) {
-        return ScreenState::Squad;
-    }
-    if (has_ocr(items, { "确认本局信息" })
-        || (has_ocr(items, { "核心盟约", "非核心盟约", "敌方领袖", "特训敌人" }) && !has_ocr(items, { "选择策略" }))) {
-        return ScreenState::Info;
-    }
-    if (has_ocr(items, { "选择策略" })
-        || (has_ocr_exact(items, { "确认选择" }) && has_ocr(items, { "固定编队", "自选编队", "已经通过", "已通过模拟", "通过次数" }))) {
-        return ScreenState::Strategy;
-    }
-    if (has_ocr(items, { "请选择模拟难度", "选择模拟难度" })
-        || (has_ocr(items, { "个人模拟" }) && has_ocr(items, { "极速模拟", "标准模拟" }))
-        || (has_ocr(items, { "开始模拟" }) && has_ocr(items, { "独立模拟", "极速模拟" }) && !has_ocr(items, { "回合" }))) {
-        return ScreenState::Mode;
-    }
-    if (find_ocr_in_roi(items, { "断线重连" }, 1100, 720, 1920, 1080).has_value()) {
-        return ScreenState::Reconnect;
-    }
-    if (has_ocr(items, { "开始模拟" })
-        || (has_ocr(items, { "极速模拟" }) && has_ocr(items, { "独立模拟" }))) {
-        return ScreenState::Lobby;
-    }
-    if (has_ocr(items, { "点击取消", "拖动以选择朝向" }) && has_ocr(items, { "准备就绪" })) {
-        return ScreenState::Facing;
+    if (level_name.empty()) {
+        std::optional<OcrItem> pick;
+        for (const auto& it : e) {
+            const std::string txt = strip_ws(it.text);
+            if (it.y < 120 && it.x < 520 && regex_test(txt, kQuickRe)) {
+                pick = it;
+                break;
+            }
+        }
+        if (!pick.has_value() && t("请选择模拟难度")) {
+            for (const auto& it : e) {
+                const std::string txt = strip_ws(it.text);
+                if (it.y > 980 && it.x < 400 && regex_test(txt, "规程等级[0-9]+")) {
+                    pick = it;
+                    break;
+                }
+            }
+        }
+        if (pick.has_value()) {
+            if (auto m = regex_first(strip_ws(pick->text), kQuickRe)) {
+                level_name = *m;
+            }
+        }
     }
 
-    if (!img.empty() && detect_facing_white_box(img).has_value()) {
-        return ScreenState::Facing;
+    // `u = combat`：顶部中心的 x/y 回合计数
+    auto is_ratio = [](const std::string& s) {
+        return regex_test(s, "^[0-9]{1,3}/[0-9]{1,3}$");
+    };
+    bool combat = false;
+    if (w) {
+        for (const auto& it : e) {
+            if (it.score >= 0.7 && it.x >= 600 && it.x < 1250 && it.y < 100 && is_ratio(strip_ws(it.text))) {
+                combat = true;
+                break;
+            }
+        }
+    }
+    if (!combat && w && !t("准备就绪|休息一下|选择策略|确认本局信息|自选编队|返回主页|开始模拟|个人模拟")) {
+        cv::Mat crop = img_crop(img, 650, 0, 540, 105);
+        if (!crop.empty()) {
+            crop = img_resize_cubic(crop, 1620, 315);
+            for (const auto& it : ocr(crop)) {
+                if (it.score >= 0.8 && is_ratio(strip_ws(it.text))) {
+                    combat = true;
+                    break;
+                }
+            }
+        }
     }
 
-    if (has_ocr(items, { "准备就绪" })
-        && (has_ocr(items, { "刷新", "收起", "展开" }) || has_ocr_exact(items, { "升级", "已满级", "满级" }))) {
-        return ScreenState::Shop;
+    // 状态判定链，顺序与 JS 完全一致
+    if (t("确认准备") && t("剩余资金|未使用的|指令")) {
+        out.screen = ScreenState::ConfirmReady;
+    }
+    else if (t("选择策略")) {
+        out.screen = ScreenState::Strategy;
+    }
+    else if (t("确认本局信息")) {
+        out.screen = ScreenState::Info;
+    }
+    else if (t("自选编队")) {
+        out.screen = ScreenState::Squad;
+    }
+    else if (t("返回主页|模拟结束|模拟成功|模拟失败|模拟胜利|模拟完成")) {
+        out.screen = ScreenState::Result;
+    }
+    else if (t("休息") && t("准备就绪")) {
+        out.screen = ScreenState::Prep;
+    }
+    else if (!t("准备就绪") && (t("回合") || combat)) {
+        out.screen = ScreenState::Battle;
+    }
+    else if (t("开始模拟") && (w || t("请选择模拟难度"))) {
+        out.screen = ScreenState::Mode;
+    }
+    else if (t("^个人模拟$") && t("^联合模拟$") && t("协议数据库")) {
+        out.screen = ScreenState::Lobby;
+    }
+    else {
+        out.screen = ScreenState::Unknown;
     }
 
-    auto cam = detect_camera(img, goal_only_allowed());
-    if (!cam.camera.empty()) {
-        auto [rnd, is_prep] = read_round_and_prep(img, items);
-        (void)rnd;
-        return is_prep ? ScreenState::Shop : ScreenState::Battle;
+    // `wins`：把所有 OCR 文本拼起来找「已通过模拟N次」
+    std::string joined;
+    for (const auto& it : e) {
+        if (!joined.empty()) {
+            joined += "|";
+        }
+        joined += strip_ws(it.text);
+    }
+    if (auto m = regex_first_group(joined, "已通过模拟([0-9]+)次")) {
+        out.wins = std::stoi(*m);
     }
 
-    if (has_ocr(items, { "回合", "COUNTDOWN" })) {
-        return ScreenState::Battle;
+    out.quick = w;
+    out.levelName = level_name;
+    out.difficulty = t("请选择模拟难度");
+    out.combat = combat;
+    out.selected = t("确认选择");
+    if (t("模拟成功|模拟胜利|模拟完成")) {
+        out.won = true;
     }
-    return ScreenState::Unknown;
+    else if (t("模拟失败")) {
+        out.won = false;
+    }
+    if (out.screen == ScreenState::Lobby) {
+        out.personal_selected = is_personal_selected(img, e);
+    }
+    return out;
 }
 
 cv::Mat SPAFarmTaskPlugin::extract_strategy_icon(const cv::Mat& img, int gx, int gy)
@@ -6403,280 +11729,457 @@ bool SPAFarmTaskPlugin::has_strategy_selected_border(const cv::Mat& img, int gx,
     return total > 0 && (static_cast<double>(orange) / total) > 0.25;
 }
 
-int SPAFarmTaskPlugin::detect_strategy_badge_tier(const cv::Mat& img, int gx, int gy)
+bool SPAFarmTaskPlugin::has_strategy_badge(const cv::Mat& img, int gx, int gy, int size) const
 {
-    // Exact 1:1 port of `Vn(png, Ie, H, 190)` in service.pretty.mjs lines 8756-8769
-    int x0 = std::clamp(gx + 30, 0, img.cols);
-    int y0 = std::clamp(gy - 88, 0, img.rows);
-    int x1 = std::clamp(gx + 88, 0, img.cols);
-    int y1 = std::clamp(gy - 30, 0, img.rows);
-    int cyan = 0, gold = 0;
-    for (int y = y0; y < y1; ++y) {
-        const auto* row = img.ptr<cv::Vec3b>(y);
-        for (int x = x0; x < x1; ++x) {
-            int B = row[x][0], G = row[x][1], R = row[x][2];
-            if (B > 130 && G > 120 && (B - R) > 25) {
-                ++cyan;
-            }
-            else if (R > 150 && G > 95 && G < R * 0.94 && B < G * 0.62) {
-                ++gold;
-            }
+    // `Vn(a, s, e, t = 190)` —— service.pretty.mjs L4891-4906
+    //   extract({left: round(s+t-58), top: round(e), width:58, height:65}).removeAlpha().raw()
+    //   计数：R>150 && G>95 && G < R*0.94 && B < G*0.62
+    //   return 计数 >= 130
+    const int left = static_cast<int>(std::lround(static_cast<double>(gx + size - 58)));
+    const int top = static_cast<int>(std::lround(static_cast<double>(gy)));
+    cv::Mat crop = img_crop(img, left, top, 58, 65);
+    if (crop.empty()) {
+        return false;
+    }
+    const RawRgb raw = img_to_rgb(crop);
+    int count = 0;
+    for (size_t i = 0; i + 2 < raw.data.size(); i += 3) {
+        const int R = raw.data[i];
+        const int G = raw.data[i + 1];
+        const int B = raw.data[i + 2];
+        if (R > 150 && G > 95 && G < R * 0.94 && B < G * 0.62) {
+            ++count;
         }
     }
-    if (cyan >= 60) {
-        return 6;
-    }
-    if (gold >= 80) {
-        return 3;
-    }
-    return 0;
+    return count >= 130;
 }
 
 bool SPAFarmTaskPlugin::handle_strategy_screen(const cv::Mat& img)
 {
-    // Exact 1:1 port of `Ot(I)` + `ye` in service.pretty.mjs lines 8711-8853 & 10359-10368
-    static constexpr int kGridX[4] = { 696, 913, 1130, 1347 };
-    static constexpr int kGridY[4] = { 370, 588, 806, 1005 };
+    // `Ot(I)` —— service.pretty.mjs L8711-8853，逐行对齐（`pc` 分支按实测结论删除）
+    //
+    // 结构：
+    //   最多 40 页 × 每页若干行 × 4 列
+    //   每格：先取 12×12 灰度指纹 → 与已见策略比距离（<12 且与次优差 >3 才认）
+    //         → 已达标且（目标>3 或 已有刻章）或本轮已试过 → 跳过
+    //         → 点击 → 读右侧面板名（`mt`）→ 记进度 → 若未达标则确认选择并返回
+    //   整页扫完：用 16×16 指纹判断是否已到列表末尾，否则向下拖拽翻页
+    const bool medal_goal = (m_goal != "medal") ? false : true; // JS `be()` 是 "!= medal"，这里取反
+    const bool by_task = !medal_goal;                            // JS `be()`
+    const int target = m_target;
 
-    cv::Mat cur_img = img;
-    auto init_items = ocr(cur_img);
-
-    // Step 1: If match info (`本局信息`) has not been inspected yet on strategy page, click `本局信息` (`ye` lines 10359-10368)
-    if (!m_match_info_read) {
-        if (auto info_btn = find_ocr(init_items, { "本局信息" })) {
-            log_info("策略选择前先点击「本局信息」读取本局敌方领袖与激活核心盟约");
-            tap(info_btn->cx, info_btn->cy, 900);
-            cv::Mat info_img = shot();
-            auto info_items = ocr(info_img);
-            handle_info_screen(info_img, info_items);
-            cur_img = shot();
+    auto frame = [&]() -> std::optional<ScreenInfo> {
+        cv::Mat shot_img = shot();
+        if (shot_img.empty()) {
+            return std::nullopt;
         }
+        return classify_screen(shot_img);
+    };
+
+    ScreenInfo info;
+    if (!img.empty()) {
+        info = classify_screen(img);
+    }
+    else if (auto f = frame()) {
+        info = *f;
+    }
+    else {
+        return false;
     }
 
-    for (int page = 0; page < 6 && !need_exit(); ++page) {
-        const int max_rows = (page == 5) ? 4 : 3;
-        for (int row_idx = 0; row_idx < max_rows; ++row_idx) {
-            int gy = kGridY[row_idx];
-            for (int col_idx = 0; col_idx < 4; ++col_idx) {
+    // 本页已尝试过的策略名（JS 的 `B`，每次调用重置）
+    std::set<std::string> tried;
+    bool skipped_by_goal = false; // JS 的 `_`
+    std::string last_fingerprint;
+
+    // `Ue(I, k)`：写入进度并重算 completed
+    auto update_progress = [&](const std::string& name, int wins) {
+        m_strategy_clears[name] = std::min(wins, target);
+    };
+
+    for (int page = 0; page < 40 && !need_exit(); ++page) {
+        std::vector<int> rows = detect_strategy_rows(info.png, info.selected);
+        for (int retry = 0; rows.empty() && retry < 8; ++retry) {
+            sleep_ms(400);
+            auto f = frame();
+            if (!f.has_value()) {
+                return false;
+            }
+            if (f->screen != ScreenState::Strategy) {
+                log_info("策略选择页面已离开（可能倒计时结束），请重新开始");
+                return false;
+            }
+            info = *f;
+            rows = detect_strategy_rows(info.png, info.selected);
+        }
+        if (rows.empty()) {
+            log_info("未识别到策略卡片边框，请保持游戏为 16:9 横屏");
+            return false;
+        }
+
+        const int panel_x = info.selected ? 586 : 982;
+        constexpr int kCellSize = 190;
+
+        for (int row_y : rows) {
+            for (int col = 0; col < 4; ++col) {
                 if (need_exit()) {
                     return false;
                 }
-                int gx = kGridX[col_idx];
+                const int cell_x = panel_x + col * 210;
 
-                // Check visual medal badge first (`Vn`)
-                int badge_tier = detect_strategy_badge_tier(cur_img, gx, gy);
-                if (badge_tier >= m_target && m_goal == "medal") {
+                // 12×12 灰度指纹
+                cv::Mat crop = img_crop(
+                    info.png,
+                    cell_x + static_cast<int>(std::lround(kCellSize * 0.13)),
+                    row_y + static_cast<int>(std::lround(kCellSize * 0.16)),
+                    static_cast<int>(std::lround(kCellSize * 0.74)),
+                    static_cast<int>(std::lround(kCellSize * 0.74)));
+                cv::Mat pixels;
+                if (crop.empty()) {
                     continue;
                 }
+                cv::resize(img_gray(crop), pixels, cv::Size(12, 12), 0.0, 0.0, cv::INTER_AREA);
 
-                // Check icon cache (`Or` with threshold `< 10`)
-                cv::Mat icon = extract_strategy_icon(cur_img, gx, gy);
-                std::string cached_name;
+                // 与已见策略比距离，取最近与次近
+                struct Neighbor
+                {
+                    std::string name;
+                    double d = 1e9;
+                };
+                std::vector<Neighbor> neighbors;
+                neighbors.reserve(m_seen_strategy_icons.size());
                 for (const auto& seen : m_seen_strategy_icons) {
-                    if (icon_diff(icon, seen.icon) < 10.0) {
-                        cached_name = seen.name;
-                        break;
+                    if (seen.icon.empty() || seen.icon.size() != pixels.size()) {
+                        continue;
                     }
-                }
-                if (!cached_name.empty() && m_done_strategies.count(cached_name) > 0 && m_goal == "medal") {
-                    continue;
-                }
-
-                // Click strategy cell if not already selected
-                if (!has_strategy_selected_border(cur_img, gx, gy)) {
-                    tap(gx, gy, 350);
-                    cur_img = shot();
-                }
-
-                // Read right detail panel `[1430, 100, 470, 880]`
-                auto panel_ocr = ocr(cur_img, std::array<int, 4> { 1430, 100, 470, 880 });
-                std::string panel_text;
-                std::string strat_name;
-                int passed = 0;
-
-                for (const auto& it : panel_ocr) {
-                    panel_text += it.text;
-                    for (std::string_view kw : { std::string_view("已通过模拟"), std::string_view("通过次数") }) {
-                        auto pos = it.text.find(kw);
-                        if (pos != std::string::npos) {
-                            std::string d = extract_digits_mapped(it.text.substr(pos));
-                            if (!d.empty()) {
-                                passed = std::stoi(d);
-                            }
+                    double sum = 0.0;
+                    for (int y = 0; y < 12; ++y) {
+                        for (int x = 0; x < 12; ++x) {
+                            sum += std::abs(static_cast<int>(pixels.at<uint8_t>(y, x))
+                                            - static_cast<int>(seen.icon.at<uint8_t>(y, x)));
                         }
                     }
+                    neighbors.push_back(Neighbor { seen.name, sum / 144.0 });
                 }
-                if (passed == 0) {
-                    for (std::string_view kw : { std::string_view("已通过模拟"), std::string_view("通过次数") }) {
-                        auto pos = panel_text.find(kw);
-                        if (pos != std::string::npos) {
-                            std::string d = extract_digits_mapped(panel_text.substr(pos, 24));
-                            if (!d.empty()) {
-                                passed = std::stoi(d);
-                                break;
-                            }
+                std::sort(neighbors.begin(), neighbors.end(), [](const Neighbor& a, const Neighbor& b) {
+                    return a.d < b.d;
+                });
+
+                std::string known_name;
+                if (!neighbors.empty() && neighbors[0].d < 12.0
+                    && (neighbors.size() < 2 || neighbors[1].d - neighbors[0].d > 3.0)) {
+                    known_name = neighbors[0].name;
+                }
+
+                // 已达标（medal）或本轮已试 → 跳过
+                if (known_name.empty()) {
+                    // 未知格子仍要点击确认，交给下面的流程
+                }
+                else {
+                    const int passed = m_strategy_clears.count(known_name) ? m_strategy_clears[known_name] : 0;
+                    if (!by_task && passed >= target) {
+                        const bool enough = (target > 3) ? true : has_strategy_badge(info.png, cell_x, row_y, kCellSize);
+                        if (enough) {
+                            continue;
                         }
                     }
-                }
-
-                auto sm = match_dict(panel_text, m_strategy_dict);
-                if (!sm.empty()) {
-                    strat_name = sm.front().name;
-                }
-                else if (!panel_ocr.empty()) {
-                    strat_name = panel_ocr.front().text;
-                }
-
-                if (!strat_name.empty()) {
-                    m_strategy_clears[strat_name] = std::max(m_strategy_clears[strat_name], passed);
-                    bool already_cached = false;
-                    for (const auto& s : m_seen_strategy_icons) {
-                        if (s.name == strat_name) {
-                            already_cached = true;
-                            break;
-                        }
-                    }
-                    if (!already_cached) {
-                        m_seen_strategy_icons.push_back(SeenStrategyIcon { strat_name, icon });
-                    }
-                }
-
-                if (m_goal != "medal") {
-                    // For task-1..task-7 goals, prefer Jessica (`杰西卡`) strategy (`pr` in service.pretty.mjs)
-                    if (!strat_name.empty() && strat_name.find("杰西卡") == std::string::npos) {
+                    if (tried.count(known_name) > 0) {
                         continue;
                     }
                 }
-                else if (passed >= m_target || badge_tier >= m_target) {
-                    if (!strat_name.empty()) {
-                        m_done_strategies.insert(strat_name);
+
+                tap(cell_x + kCellSize / 2.0, row_y + kCellSize / 2.0, 350);
+                auto after = frame();
+                if (!after.has_value()) {
+                    return false;
+                }
+                info = *after;
+                if (info.screen != ScreenState::Strategy) {
+                    log_info("策略选择页面已离开（可能倒计时结束），请重新开始");
+                    return false;
+                }
+
+                std::string picked = strategy_from_panel(info);
+                for (int retry = 0; picked.empty() && retry < 2; ++retry) {
+                    sleep_ms(400);
+                    auto f = frame();
+                    if (!f.has_value() || f->screen != ScreenState::Strategy) {
+                        break;
                     }
-                    log_info("跳过已满章策略: " + strat_name + " (通过次数:" + std::to_string(std::max(passed, badge_tier)) + "/" + std::to_string(m_target) + ")");
+                    info = *f;
+                    picked = strategy_from_panel(info);
+                }
+                if (picked.empty() || tried.count(picked) > 0) {
+                    continue;
+                }
+                tried.insert(picked);
+
+                // 缓存指纹
+                if (m_seen_strategy_icons.size() < 128) {
+                    bool exists = false;
+                    for (const auto& s : m_seen_strategy_icons) {
+                        if (s.name == picked) {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if (!exists) {
+                        m_seen_strategy_icons.push_back(SeenStrategyIcon { picked, pixels.clone() });
+                    }
+                }
+
+                // 胜场未显示时：先看「未通过模拟」，再看刻章标记
+                std::optional<int> wins = info.wins;
+                if (!wins.has_value()) {
+                    if (has_text_regex(info.texts, "未通过模拟|尚未通过|未通关")) {
+                        wins = 0;
+                    }
+                    else if (has_strategy_badge(info.png, cell_x, row_y, kCellSize)) {
+                        if (target > 3 || by_task) {
+                            wins = 3;
+                        }
+                        else {
+                            log_info(picked + " 已显示刻章，但胜场数未读到");
+                        }
+                    }
+                }
+                if (wins.has_value()) {
+                    update_progress(picked, *wins);
+                }
+
+                // 目标策略过滤（task-N 只跑指定策略）
+                std::vector<std::string> goal_strategies;
+                for (const auto& gt : kGoalTasks) {
+                    if (gt.id == m_goal) {
+                        goal_strategies = gt.strategies;
+                        break;
+                    }
+                }
+                if (by_task && !goal_strategies.empty()
+                    && std::find(goal_strategies.begin(), goal_strategies.end(), picked) == goal_strategies.end()) {
+                    skipped_by_goal = true;
                     continue;
                 }
 
-                // Found our target strategy!
-                m_current_strategy = strat_name;
+                if (!by_task) {
+                    // medal：已经全部达标就收工；否则本策略达标就跳过
+                    int completed = 0;
+                    for (const auto& sr : m_strategies) {
+                        if (!sr.available) {
+                            continue;
+                        }
+                        const int p = m_strategy_clears.count(sr.name) ? m_strategy_clears[sr.name] : 0;
+                        if (p >= target) {
+                            ++completed;
+                        }
+                    }
+                    int avail = 0;
+                    for (const auto& sr : m_strategies) {
+                        if (sr.available) {
+                            ++avail;
+                        }
+                    }
+                    if (completed == avail) {
+                        log_info("极速模拟可用策略均已确认获得刻章");
+                        return false;
+                    }
+                    if (wins.has_value() && *wins >= target) {
+                        continue;
+                    }
+                }
+
+                m_current_strategy = picked;
                 m_current_strategy_id.clear();
                 for (const auto& sr : m_strategies) {
-                    if (sr.name == strat_name) {
+                    if (sr.name == picked) {
                         m_current_strategy_id = sr.id;
                         break;
                     }
                 }
-                log_info(
-                    "选定策略: " + (m_current_strategy.empty() ? std::string("当前策略") : m_current_strategy)
-                    + " (当前通关:" + std::to_string(passed) + "/" + std::to_string(m_target)
-                    + "，总体策略完成:" + std::to_string(m_done_strategies.size()) + "/" + std::to_string(total_available_strategies()) + ")");
-                if (auto conf_btn = find_ocr_exact(panel_ocr, { "确认选择" })) {
-                    tap(conf_btn->cx, conf_btn->cy, 1200);
+                log_info("选择 " + picked + " · "
+                         + (by_task ? m_goal : (wins.has_value() ? "已通过 " + std::to_string(*wins) + "/"
+                                                                       + std::to_string(target) + " 次"
+                                                                 : std::string("未获刻章（胜场未显示）"))));
+
+                if (auto hit = find_text_regex(info.texts, "^确认选择$")) {
+                    tap(hit->cx, hit->cy, 350);
                 }
                 else {
-                    tap(1680, 990, 1200);
+                    // `W(k, /确认选择/)` 在找不到时会抛；这里按 JS 语义视为失败
+                    log_info("画面没有预期按钮：确认选择");
+                    return false;
                 }
+                wait_for(
+                    [](const ScreenInfo& s) {
+                        return s.screen == ScreenState::Squad || s.screen == ScreenState::Prep;
+                    },
+                    15000);
                 return true;
             }
         }
 
-        // Scroll strategy grid down (`ut(1020, 820, 1020, 360, 700)`)
-        log_info("当前页策略均已达标，向下滑动策略列表 (" + std::to_string(page + 1) + "/6)");
-        swipe(1020, 820, 1020, 360, 700, 800);
-        cur_img = shot();
+        // 翻页：16×16 指纹判末尾
+        cv::Mat tail = img_crop(info.png, panel_x, 300, 820, 700);
+        if (tail.empty()) {
+            break;
+        }
+        cv::Mat tiny;
+        cv::resize(tail, tiny, cv::Size(16, 16), 0.0, 0.0, cv::INTER_AREA);
+        std::string fingerprint;
+        fingerprint.reserve(16 * 16 * 3);
+        for (int y = 0; y < 16; ++y) {
+            for (int x = 0; x < 16; ++x) {
+                const auto& px = tiny.at<cv::Vec3b>(y, x);
+                fingerprint.push_back(static_cast<char>(px[0]));
+                fingerprint.push_back(static_cast<char>(px[1]));
+                fingerprint.push_back(static_cast<char>(px[2]));
+            }
+        }
+        if (fingerprint == last_fingerprint) {
+            break;
+        }
+        last_fingerprint = fingerprint;
+
+        const int max_row = rows.empty() ? 480 : *std::max_element(rows.begin(), rows.end());
+        const int scroll = std::max(170, std::min(560, max_row - 300));
+        const int distance = static_cast<int>(std::lround(static_cast<double>(scroll) / 0.92));
+        drag_segments(panel_x + 790.0, 950.0, panel_x + 790.0, 950.0 - distance, 14, 30, 500);
+        sleep_ms(600);
+        auto next = frame();
+        if (!next.has_value()) {
+            return false;
+        }
+        info = *next;
     }
 
+    // 列表翻到底：task 目标允许直接沿用当前策略
+    if (by_task && skipped_by_goal) {
+        auto f = frame();
+        if (f.has_value() && f->screen == ScreenState::Strategy) {
+            const std::string picked = strategy_from_panel(*f);
+            if (!picked.empty() && has_text_regex(f->texts, "^确认选择$")) {
+                m_current_strategy = picked;
+                log_info("选择 " + picked + " · 未找到对应盟约的策略，使用当前策略");
+                if (auto hit = find_text_regex(f->texts, "^确认选择$")) {
+                    tap(hit->cx, hit->cy, 350);
+                }
+                wait_for(
+                    [](const ScreenInfo& s) {
+                        return s.screen == ScreenState::Squad || s.screen == ScreenState::Prep;
+                    },
+                    15000);
+                return true;
+            }
+        }
+    }
+
+    // 是否全部达标
+    bool all_done = true;
+    for (const auto& sr : m_strategies) {
+        if (!sr.available) {
+            continue;
+        }
+        const int p = m_strategy_clears.count(sr.name) ? m_strategy_clears[sr.name] : 0;
+        if (p < target) {
+            all_done = false;
+            break;
+        }
+    }
+    if (all_done) {
+        log_info("所有极速模式可用策略均已获得刻章");
+        return false;
+    }
+    log_info("已到策略列表末尾，但尚有策略进度未核实；请检查锁定策略或识别结果");
     return false;
+}
+
+std::string SPAFarmTaskPlugin::strategy_from_panel(const ScreenInfo& info) const
+{
+    // `mt(I)` —— service.pretty.mjs L8598-8606
+    //   取 x>1450 && 500<y<640 的文本，拼起来去掉空白与 “”·
+    //   再做 12 个字的繁→简替换，然后找「名字包含于该串」的策略
+    std::string joined;
+    for (const auto& it : info.texts) {
+        if (it.x > 1450 && it.y > 500 && it.y < 640) {
+            joined += it.text;
+        }
+    }
+    auto clean = [](std::string_view sv) {
+        std::string out;
+        for (const auto& ch : split_utf8_chars(sv)) {
+            if (ch == "\u201c" || ch == "\u201d" || ch == "·" || ch == " ") {
+                continue;
+            }
+            if (ch.size() == 1 && (ch[0] == ' ' || ch[0] == '\t' || ch[0] == '\n' || ch[0] == '\r')) {
+                continue;
+            }
+            out += ch;
+        }
+        return out;
+    };
+    // JS 只替换这 12 个常见繁体字
+    auto to_simplified = [](std::string s) {
+        static const std::vector<std::pair<std::string_view, std::string_view>> kMap = {
+            { "傑", "杰" }, { "奧", "奥" }, { "維", "维" }, { "絲", "丝" }, { "羅", "罗" }, { "麗", "丽" },
+            { "亞", "亚" }, { "爾", "尔" }, { "諾", "诺" }, { "達", "达" }, { "馬", "马" },
+        };
+        for (const auto& [from, to] : kMap) {
+            size_t pos = 0;
+            while ((pos = s.find(from, pos)) != std::string::npos) {
+                s.replace(pos, from.size(), to);
+                pos += to.size();
+            }
+        }
+        return s;
+    };
+
+    const std::string panel = to_simplified(clean(joined));
+    for (const auto& sr : m_strategies) {
+        // medal 目标只在 available 里找；task 目标在全部策略里找
+        if (m_goal == "medal" && !sr.available) {
+            continue;
+        }
+        const std::string name = to_simplified(clean(sr.name));
+        if (!name.empty() && panel.find(name) != std::string::npos) {
+            return sr.name;
+        }
+    }
+    return {};
 }
 
 void SPAFarmTaskPlugin::handle_squad_screen(const cv::Mat& img, const std::vector<OcrItem>& items)
 {
-    // Exact 1:1 port of `squad` handler in service.pretty.mjs lines 10420-10423
+    // `squad` 分支 —— service.pretty.mjs L10420-10423
+    //   `if (D.screen === "squad") { await W(D, /准备就绪/), await pe(3e3); continue }`
+    //   自选编队页只需要点「准备就绪」，没有任何干员打分/禁用位处理。
     (void)img;
-    std::vector<std::pair<double, double>> banned;
-    for (const auto& it : items) {
-        if (it.text.find("禁用") != std::string::npos) {
-            banned.emplace_back(it.cx, it.cy);
-        }
+    if (auto ready = find_text_regex(items, "准备就绪")) {
+        tap(ready->cx, ready->cy, static_cast<int>(std::lround(3000.0 * m_step_scale)));
     }
-    std::unordered_map<std::string, int> empty_owned;
-    std::unordered_set<std::string> active_bonds(m_active_core_bonds.begin(), m_active_core_bonds.end());
-
-    for (auto [lo_y, hi_y] : { std::pair<int, int> { 380, 520 }, std::pair<int, int> { 760, 900 } }) {
-        struct CandOp
-        {
-            double cx = 0.0;
-            double cy = 0.0;
-            double score = 0.0;
-        };
-        std::vector<CandOp> row_cands;
-        for (const auto& it : items) {
-            if (it.cy < lo_y || it.cy > hi_y || it.text.find("禁用") != std::string::npos) {
-                continue;
-            }
-            bool is_banned = false;
-            for (auto [bx, by] : banned) {
-                if (std::abs(it.cx - bx) < 90.0 && (by - it.cy) > 0.0 && (by - it.cy) < 85.0) {
-                    is_banned = true;
-                    break;
-                }
-            }
-            if (is_banned) {
-                continue;
-            }
-            auto cm = match_dict(it.text, m_chess_dict);
-            double sc = 10.0;
-            if (!cm.empty()) {
-                if (const auto* op = find_operator(cm.front().name)) {
-                    sc = score_operator_for_plan(*op, empty_owned, active_bonds);
-                }
-            }
-            row_cands.push_back(CandOp { it.cx, it.cy, sc });
-        }
-        std::sort(row_cands.begin(), row_cands.end(), [](const CandOp& a, const CandOp& b) {
-            return a.score > b.score;
-        });
-        for (size_t i = 0; i < std::min<size_t>(2, row_cands.size()); ++i) {
-            tap(row_cands[i].cx, row_cands[i].cy - 170.0, 380);
-        }
-    }
-
-    // CRITICAL FIX: Never click `"确定自选编队"` (which is the top header title)!
-    // Click `"准备就绪"` or bottom-right button ROI `[1300, 820, 1920, 1080]`, fallback `(1686, 986)`.
-    log_info("界面: 确定自选编队 -> 完成干员勾选并点击右下角准备就绪");
-    if (auto hit = find_ocr(items, { "准备就绪", "开始模拟" })) {
-        tap(hit->cx, hit->cy, 1500);
-    }
-    else if (auto roi_hit = find_ocr_in_roi(items, { "确认选择", "确认", "确定" }, 1300, 820, 1920, 1080)) {
-        tap(roi_hit->cx, roi_hit->cy, 1500);
+    else if (auto ready2 = find_text_regex(items, "^准备就绪$")) {
+        tap(ready2->cx, ready2->cy, static_cast<int>(std::lround(3000.0 * m_step_scale)));
     }
     else {
-        tap(1686, 986, 1500);
+        log_info("自选编队页没找到「准备就绪」");
     }
 }
 
 void SPAFarmTaskPlugin::handle_info_screen(const cv::Mat& img, const std::vector<OcrItem>& items)
 {
-    // Exact 1:1 port of `ln` (lines 9627-9650) & `info` screen handler (lines 10340-10358) in service.pretty.mjs:
-    // Inspects active core bonds on `确认本局信息` / `本局信息` screen and switches core bonds if `精准` or `奥术` is banned!
+    // `ye` L10340-10358 的 info 分支 + `ln()`（L9627-9651）
+    // 说明：`ln` 在读取完本局信息后调用，用于把「核心盟约」切到目标盟约更多的分组。
     m_match_info_read = true;
     if (auto info = read_info_screen(img)) {
+        // `l`（本局已激活盟约）：只用于筛选「当前可用的聚焦盟约」，
+        // 不覆盖 `m_active_core_bonds`（那是 goal 决定的聚焦盟约 `st`，运行期不变）。
+        m_active_bond_names.clear();
         std::vector<std::string> active_cores;
         for (const auto& b : info->bonds) {
+            if (b.active) {
+                m_active_bond_names.push_back(b.name);
+            }
             if (b.core && b.active) {
                 active_cores.push_back(b.name);
-            }
-        }
-        if (m_goal == "medal" && !active_cores.empty()) {
-            std::vector<std::string> chosen;
-            for (std::string_view pref : { "精准", "奥术", "迅捷", "强攻", "守望", "坚城" }) {
-                if (std::find(active_cores.begin(), active_cores.end(), pref) != active_cores.end()) {
-                    chosen.emplace_back(pref);
-                    if (chosen.size() >= 2) {
-                        break;
-                    }
-                }
-            }
-            if (!chosen.empty()) {
-                m_active_core_bonds = chosen;
             }
         }
         std::string bond_str;
@@ -6686,11 +12189,19 @@ void SPAFarmTaskPlugin::handle_info_screen(const cv::Mat& img, const std::vector
             }
             bond_str += cb;
         }
+        std::string active_str;
+        for (const auto& ab : m_active_bond_names) {
+            if (!active_str.empty()) {
+                active_str += "/";
+            }
+            active_str += ab;
+        }
         if (!info->boss.empty()) {
             m_current_boss = info->boss;
         }
         log_info(
             "界面: 确认本局信息 (主抓核心盟约: " + bond_str
+            + " | 已激活: " + (active_str.empty() ? "无" : active_str)
             + (info->boss.empty() ? "" : (" | 敌方领袖: " + info->boss)) + ")");
     }
     else {
@@ -6715,147 +12226,734 @@ void SPAFarmTaskPlugin::handle_info_screen(const cv::Mat& img, const std::vector
     else {
         tap(1805, 65, 700);
     }
+
+    // `be() && await ln()`：task 目标才切核心盟约分组
+    if (m_goal != "medal") {
+        ScreenInfo info_state = classify_screen(img);
+        switch_core_bond_group(info_state);
+    }
 }
 
 void SPAFarmTaskPlugin::handle_three_choice_screen(const cv::Mat& img, const std::vector<OcrItem>& items)
 {
-    // Exact 1:1 port of `K(I, k)` in service.pretty.mjs lines 10252-10335
+    // `K(I)` —— service.pretty.mjs L9679-9697
+    //   三张卡（x 中心 475/990/1500）：收集 380<y<720 且 |cx-中心|<260 的文本，按 y 再 x 排序拼接
+    //   命中装备名 → 按分类打分（output/stack=3, utility=2, defense=1, debuff=-1）
+    //   取最高分 → 点 (cx, 540)
     (void)img;
-    double best_x = 960.0;
-    double best_score = -1.0;
+    static constexpr int kCenters[3] = { 475, 990, 1500 };
+    static const std::unordered_map<std::string, int> kScore = {
+        { "output", 3 }, { "stack", 3 }, { "utility", 2 }, { "defense", 1 }, { "debuff", -1 },
+    };
 
-    std::unordered_map<std::string, int> owned;
-    for (const auto& u : m_units) {
-        if (!u.name.empty()) {
-            owned[u.name]++;
+    struct Card
+    {
+        int cx = 0;
+        std::string text;
+        int score = 0;
+    };
+    std::vector<Card> cards;
+    cards.reserve(3);
+
+    for (int center : kCenters) {
+        std::vector<const OcrItem*> picked;
+        for (const auto& it : items) {
+            if (it.y <= 380 || it.y >= 720) {
+                continue;
+            }
+            if (std::abs(it.cx - center) >= 260) {
+                continue;
+            }
+            picked.push_back(&it);
         }
-    }
-    std::unordered_set<std::string> active_bonds(m_active_core_bonds.begin(), m_active_core_bonds.end());
-
-    // Find all `选择` buttons or evaluate card columns (560, 960, 1360)
-    std::vector<OcrItem> btns;
-    for (const auto& it : items) {
-        if ((it.text == "选择" || it.text == "选取") && it.cy > 500 && it.cy < 950) {
-            btns.push_back(it);
+        std::sort(picked.begin(), picked.end(), [](const OcrItem* a, const OcrItem* b) {
+            if (a->y != b->y) {
+                return a->y < b->y;
+            }
+            return a->x < b->x;
+        });
+        std::string text;
+        for (const auto* it : picked) {
+            text += strip_ws(it->text);
         }
-    }
 
-    for (const auto& it : items) {
-        auto cm = match_dict(it.text, m_chess_dict);
-        if (!cm.empty()) {
-            if (const auto* op = find_operator(cm.front().name)) {
-                double sc = score_operator_for_plan(*op, owned, active_bonds);
-                if (sc > best_score) {
-                    best_score = sc;
-                    best_x = it.cx;
-                }
+        int score = 0;
+        for (const auto& item : m_items) {
+            if (!item.name.empty() && text.find(item.name) != std::string::npos) {
+                const std::string cat = classify_item_category(item.name, item.effect);
+                auto sit = kScore.find(cat);
+                score = (sit != kScore.end()) ? sit->second : 0;
+                break;
             }
         }
+        cards.push_back(Card { center, text, score });
     }
 
-    if (!btns.empty()) {
-        const OcrItem* chosen_btn = &btns.front();
-        double min_dx = 1e9;
-        for (const auto& b : btns) {
-            double dx = std::abs(b.cx - best_x);
-            if (dx < min_dx) {
-                min_dx = dx;
-                chosen_btn = &b;
-            }
-        }
-        log_info("界面: 三选一奖励 -> 点击选择 (" + std::to_string(static_cast<int>(chosen_btn->cx)) + "," + std::to_string(static_cast<int>(chosen_btn->cy)) + ")");
-        tap(chosen_btn->cx, chosen_btn->cy, 600);
+    if (cards.empty()) {
+        return;
     }
-    else {
-        log_info("界面: 三选一奖励 -> 选择中间项并确认");
-        tap(960, 520, 400);
-    }
-
-    if (auto conf = find_ocr_in_roi(items, { "确认", "确定" }, 500, 700, 1600, 1060)) {
-        tap(conf->cx, conf->cy, 800);
-    }
+    std::stable_sort(cards.begin(), cards.end(), [](const Card& a, const Card& b) {
+        return a.score > b.score;
+    });
+    const Card& best = cards.front();
+    log_info("三选一：选「" + best.text.substr(0, 48) + "」");
+    tap(best.cx, 540, 1000);
 }
 
 void SPAFarmTaskPlugin::handle_decision_screen(const cv::Mat& img, const std::vector<OcrItem>& items)
 {
-    // Exact 1:1 port of `ce(I, k)` in service.pretty.mjs lines 10337-10378
+    // `ce(I)` —— service.pretty.mjs L9698-9721
+    //   三张卡分别打分：
+    //     含【目标盟约】且有「层数+N」 → 100 + N
+    //     含「资金」            → 50 + 「获得N资金」(缺省 1)
+    //     含「层数」            → 10
+    //   取最高 → 点 (cx, 540) → 若还有「战术决策」+「确认」则再点确认
     (void)img;
-    log_info("界面: 战术决策 -> 选择第一项并确认选择");
-    tap(450, 300, 400);
-    if (auto conf = find_ocr_exact(items, { "确认选择", "确认" })) {
-        tap(conf->cx, conf->cy, 1000);
+    static constexpr int kCenters[3] = { 475, 990, 1500 };
+
+    auto bracketed = [](const std::string& s) {
+        std::vector<std::string> out;
+        const std::string open = "【";
+        const std::string close = "】";
+        size_t pos = 0;
+        while (true) {
+            const size_t a = s.find(open, pos);
+            if (a == std::string::npos) {
+                break;
+            }
+            const size_t b = s.find(close, a + open.size());
+            if (b == std::string::npos) {
+                break;
+            }
+            out.push_back(s.substr(a + open.size(), b - (a + open.size())));
+            pos = b + close.size();
+        }
+        return out;
+    };
+
+    struct Card
+    {
+        int cx = 0;
+        std::string text;
+        int score = 0;
+    };
+    std::vector<Card> cards;
+    cards.reserve(3);
+
+    for (int center : kCenters) {
+        std::vector<const OcrItem*> picked;
+        for (const auto& it : items) {
+            if (it.y <= 380 || it.y >= 720) {
+                continue;
+            }
+            if (std::abs(it.cx - center) >= 260) {
+                continue;
+            }
+            picked.push_back(&it);
+        }
+        std::sort(picked.begin(), picked.end(), [](const OcrItem* a, const OcrItem* b) {
+            if (a->y != b->y) {
+                return a->y < b->y;
+            }
+            return a->x < b->x;
+        });
+        std::string text;
+        for (const auto* it : picked) {
+            text += strip_ws(it->text);
+        }
+
+        const auto names = bracketed(text);
+        int layers = 0;
+        if (auto d = regex_first_group(text, "层数\\+([0-9]+)")) {
+            layers = std::stoi(*d);
+        }
+        const bool hits_focus = std::any_of(names.begin(), names.end(), [&](const std::string& n) {
+            return std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), n) != m_active_core_bonds.end();
+        });
+
+        int score = 0;
+        if (hits_focus && layers > 0) {
+            score = 100 + layers;
+        }
+        else if (text.find("资金") != std::string::npos) {
+            int gain = 1;
+            if (auto d = regex_first_group(text, "获得([0-9]+)资金")) {
+                gain = std::stoi(*d);
+            }
+            score = 50 + gain;
+        }
+        else if (text.find("层数") != std::string::npos) {
+            score = 10;
+        }
+        cards.push_back(Card { center, text, score });
     }
-    else {
-        tap(320, 480, 1000);
+
+    if (cards.empty()) {
+        return;
     }
+    std::stable_sort(cards.begin(), cards.end(), [](const Card& a, const Card& b) {
+        return a.score > b.score;
+    });
+    const Card& best = cards.front();
+    log_info("战术决策：选「" + best.text.substr(0, 72) + "」");
+    tap(best.cx, 540, 800);
+
+    cv::Mat after = shot();
+    if (after.empty()) {
+        return;
+    }
+    auto after_items = ocr(after);
+    auto confirm = find_text_regex(after_items, "^确认");
+    if (confirm.has_value() && has_text_regex(after_items, "战术决策")) {
+        tap(confirm->cx, confirm->cy, 800);
+    }
+    sleep_ms(800);
 }
 
 // ============================================================================
 // Main Run Loop (`_run`, 1:1 with `ye` in service.pretty.mjs lines 10256-10530)
 // ============================================================================
 
+std::vector<int> SPAFarmTaskPlugin::detect_strategy_rows(const cv::Mat& img, bool selected) const
+{
+    // `Ft(I)` —— service.pretty.mjs L8683-8719（`pc` 恒 false，不走 `Or`）
+    //   k = selected ? 586 : 982
+    //   对 x ∈ [160,1050) 竖扫 y ∈ [k+218, k+390)：R∈(27,180) 且 max-min<16 的像素 > 100 → 记列
+    //   连续列分段（间隙 >2 断开），每段取中点；只保留 x<850 且右侧 175..200 内有邻居的
+    //   再剔除同簇（|dx|<40）里 186 偏差更大的
+    std::vector<int> rows;
+    if (img.empty()) {
+        return rows;
+    }
+    const RawRgb raw = img_to_rgb(img);
+    if (raw.width == 0) {
+        return rows;
+    }
+    const int k = selected ? 586 : 982;
+
+    std::vector<int> cols;
+    for (int x = 160; x < 1050; ++x) {
+        int v = 0;
+        for (int ie = 218; ie < 390; ++ie) {
+            const int yy = k + ie;
+            if (yy < 0 || yy >= raw.height) {
+                continue;
+            }
+            const size_t idx = (static_cast<size_t>(yy) * raw.width + static_cast<size_t>(x)) * 3;
+            const int R = raw.data[idx];
+            const int G = raw.data[idx + 1];
+            const int B = raw.data[idx + 2];
+            const int mx = std::max({ R, G, B });
+            const int mn = std::min({ R, G, B });
+            if (R > 27 && R < 180 && (mx - mn) < 16) {
+                ++v;
+            }
+        }
+        if (v > 100) {
+            cols.push_back(x);
+        }
+    }
+
+    std::vector<std::pair<int, int>> segs;
+    for (int x : cols) {
+        if (segs.empty() || x - segs.back().second > 2) {
+            segs.emplace_back(x, x);
+        }
+        else {
+            segs.back().second = x;
+        }
+    }
+
+    std::vector<int> centers;
+    centers.reserve(segs.size());
+    for (const auto& [a, b] : segs) {
+        centers.push_back(static_cast<int>(std::lround((a + b) / 2.0)));
+    }
+
+    auto tail_gap = [&](int x) -> double {
+        double best = std::numeric_limits<double>::infinity();
+        for (int v : centers) {
+            const int d = v - x;
+            if (d >= 175 && d <= 200) {
+                best = std::min(best, static_cast<double>(std::abs(v - x - 186)));
+            }
+        }
+        return best;
+    };
+
+    std::vector<int> cand;
+    for (int x : centers) {
+        if (x < 850 && std::isfinite(tail_gap(x))) {
+            cand.push_back(x);
+        }
+    }
+    for (int x : cand) {
+        bool drop = false;
+        for (int v : cand) {
+            if (v == x || std::abs(v - x) >= 40) {
+                continue;
+            }
+            if (tail_gap(v) < tail_gap(x) || (tail_gap(v) == tail_gap(x) && v > x)) {
+                drop = true;
+                break;
+            }
+        }
+        if (!drop) {
+            rows.push_back(x);
+        }
+    }
+    return rows;
+}
+
+bool SPAFarmTaskPlugin::is_personal_selected(const cv::Mat& img, const std::vector<OcrItem>& items) const
+{
+    // `wi(a, s)` —— service.pretty.mjs L4753-4765
+    //   Te(/^个人模拟$/) 且 score >= .75
+    //   取 box 右侧 6px 处 8×round(h*0.5) 的竖条，统计“近白中性色”(min>150 && max-min<40) 占比 > .75
+    auto hit = find_text_regex(items, "^个人模拟$");
+    if (!hit.has_value() || hit->score < 0.75) {
+        return false;
+    }
+    const int left = static_cast<int>(std::lround(static_cast<double>(hit->x + hit->w) + 6.0));
+    const int top = static_cast<int>(std::lround(static_cast<double>(hit->y) + hit->h * 0.25));
+    const int height = std::max(1, static_cast<int>(std::lround(static_cast<double>(hit->h) * 0.5)));
+    if (left < 0 || top < 0 || left + 8 > img.cols || top + height > img.rows) {
+        return false;
+    }
+    cv::Mat crop = img_crop(img, left, top, 8, height);
+    if (crop.empty()) {
+        return false;
+    }
+    const RawRgb raw = img_to_rgb(crop);
+    int white = 0;
+    const int total = 8 * height;
+    for (size_t i = 0; i + 2 < raw.data.size(); i += 3) {
+        const int R = raw.data[i];
+        const int G = raw.data[i + 1];
+        const int B = raw.data[i + 2];
+        const int mn = std::min({ R, G, B });
+        const int mx = std::max({ R, G, B });
+        if (mn > 150 && (mx - mn) < 40) {
+            ++white;
+        }
+    }
+    return total > 0 && static_cast<double>(white) / total > 0.75;
+}
+
+void SPAFarmTaskPlugin::set_mode(const std::string& mode)
+{
+    // `ls(a)` L7946-7953：`_t.mode = a; _t.lastRound = a === "standard" ? 14 : 9`
+    m_mode = (mode == "standard") ? "standard" : "quick";
+    m_last_round = (m_mode == "standard") ? 14 : 9;
+}
+
+std::optional<SPAFarmTaskPlugin::ScreenInfo> SPAFarmTaskPlugin::wait_for(
+    const std::function<bool(const ScreenInfo&)>& pred,
+    int timeout_ms)
+{
+    // `V(I, k = 1e4)`：每 200ms 抓一帧分类，超时返回 null
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    while (std::chrono::steady_clock::now() < deadline && !need_exit()) {
+        cv::Mat img = shot();
+        if (!img.empty()) {
+            ScreenInfo info = classify_screen(img);
+            if (pred(info)) {
+                return info;
+            }
+        }
+        sleep_ms(200);
+    }
+    return std::nullopt;
+}
+
+bool SPAFarmTaskPlugin::handle_lobby_quick(ScreenInfo info)
+{
+    // `ys(a, s)` —— service.pretty.mjs L8415-8427
+    if (info.screen == ScreenState::Lobby) {
+        if (!info.personal_selected && !info.quick) {
+            // 必须先能确认「同盟模拟 + 搜寻队友」才敢切个人模拟
+            bool union_tab = false;
+            bool search_team = false;
+            for (const auto& it : info.texts) {
+                if (it.score >= 0.75 && regex_test(strip_ws(it.text), "^同盟模拟$")) {
+                    union_tab = true;
+                }
+                if (it.score >= 0.75 && regex_test(strip_ws(it.text), "^搜寻队友$")) {
+                    search_team = true;
+                }
+            }
+            if (!(union_tab && search_team)) {
+                log_info("无法确认个人/联合模拟，等待确认后再切换");
+                return false;
+            }
+            log_info("活动主页 · 从联合切换个人模拟");
+            if (auto hit = find_text_regex(info.texts, "^个人模拟$")) {
+                tap(hit->cx, hit->cy, 350);
+            }
+        }
+        auto lobby = wait_for(
+            [](const ScreenInfo& s) {
+                return s.screen == ScreenState::Lobby && s.personal_selected && s.quick;
+            },
+            15000);
+        if (!lobby.has_value()) {
+            log_info("个人模拟确认超时");
+            return false;
+        }
+        log_info("个人模拟已确认 · 进入极速模拟");
+        if (auto hit = find_text_regex(lobby->texts, "^极速模拟$")) {
+            tap(hit->cx, hit->cy, 350);
+        }
+        auto next = wait_for(
+            [](const ScreenInfo& s) {
+                return s.quick
+                    && (s.screen == ScreenState::Mode || s.screen == ScreenState::Info
+                        || s.screen == ScreenState::Strategy);
+            },
+            15000);
+        if (!next.has_value()) {
+            log_info("极速模拟页面切换超时");
+            return false;
+        }
+        info = *next;
+    }
+
+    if (info.screen == ScreenState::Mode) {
+        if (!info.quick) {
+            log_info("当前模式不是极速模拟，等待正确模式后继续");
+            return false;
+        }
+        log_info("极速模拟已确认 · 开始模拟");
+        if (auto hit = find_text_regex(info.texts, "^开始模拟$")) {
+            tap(hit->cx, hit->cy, 350);
+        }
+        wait_for(
+            [](const ScreenInfo& s) {
+                return s.quick && (s.screen == ScreenState::Info || s.screen == ScreenState::Strategy);
+            },
+            20000);
+    }
+    return true;
+}
+
+bool SPAFarmTaskPlugin::handle_lobby_standard(ScreenInfo info, const std::string& level_name)
+{
+    // `xs(a, s, e = "规程等级1")` —— service.pretty.mjs L8429-8448
+    if (info.screen == ScreenState::Lobby) {
+        if (!info.personal_selected) {
+            bool union_tab = false;
+            bool search_team = false;
+            for (const auto& it : info.texts) {
+                if (it.score >= 0.75 && regex_test(strip_ws(it.text), "^同盟模拟$")) {
+                    union_tab = true;
+                }
+                if (it.score >= 0.75 && regex_test(strip_ws(it.text), "^搜寻队友$")) {
+                    search_team = true;
+                }
+            }
+            if (!(union_tab && search_team)) {
+                log_info("无法确认个人/联合模拟，等待确认后再切换");
+                return false;
+            }
+            log_info("活动主页 · 从联合切换个人模拟");
+            if (auto hit = find_text_regex(info.texts, "^个人模拟$")) {
+                tap(hit->cx, hit->cy, 350);
+            }
+        }
+        auto lobby = wait_for(
+            [](const ScreenInfo& s) {
+                return s.screen == ScreenState::Lobby && s.personal_selected;
+            },
+            15000);
+        if (!lobby.has_value()) {
+            log_info("个人模拟确认超时");
+            return false;
+        }
+        log_info("个人模拟已确认 · 进入独立模拟");
+        if (auto hit = find_text_regex(lobby->texts, "^独立模拟$")) {
+            tap(hit->cx, hit->cy, 350);
+        }
+        auto next = wait_for(
+            [](const ScreenInfo& s) {
+                return s.screen == ScreenState::Mode || s.screen == ScreenState::Info
+                    || s.screen == ScreenState::Strategy;
+            },
+            15000);
+        if (!next.has_value()) {
+            log_info("独立模拟页面切换超时");
+            return false;
+        }
+        info = *next;
+    }
+
+    if (info.screen == ScreenState::Mode) {
+        const int target = [&]() {
+            if (auto d = regex_first_group(level_name, "([0-9]+)")) {
+                return std::stoi(*d);
+            }
+            return 1;
+        }();
+
+        for (int i = 0; i < 12 && info.levelName != level_name; ++i) {
+            const int cur = [&]() {
+                if (auto d = regex_first_group(info.levelName, "([0-9]+)")) {
+                    return std::stoi(*d);
+                }
+                return 99;
+            }();
+            const int steps = std::min(4, std::max(1, std::abs(cur - target)));
+            if (cur > target) {
+                drag_segments(1650, 820, 1650, 820 - 200 * steps, 14, 25, 300);
+            }
+            else {
+                drag_segments(1650, 300, 1650, 300 + 200 * steps, 14, 25, 300);
+            }
+            sleep_ms(700);
+            cv::Mat img = shot();
+            if (img.empty()) {
+                return false;
+            }
+            info = classify_screen(img);
+        }
+        if (info.levelName != level_name) {
+            log_info("难度页没能选中【" + level_name + "】（当前 " + (info.levelName.empty() ? "未识别" : info.levelName) + "）");
+            return false;
+        }
+        log_info(level_name + "已确认 · 开始模拟");
+        if (auto hit = find_text_regex(info.texts, "^开始模拟$")) {
+            tap(hit->cx, hit->cy, 350);
+        }
+        wait_for(
+            [](const ScreenInfo& s) {
+                return s.quick && (s.screen == ScreenState::Info || s.screen == ScreenState::Strategy);
+            },
+            20000);
+    }
+    return true;
+}
+
+void SPAFarmTaskPlugin::switch_core_bond_group(const ScreenInfo& info)
+{
+    // `ln()` —— service.pretty.mjs L9627-9651
+    //   在本局信息页找「核心盟约」里属于目标盟约(st)的那几个，
+    //   统计左（cx<680）/右两列哪个多，若该列还有未激活的，就点该列上方切换分组
+    if (info.screen != ScreenState::Info) {
+        return;
+    }
+    std::set<std::string> core_names;
+    for (const auto& b : m_bonds) {
+        if (b.is_core) {
+            core_names.insert(b.name);
+        }
+    }
+
+    struct Hit
+    {
+        const OcrItem* it = nullptr;
+        std::string name;
+    };
+    std::vector<Hit> hits;
+    for (const auto& it : info.texts) {
+        if (it.x >= 1340 || it.y <= 380 || it.y >= 740) {
+            continue;
+        }
+        const std::string name = strip_ws(it.text);
+        if (core_names.count(name) > 0) {
+            hits.push_back(Hit { &it, name });
+        }
+    }
+
+    std::vector<Hit> focus;
+    for (const auto& h : hits) {
+        if (std::find(m_active_core_bonds.begin(), m_active_core_bonds.end(), h.name)
+            != m_active_core_bonds.end()) {
+            focus.push_back(h);
+        }
+    }
+    if (focus.empty()) {
+        return;
+    }
+
+    auto center_x = [](const Hit& h) {
+        return h.it->x + h.it->w * 0.5;
+    };
+    auto side_of = [&](const Hit& h) {
+        return center_x(h) < 680.0 ? std::string("left") : std::string("right");
+    };
+    const int left_cnt = static_cast<int>(std::count_if(focus.begin(), focus.end(), [&](const Hit& h) {
+        return side_of(h) == "left";
+    }));
+    const int right_cnt = static_cast<int>(focus.size()) - left_cnt;
+    const std::string side = (right_cnt > left_cnt) ? "right" : "left";
+
+    auto is_active = [&](const std::string& name) {
+        auto it = m_active_bond_names.end();
+        it = std::find(m_active_bond_names.begin(), m_active_bond_names.end(), name);
+        return it != m_active_bond_names.end();
+    };
+
+    std::vector<Hit> on_side;
+    for (const auto& h : focus) {
+        if (side_of(h) == side) {
+            on_side.push_back(h);
+        }
+    }
+    if (on_side.empty()) {
+        return;
+    }
+    if (std::all_of(on_side.begin(), on_side.end(), [&](const Hit& h) {
+            return is_active(h.name);
+        })) {
+        return;
+    }
+
+    std::vector<Hit> all_side;
+    for (const auto& h : hits) {
+        if (side_of(h) == side) {
+            all_side.push_back(h);
+        }
+    }
+    if (all_side.empty()) {
+        return;
+    }
+    double sum_x = 0.0;
+    double sum_y = 0.0;
+    for (const auto& h : all_side) {
+        sum_x += center_x(h);
+        sum_y += h.it->y;
+    }
+    const double click_x = sum_x / all_side.size();
+    const double click_y = sum_y / all_side.size() - 70.0;
+    tap(click_x, click_y, 600);
+
+    cv::Mat after = shot();
+    if (after.empty()) {
+        return;
+    }
+    ScreenInfo next = classify_screen(after);
+    // 重新读本局信息，更新已激活盟约
+    if (auto data = read_info_screen(after)) {
+        m_active_bond_names.clear();
+        for (const auto& b : data->bonds) {
+            if (b.active) {
+                m_active_bond_names.push_back(b.name);
+            }
+        }
+    }
+    const bool all_now_active = std::all_of(on_side.begin(), on_side.end(), [&](const Hit& h) {
+        return is_active(h.name);
+    });
+    std::string names;
+    for (const auto& h : on_side) {
+        if (!names.empty()) {
+            names += "、";
+        }
+        names += h.name;
+    }
+    if (all_now_active) {
+        log_info("核心盟约改选" + std::string(side == "left" ? "左" : "右") + "组（含 " + names + "）");
+    }
+    else {
+        log_info("核心盟约改选" + std::string(side == "left" ? "左" : "右") + "组后仍未确认 " + names
+                 + " 可用，请检查本局信息页");
+    }
+    (void)next;
+}
+
 bool SPAFarmTaskPlugin::_run()
 {
     LogTraceFunction;
     load_all_data();
     reset_match_state();
-
+    // 数据到位后重算 `ht`（`en(goal)` 的 stackers 依赖 chess.traits）
+    rebuild_stacker_names();
     log_info(
-        "启动卫戍协议自动刷章任务 | 模式:" + m_goal
-        + " | 配置:" + m_profile
-        + " | 目标通关次数:" + std::to_string(m_target)
-        + " | 计划通关上限:" + std::to_string(m_runs) + "局");
+        "启动卫戍协议自动刷章 | 目标:" + m_goal + " | 配置:" + m_profile
+        + " | 目标通关:" + std::to_string(m_target) + " | 局数上限:" + std::to_string(m_runs));
 
+    // 说明：本函数是 `ye(I)`（service.pretty.mjs L10230-10460）的接线骨架。
+    // 各页面处理函数（`ys`/`Ot`/`je`/`K`/`ce`/`ln`）在 M2 内逐个替换为逐行实现，
+    // 全部就位后再按 `ye` 的完整分支顺序（含中途接管 `l` 标志）收口一次。
     double last_garrison_seen = now_sec();
-    double last_progress_time = now_sec();
-    int unknown_streak = 0;
+    double last_progress = now_sec();
+    bool result_counted = false;
     std::string stop_reason = "已达到设定通关局数上限";
     bool finished_ok = true;
 
-    while (m_runs_completed < m_runs && !need_exit()) {
-        if (m_attempts > 0 && m_attempts_done >= m_attempts) {
-            stop_reason = "已达到设定最大尝试场次上限 (" + std::to_string(m_attempts) + " 场)";
-            break;
-        }
-
-        if (now_sec() - last_progress_time > kStallTimeoutSec) {
-            stop_reason = "超过 10 分钟无实质进展，触发防卡死保护停止";
-            finished_ok = false;
-            break;
-        }
-
+    while (!need_exit()) {
         cv::Mat img = shot();
         if (img.empty()) {
-            sleep_sec(1.0);
+            sleep_ms(1000);
             continue;
         }
+        ScreenInfo info = classify_screen(img);
+        const auto& items = info.texts;
 
-        auto items = ocr(img);
-
-        // Global overlay checks matching `handleScreen` in service.pretty.mjs (lines 10256-10319)
-        if (has_ocr(items, { "数据已更新", "即将进行同步" })) {
+        // ---- 全局浮层（顺序与 `ye` L10256-10319 一致）----
+        if (has_text_regex(items, "暂时离开模拟")) {
+            if (auto hit = find_text_regex(items, "^取消$")) {
+                tap(hit->cx, hit->cy, 800);
+            }
+            else {
+                tap(480, 727, 800);
+            }
+            log_info("界面: 暂时离开模拟 -> 取消");
+            continue;
+        }
+        if (has_text_regex(items, "敌方领袖") && has_text_regex(items, "核心盟约")
+            && info.screen == ScreenState::Unknown) {
+            tap(1805, 65, 600);
+            continue;
+        }
+        if (has_text_regex(items, "数据已更新|即将进行同步")) {
             tap(960, 738, 3000);
+            log_info("界面: 游戏数据同步 -> 确认");
             continue;
         }
-        if (has_ocr(items, { "今日配给" })) {
+        if (has_text_regex(items, "今日配给")) {
             tap(960, 960, 1500);
             continue;
         }
-        if (has_ocr(items, { "签到", "许愿墙", "活动公告", "系统公告" })
-            && !has_ocr(items, { "个人模拟", "休息一下" })) {
-            tap(1822, 104, 500);
+        if (has_text_regex(items, "签到|许愿墙|活动公告|系统公告")
+            && !has_text_regex(items, "个人模拟|休息一下")) {
+            static constexpr int kClose[4][2] = { { 1822, 104 }, { 1868, 152 }, { 1848, 126 }, { 1808, 106 } };
+            for (const auto& xy : kClose) {
+                tap(xy[0], xy[1], 900);
+                cv::Mat after = shot();
+                if (!after.empty()
+                    && !has_text_regex(ocr(after), "签到|许愿墙|活动公告|系统公告")) {
+                    break;
+                }
+            }
             continue;
         }
-        if (has_ocr_exact(items, { "终端" }) && has_ocr(items, { "理智" })) {
+        if (has_text_regex(items, "^终端$") && has_text_regex(items, "理智")) {
             tap(1750, 215, 4000);
+            log_info("界面: 游戏主页 -> 从 Banner 进入卫戍协议");
+            continue;
+        }
+        if (info.screen == ScreenState::Lobby && has_text_regex(items, "断线重连")) {
+            if (auto hit = find_text_regex(items, "断线重连")) {
+                tap(hit->cx, hit->cy, 6000);
+            }
+            continue;
+        }
+        if (has_text_regex(items, "装备已满，请选择|销毁并替换")) {
+            tap(1846, 284, 800);
+            continue;
+        }
+        if (has_text_regex(items, "选定后将无法更改")) {
+            if (auto hit = find_text_regex(items, "^确认选择$")) {
+                tap(hit->cx, hit->cy, 1200);
+            }
+            else {
+                handle_three_choice_screen(img, items);
+            }
             continue;
         }
 
-        ScreenState state = classify_screen(img, items);
-
-        if (state != ScreenState::Unknown) {
+        if (info.screen != ScreenState::Unknown) {
             last_garrison_seen = now_sec();
-            unknown_streak = 0;
         }
         else if (now_sec() - last_garrison_seen > kLeaveTimeoutSec) {
             stop_reason = "连续 30 秒未检测到卫戍协议界面，自动停止";
@@ -6863,54 +12961,31 @@ bool SPAFarmTaskPlugin::_run()
             break;
         }
 
-        switch (state) {
-        case ScreenState::Lobby: {
-            log_info("界面: 卫戍协议主界面 -> 进入模拟");
-            if (auto hit = find_ocr(items, { "开始模拟", "极速模拟" })) {
-                tap(hit->cx, hit->cy, 2000);
-            }
-            else {
-                tap(1280, 1000, 2000);
-            }
-            last_progress_time = now_sec();
-            break;
-        }
+        switch (info.screen) {
+        case ScreenState::Lobby:
         case ScreenState::Mode: {
-            log_info("界面: 选择模拟模式 -> 点击个人模拟/极速模拟");
-            if (auto p_hit = find_ocr_exact(items, { "个人模拟" })) {
-                tap(p_hit->cx, p_hit->cy, 600);
+            // `ye` L10321：`X.mode === "standard" ? xs(...) : ys(...)`
+            const bool ok = (m_mode == "standard") ? handle_lobby_standard(info) : handle_lobby_quick(info);
+            if (!ok) {
+                sleep_ms(600);
             }
-            if (auto hit = find_ocr(items, { "开始模拟", "极速模拟" })) {
-                tap(hit->cx, hit->cy, 2200);
-            }
-            else {
-                tap(1700, 986, 2200);
-            }
-            reset_match_state();
-            last_progress_time = now_sec();
+            last_progress = now_sec();
             break;
         }
-        case ScreenState::Reconnect: {
-            // CRITICAL FIX: Never click dialog title `"断线重连"` at top of screen!
-            // Check dialog lower button area `[400, 520, 1520, 920]` for `重新连接`/`确定`/`确认`,
-            // or bottom-right lobby button area `[1250, 780, 1920, 1080]` for `断线重连`.
-            log_info("界面: 检测到断线重连/连接中断 -> 点击重连按钮");
-            if (auto dialog_btn = find_ocr_in_roi(items, { "重新连接", "确定", "确认" }, 400, 520, 1520, 920)) {
-                tap(dialog_btn->cx, dialog_btn->cy, 3500);
+        case ScreenState::Info: {
+            handle_info_screen(img, items);
+            if (auto hit = find_text_regex(items, "准备就绪")) {
+                tap(hit->cx, hit->cy, 800);
             }
-            else if (auto lobby_btn = find_ocr_in_roi(items, { "断线重连" }, 1250, 780, 1920, 1080)) {
-                tap(lobby_btn->cx, lobby_btn->cy, 3500);
-            }
-            else {
-                tap(1660, 970, 3500);
-            }
-            reset_match_state();
-            last_progress_time = now_sec();
+            result_counted = false;
+            last_progress = now_sec();
             break;
         }
         case ScreenState::Strategy: {
-            last_progress_time = now_sec();
-            if (!handle_strategy_screen(img)) {
+            if (handle_strategy_screen(img)) {
+                last_progress = now_sec();
+            }
+            else {
                 stop_reason = "全部可用策略均已达成 " + std::to_string(m_target) + " 次通关刻章目标";
                 finished_ok = true;
                 report_task_summary(stop_reason, finished_ok);
@@ -6919,163 +12994,70 @@ bool SPAFarmTaskPlugin::_run()
             break;
         }
         case ScreenState::Squad: {
-            last_progress_time = now_sec();
             handle_squad_screen(img, items);
+            last_progress = now_sec();
             break;
         }
-        case ScreenState::Info: {
-            last_progress_time = now_sec();
-            handle_info_screen(img, items);
-            break;
-        }
-        case ScreenState::Confirm: {
-            // Replicates `confirm-ready` in service.pretty.mjs lines 10369-10372:
-            // Find `本局不再提示` and tap `(B.x - 20, B.y + B.h / 2)`, then tap `/^确认$/`
-            log_info("界面: 确认准备弹窗 -> 勾选本局不再提示并确认");
-            if (auto no_prompt = find_ocr(items, { "本局不再提示", "不再提示" })) {
+        case ScreenState::ConfirmReady: {
+            // `confirm-ready` L10369-10372：本局不再提示 + 确认
+            if (auto no_prompt = find_text_regex(items, "本局不再提示")) {
                 tap(no_prompt->x - 20, no_prompt->y + no_prompt->h * 0.5, 250);
             }
-            else {
-                tap(860, 602, 250);
-            }
-            if (auto hit = find_ocr_exact(items, { "确认", "确定" })) {
-                tap(hit->cx, hit->cy, 1000);
-            }
-            else if (auto roi_hit = find_ocr_in_roi(items, { "确认", "确定" }, 960, 580, 1650, 860)) {
-                tap(roi_hit->cx, roi_hit->cy, 1000);
-            }
-            else {
-                tap(1410, 728, 1000);
+            if (auto hit = find_text_regex(items, "^确认$")) {
+                tap(hit->cx, hit->cy, 1200);
             }
             break;
         }
-        case ScreenState::Abandon: {
-            // Replicates `/暂时离开模拟/` in service.pretty.mjs lines 10257-10261: always click `取消`!
-            log_info("界面: 暂时离开/放弃模拟弹窗 -> 点击取消继续对局");
-            if (auto hit = find_ocr_exact(items, { "取消" })) {
-                tap(hit->cx, hit->cy, 800);
-            }
-            else if (auto sub_hit = find_ocr(items, { "取消" })) {
-                tap(sub_hit->cx, sub_hit->cy, 800);
-            }
-            else {
-                tap(480, 727, 800);
-            }
-            break;
-        }
-        case ScreenState::EquipFull: {
-            // Replicates `/装备已满，请选择|销毁并替换/` in service.pretty.mjs lines 10315-10318:
-            // Click top-right close `(1846, 284)` to avoid destroying equipped items!
-            log_info("界面: 装备已满弹窗 -> 关闭替换窗口保留原装备");
-            if (has_ocr(items, { "装备已满，请选择", "销毁并替换" })) {
-                tap(1846, 284, 800);
-            }
-            else if (auto hit = find_ocr_exact(items, { "确认", "确定" })) {
-                tap(hit->cx, hit->cy, 600);
-            }
-            else {
-                tap(1846, 284, 800);
-            }
-            break;
-        }
-        case ScreenState::ThreeChoice: {
-            handle_three_choice_screen(img, items);
-            last_progress_time = now_sec();
-            break;
-        }
-        case ScreenState::Decision: {
-            handle_decision_screen(img, items);
-            last_progress_time = now_sec();
-            break;
-        }
-        case ScreenState::Reward: {
-            log_info("界面: 奖励/继续提示 -> 点击继续");
-            tap(960, 920, 800);
-            break;
-        }
-        case ScreenState::Detail: {
-            close_detail_panel();
-            break;
-        }
-        case ScreenState::Facing: {
-            if (auto box = detect_facing_white_box(img)) {
-                log_info("界面: 检测到未完成朝向框 -> 自动向左拖拽设朝向");
-                drag_segments(box->first, box->second, box->first - 210.0, box->second, 6, 20, 80);
-                sleep_ms(300);
-            }
-            else if (auto cancel = find_ocr(items, { "点击取消" })) {
-                tap(cancel->cx, cancel->cy, 600);
-            }
-            break;
-        }
-        case ScreenState::Shop: {
-            auto [rnd_opt, is_prep] = read_round_and_prep(img, items);
+        case ScreenState::Prep: {
+            auto [rnd, is_prep] = read_round_and_prep(img, items);
             (void)is_prep;
-            if (rnd_opt.has_value()) {
-                m_current_round = *rnd_opt;
-            }
-            else if (m_current_round <= 0) {
-                m_current_round = 1;
+            if (rnd.has_value()) {
+                m_current_round = *rnd;
             }
             auto cam = detect_camera(img, goal_only_allowed());
-            if (cam.camera.empty()) {
-                cam.camera = "expanded";
-                cam.H = m_calib_expanded.base_H;
-            }
             run_prep_phase(img, cam);
-            last_progress_time = now_sec();
+            last_progress = now_sec();
             break;
         }
         case ScreenState::Battle: {
-            auto [rnd_opt, is_prep] = read_round_and_prep(img, items);
-            if (rnd_opt.has_value() && *rnd_opt != m_current_round) {
-                m_current_round = *rnd_opt;
-                last_progress_time = now_sec();
+            auto [rnd, is_prep] = read_round_and_prep(img, items);
+            (void)is_prep;
+            if (rnd.has_value() && *rnd != m_current_round) {
+                m_current_round = *rnd;
+                last_progress = now_sec();
             }
-            if (is_prep) {
-                auto cam = detect_camera(img, goal_only_allowed());
-                if (!cam.camera.empty()) {
-                    run_prep_phase(img, cam);
-                    last_progress_time = now_sec();
-                    break;
-                }
-            }
-            sleep_sec(2.0);
+            sleep_ms(2000);
             break;
         }
         case ScreenState::Result: {
-            bool won = has_ocr(items, { "模拟完成" });
-            report_match_finished(won, m_current_round);
-            if (auto hit = find_ocr(items, { "返回主页", "返回", "退出" })) {
-                tap(hit->cx, hit->cy, 3000);
+            // `result` L10435-10455：每局只记一次，然后返回主页
+            if (!result_counted) {
+                result_counted = true;
+                report_match_finished(info.won.value_or(false), m_current_round);
+            }
+            if (auto hit = find_text_regex(items, "返回主页")) {
+                tap(hit->cx, hit->cy, 2000);
             }
             else {
-                tap(1650, 960, 3000);
+                sleep_ms(1500);
             }
-            reset_match_state();
-            last_progress_time = now_sec();
             break;
         }
         case ScreenState::Unknown:
         default: {
-            ++unknown_streak;
-            std::string all_txt;
-            for (const auto& it : items) {
-                all_txt += it.text + " ";
+            if (now_sec() - last_progress > kStallTimeoutSec) {
+                stop_reason = "超过 10 分钟无实质进展，触发防卡死保护";
+                finished_ok = false;
+                report_task_summary(stop_reason, finished_ok);
+                return false;
             }
-            // CRITICAL FIX: Never match substring `"完成"` (which matches `"模拟完成"` header)!
-            if (auto hit = find_ocr(items, { "返回主页", "点击任意", "点击空白处" })) {
-                tap(hit->cx, hit->cy, 1000);
-            }
-            else if (auto exact_hit = find_ocr_exact(items, { "继续", "确定", "确认" })) {
-                tap(exact_hit->cx, exact_hit->cy, 1000);
-            }
-            else if (unknown_streak % 5 == 1) {
-                log_info("未识别界面，OCR 片段: " + all_txt.substr(0, std::min<size_t>(120, all_txt.size())));
-            }
-            sleep_sec(1.5);
+            sleep_ms(1200);
             break;
         }
+        }
+
+        if (m_runs_completed >= m_runs) {
+            break;
         }
     }
 

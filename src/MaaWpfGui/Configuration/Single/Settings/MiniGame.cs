@@ -61,6 +61,19 @@ public class MiniGame : NotifyPropertyChangedWithValue
     /// </summary>
     public int SPAMaxRuns { get; set; } = 20;
 
+    /// <summary>
+    /// Gets or sets 刷角标的目标："medal" 刷策略徽章，"task-1".."task-7" 对应七条任务线。
+    /// 对应插件参数 <c>spa_farm.goal</c>（JS 的 <c>pr[].id</c>）。
+    /// </summary>
+    public string SPAGoal { get; set; } = "medal";
+
+    /// <summary>
+    /// Gets or sets 刷角标的对局模式："quick" 极速模拟，"standard" 标准模拟。
+    /// 对应插件参数 <c>spa_farm.mode</c>；刷角标时若为 "standard"，
+    /// 插件会在难度页按「规程等级N」拖拽选择。
+    /// </summary>
+    public string SPASimMode { get; set; } = "quick";
+
     [JsonInclude]
     public Reclamation Reclamation { get; private set; } = new();
 }

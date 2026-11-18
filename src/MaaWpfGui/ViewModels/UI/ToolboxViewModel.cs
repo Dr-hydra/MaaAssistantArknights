@@ -3031,6 +3031,10 @@ public class ToolboxViewModel : Screen
 
     private int _spaMaxRuns = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAMaxRuns;
 
+    private string _spaSimMode = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPASimMode;
+
+    private string _spaGoal = ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAGoal;
+
     public LocalizedObservableList<string> SPAModeList { get; } = new(
         ("level", "Toolbox.MiniGame.SPA.Mode.Level"),
         ("badge", "Toolbox.MiniGame.SPA.Mode.Badge"));
@@ -3078,6 +3082,53 @@ public class ToolboxViewModel : Screen
             }
 
             ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPATargetClears = value ? 6 : 3;
+        }
+    }
+
+    public LocalizedObservableList<string> SPAGoalList { get; } = new(
+        ("medal", "Toolbox.MiniGame.SPA.Goal.Medal"),
+        ("task-1", "Toolbox.MiniGame.SPA.Goal.Task1"),
+        ("task-2", "Toolbox.MiniGame.SPA.Goal.Task2"),
+        ("task-3", "Toolbox.MiniGame.SPA.Goal.Task3"),
+        ("task-4", "Toolbox.MiniGame.SPA.Goal.Task4"),
+        ("task-5", "Toolbox.MiniGame.SPA.Goal.Task5"),
+        ("task-6", "Toolbox.MiniGame.SPA.Goal.Task6"),
+        ("task-7", "Toolbox.MiniGame.SPA.Goal.Task7"));
+
+    /// <summary>Gets or sets 刷角标的目标：medal 刷策略徽章，task-1..7 对应七条任务线。</summary>
+    public string SPAGoal
+    {
+        get => _spaGoal;
+        set {
+            if (!SetAndNotify(ref _spaGoal, value))
+            {
+                return;
+            }
+
+            ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPAGoal = value;
+            NotifyOfPropertyChange(nameof(CanChooseSPASimMode));
+        }
+    }
+
+    /// <summary>Gets a value indicating whether 可以自由选择对局模式（`Bs`：medal 强制极速模拟）。</summary>
+    [PropertyDependsOn(nameof(SPAGoal))]
+    public bool CanChooseSPASimMode => SPAGoal != "medal";
+
+    public LocalizedObservableList<string> SPASimModeList { get; } = new(
+        ("quick", "Toolbox.MiniGame.SPA.SimMode.Quick"),
+        ("standard", "Toolbox.MiniGame.SPA.SimMode.Standard"));
+
+    /// <summary>Gets or sets 刷角标的对局模式：quick = 极速模拟，standard = 标准模拟。</summary>
+    public string SPASimMode
+    {
+        get => _spaSimMode;
+        set {
+            if (!SetAndNotify(ref _spaSimMode, value))
+            {
+                return;
+            }
+
+            ConfigFactory.CurrentConfig.Toolbox.MiniGame.SPASimMode = value;
         }
     }
 
@@ -3717,7 +3768,7 @@ public class ToolboxViewModel : Screen
             return Instances.AsstProxy.AsstMiniGame(GetMiniGameTask());
         }
 
-        return Instances.AsstProxy.AsstSPAFarm(SPALowProfile, SPAColorfulBadge ? 6 : 3, SPAMaxRuns);
+        return Instances.AsstProxy.AsstSPAFarm(SPALowProfile, SPAColorfulBadge ? 6 : 3, SPAMaxRuns, SPAGoal, SPASimMode);
     }
 
     /// <summary>活动商店启动：提交自定义及游戏客户端语言下的预设黑名单关键词。</summary>
