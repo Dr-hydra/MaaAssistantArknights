@@ -265,6 +265,36 @@ void SPAFarmTaskPlugin::drag_move(int x1, int y1, int x2, int y2, int duration_m
     sleep_sec(post_wait_sec);
 }
 
+// 分段拖拽节拍，与原实现一致：按下保持 30ms，move 每步 12ms
+// （MAA Win32 AnchoredTouch 底层 touch_move 每步约需 12ms 才能提交一帧）
+namespace
+{
+constexpr int DragDownHoldMs = 30;
+constexpr int DragMoveStepMs = 12;
+} // namespace
+
+void SPAFarmTaskPlugin::touch_event(int type, double x, double y) const
+{
+    InputEvent event;
+    event.type = static_cast<InputEvent::Type>(type);
+    event.pointerId = 0;
+    event.point = to_720p(static_cast<int>(std::lround(x)), static_cast<int>(std::lround(y)));
+    ctrler()->inject_input_event(event);
+}
+
+void SPAFarmTaskPlugin::drag_path(double x1, double y1, double x2, double y2, int steps) const
+{
+    const auto start = std::chrono::steady_clock::now();
+    for (int k = 1; k <= steps; ++k) {
+        const double r = static_cast<double>(k) / static_cast<double>(steps);
+        touch_event(
+            static_cast<int>(InputEvent::Type::TOUCH_MOVE),
+            x1 + (x2 - x1) * r,
+            y1 + (y2 - y1) * r);
+        std::this_thread::sleep_until(start + std::chrono::milliseconds(DragMoveStepMs * k));
+    }
+}
+
 void SPAFarmTaskPlugin::log_info(const std::string& msg)
 {
     Log.info("SPAFarm |", msg);
@@ -487,7 +517,13 @@ std::vector<int> SPAFarmTaskPlugin::detect_rows(const cv::Mat& img)
 
 void SPAFarmTaskPlugin::scroll_grid()
 {
-    drag_move(1000, 900, 1000, 480, 700, 0.8);
+    // 原实现：慢速向上拖动约两行，结束前停顿以消除惯性
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), 1000, 900);
+    std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+    drag_path(1000, 900, 1000, 480, 14);
+    sleep_sec(0.5);
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), 1000, 480);
+    sleep_sec(0.8);
 }
 
 std::string SPAFarmTaskPlugin::strategy_name(const std::vector<OcrItem>& panel)
@@ -1086,13 +1122,23 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
     cv::Mat before = shot();
     auto left0 = slots_left(before);
     for (int attempt = 0; attempt < 3; ++attempt) {
+        // 原实现：先在备战席按下并竖直上移 180px 把干员「拿起」，
+        // 只有拖拽态下游戏才会显示可部署绿格，静止截图里是找不到的。
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), bx, by);
+        std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+        drag_path(bx, by, bx, by - 180, 9);
+        sleep_sec(0.8);
         cv::Mat img = shot();
         auto cand = right3(green_tiles(img), img);
         if (cand.empty()) {
+            touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), bx, by - 180);
+            sleep_sec(0.8);
             return std::nullopt;
         }
         auto [tx, ty] = cand[std::min<size_t>(attempt, cand.size() - 1)];
-        drag_move(bx, by, tx, ty, 600, 1.0);
+        drag_path(bx, by - 180, tx, ty, 10);
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), tx, ty);
+        sleep_sec(1.0);
         cv::Mat im = shot();
         if (find(ocr(im, std::array<int, 4> { 300, 0, 1700, 820 }), { "点击取消", "取消" }).has_value()) {
             m_last_tile = { tx, ty };
@@ -1239,7 +1285,18 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
     }
 
     auto [tx, ty] = tile_xy(target);
-    drag_move(bx, by, tx, ty, 650, 1.0);
+    // 原实现 deploy_layout 的三段式拖拽：
+    //   按下 -> 竖直上移 120px「拿起」-> 移到 lift(760,650) 不挡目标格 -> 停顿
+    //   -> 从 lift 拖到目标格 -> 在目标格松手
+    // 一步到位的 swipe 容易被游戏判成「滑动」而不是「按住拖拽」，干员拿不起来。
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), bx, by);
+    std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+    drag_path(bx, by, bx, by - 120, 6);
+    drag_path(bx, by - 120, m_layout.lift.first, m_layout.lift.second, 8);
+    sleep_sec(0.8);
+    drag_path(m_layout.lift.first, m_layout.lift.second, tx, ty, 10);
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), tx, ty);
+    sleep_sec(1.0);
     if (!find(ocr(shot(), std::array<int, 4> { 300, 0, 1700, 820 }), { "点击取消", "取消" }).has_value()) {
         return std::nullopt;
     }
@@ -1271,7 +1328,14 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
 bool SPAFarmTaskPlugin::sell_at(int x, int y)
 {
     auto g0 = numrec(shot(), kGoldBox);
-    drag_move(x, y, kSellPos.first, kSellPos.second, 800, 1.0);
+    // 原实现：两段拖拽（先上移 120px 拿起，再拖到右下角出售区），松手后比对资金
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), x, y);
+    std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+    drag_path(x, y, x, y - 120, 6);
+    drag_path(x, y - 120, kSellPos.first, kSellPos.second, 10);
+    sleep_sec(0.4);
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), kSellPos.first, kSellPos.second);
+    sleep_sec(1.0);
     auto g1 = numrec(shot(), kGoldBox);
     return g0.has_value() && g1.has_value() && *g1 > *g0;
 }
@@ -1286,7 +1350,13 @@ bool SPAFarmTaskPlugin::set_facing(int tx, int ty, int tries)
 {
     for (int k = 0; k < tries; ++k) {
         int dist = 300 + 60 * k;
-        drag_move(tx, ty, tx + dist, ty, 500, 1.2);
+        // 原实现：慢速横向拖拽设置朝向，松手后确认「点击取消」消失
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), tx, ty);
+        std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+        drag_path(tx, ty, tx + dist, ty, 10);
+        sleep_sec(0.3);
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), tx + dist, ty);
+        sleep_sec(1.2);
         if (!in_facing_mode()) {
             return true;
         }

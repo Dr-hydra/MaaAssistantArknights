@@ -95,6 +95,10 @@ private:
     void tap(double x, double y, double wait_sec = 0.6);
     void swipe(double x1, double y1, double x2, double y2, int ms = 500, double wait_sec = 0.8);
     void drag_move(int x1, int y1, int x2, int y2, int duration_ms = 500, double post_wait_sec = 0.8);
+    // 分段拖拽（原实现 drag_path 的等价物）：手动发 touch down/move/up，
+    // 每步按固定节拍插值。一步到位的 swipe 容易被游戏判成滑动而非「按住拖拽」。
+    void touch_event(int type, double x, double y) const;
+    void drag_path(double x1, double y1, double x2, double y2, int steps = 12) const;
     void log_info(const std::string& msg);
 
     // --- 核心 OCR 接口 (修复四大准确率问题) ---

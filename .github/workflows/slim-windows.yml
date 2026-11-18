@@ -16,7 +16,9 @@ on:
 
 concurrency:
   group: slim-windows-${{ github.ref }}
-  cancel-in-progress: true
+  # 不取消正在跑的构建：连续 push 时让每轮都跑完并写回 build 缓存，
+  # 否则缓存链被掐断、下一轮又全量编译（实测命中缓存 15min -> 2min19s）
+  cancel-in-progress: false
 
 jobs:
   build:
