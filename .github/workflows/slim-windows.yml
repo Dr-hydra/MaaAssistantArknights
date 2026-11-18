@@ -1,15 +1,17 @@
 name: Slim Build (Windows x64)
 
-# 仅用于开发期验证：只编 Windows x64 的 MaaCore + WPF GUI，跳过 arm64 与其它平台。
+# 开发期验证：只编 Windows x64 的 MaaCore + WPF GUI，跳过 arm64 与其它平台。
 # 上游合并前应删除此文件（正式的 Release Pipeline 见 ci.yml）。
 on:
   workflow_dispatch:
   push:
     branches:
       - "feat/spa-badge-farm"
+      - "ci/spa-verify"
     paths:
       - "src/**"
       - "resource/**"
+      - "tools/**"
       - "CMakeLists.txt"
       - "CMakePresets.json"
       - ".github/workflows/slim-windows.yml"
@@ -21,6 +23,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  meta:
+    name: Repo Checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          show-progress: false
+
+      - name: Localization checks (same scripts as ci.yml meta job)
+        run: |
+          python3 tools/CheckStubLocalization.py
+          python3 tools/CheckLocalizationReferences.py
+          python3 tools/SortLocalizationKeys.py --check
+
+      - name: clang-format (informational, not a PR gate)
+        continue-on-error: true
+        shell: bash
+        run: |
+          if command -v clang-format >/dev/null 2>&1; then
+            clang-format --version
+            clang-format --dry-run --Werror \
+              src/MaaCore/Task/MiniGame/SPAFarmTaskPlugin.cpp \
+              src/MaaCore/Task/MiniGame/SPAFarmTaskPlugin.h 2>&1 | tail -30
+          else
+            echo "clang-format is not preinstalled on the runner; skipped"
+          fi
+
   build:
     name: Windows x64
     runs-on: windows-2025-vs2026
