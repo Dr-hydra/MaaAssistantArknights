@@ -2365,6 +2365,22 @@ public class AsstProxy
         string what = details["what"]?.ToString() ?? string.Empty;
         switch (what)
         {
+            // 卫戍协议刷刻章插件（SPAFarmTaskPlugin）的进度上报。
+            // 插件通过 SubTaskExtraInfo 发送，details.message 为可直接展示的文本。
+            case "SPAFarmStatus":
+            case "SPAFarmMatchResult":
+            case "SPAFarmMedalEarned":
+            case "SPAFarmTaskCompleted":
+                {
+                    string spaMessage = subTaskDetails?["message"]?.ToString() ?? string.Empty;
+                    if (!string.IsNullOrEmpty(spaMessage))
+                    {
+                        Instances.TaskQueueViewModel.AddLog(spaMessage);
+                    }
+
+                    break;
+                }
+
             case "StageDrops":
                 {
                     string allDrops = string.Empty;

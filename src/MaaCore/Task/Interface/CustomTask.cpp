@@ -304,13 +304,25 @@ bool asst::CustomTask::parse_and_register_spa_farm(const std::string& task_name,
 
     if (auto params_opt = params.find<json::object>("params"); params_opt) {
         if (auto spa_opt = params_opt->find<json::object>("spa_farm"); spa_opt) {
-            // GUI 传 low_profile/target_clears/max_runs，插件 set_params 收 profile/target/runs，
-            // 在这里做一次映射，GUI 侧无需改动。
-            json::value plugin_params = json::object {};
-            plugin_params["profile"] = spa_opt->get("low_profile", false) ? std::string("low") : std::string("full");
-            plugin_params["target"] = spa_opt->get("target_clears", 3);
-            plugin_params["runs"] = spa_opt->get("max_runs", 20);
-            plugin_ptr->set_params(plugin_params);
+            // GUI 传 low_profile / target_clears / max_runs
+            // 插件收 profile / target / runs
+            json::value p = json::object {};
+            p["profile"] = spa_opt->get("low_profile", false) ? std::string("low") : std::string("full");
+            p["target"] = spa_opt->get("target_clears", 3);
+            p["runs"] = spa_opt->get("max_runs", 20);
+            if (auto goal_opt = spa_opt->find<std::string>("goal")) {
+                p["goal"] = *goal_opt;
+            }
+            if (auto mode_opt = spa_opt->find<std::string>("mode")) {
+                p["mode"] = *mode_opt;
+            }
+            if (auto cam_opt = spa_opt->find<std::string>("camera")) {
+                p["camera"] = *cam_opt;
+            }
+            if (auto att_opt = spa_opt->find<int>("attempts")) {
+                p["attempts"] = *att_opt;
+            }
+            plugin_ptr->set_params(p);
         }
     }
 
