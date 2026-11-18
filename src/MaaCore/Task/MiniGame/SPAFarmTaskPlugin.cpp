@@ -1232,61 +1232,6 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
     return std::nullopt;
 }
 
-std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench(
-    std::pair<int, int> bench_xy,
-    bool quiet,
-    Board* board,
-    bool hi)
-{
-    if (m_layout.loaded && board != nullptr) {
-        return deploy_layout(bench_xy, *board, "", hi ? 5 : 0, 0);
-    }
-    return deploy_from_bench_old(bench_xy, quiet, board, hi);
-}
-
-std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
-    std::pair<int, int> bench_xy,
-    bool /*quiet*/,
-    Board* board,
-    bool hi)
-{
-    auto [bx, by] = bench_xy;
-    cv::Mat before = shot();
-    auto left0 = slots_left(before);
-    for (int attempt = 0; attempt < 3; ++attempt) {
-        // 原实现：先在备战席按下并竖直上移 180px 把干员「拿起」，
-        // 只有拖拽态下游戏才会显示可部署绿格，静止截图里是找不到的。
-        touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), bx, by);
-        std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
-        drag_path(bx, by, bx, by - 180, 9);
-        sleep_sec(0.8);
-        cv::Mat img = shot();
-        auto cand = right3(green_tiles(img), img);
-        if (cand.empty()) {
-            touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), bx, by - 180);
-            sleep_sec(0.8);
-            return std::nullopt;
-        }
-        auto [tx, ty] = cand[std::min<size_t>(attempt, cand.size() - 1)];
-        drag_path(bx, by - 180, tx, ty, 10);
-        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), tx, ty);
-        sleep_sec(1.0);
-        cv::Mat im = shot();
-        if (find(ocr(im, std::array<int, 4> { 300, 0, 1700, 820 }), { "点击取消", "取消" }).has_value()) {
-            m_last_tile = { tx, ty };
-            set_facing(tx, ty);
-            if (board) {
-                board->used.emplace_back(tx, ty);
-                if (hi) {
-                    board->hi_tiles.emplace_back(tx, ty);
-                }
-            }
-            return std::pair<int, int> { tx, ty };
-        }
-    }
-    return std::nullopt;
-}
-
 std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
     std::pair<int, int> bench_xy,
     Board& board,
