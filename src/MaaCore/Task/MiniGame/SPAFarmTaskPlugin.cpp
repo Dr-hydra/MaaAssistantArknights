@@ -1264,7 +1264,9 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
             auto occ = occupant(tn);
             if (occ.has_value()) {
                 int v = value(tn, *occ);
-                if (occ->second < 5 || (occ->first != "?" && v < my)) {
+                // 原实现是 and：等阶<5、不是未知占位、价值低于自己，三者必须同时满足。
+                // 写成 or 会导致只要格子是低星就被选中，把价值更高的干员换下场。
+                if (occ->second < 5 && occ->first != "?" && v < my) {
                     cands.push_back(Cand { v, idx, tn, *occ });
                 }
             }
