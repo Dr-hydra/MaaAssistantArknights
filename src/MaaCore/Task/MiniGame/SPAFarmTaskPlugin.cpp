@@ -1114,6 +1114,138 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench(
 
 std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
     std::pair<int, int> bench_xy,
+    bool quiet,
+    Board* board,
+    bool hi)
+{
+    const auto [bx, by] = bench_xy;
+    const cv::Mat before = shot();
+    const auto slots_before = slots_left(before);
+
+    std::vector<std::pair<int, int>> local_used;
+    std::vector<std::pair<int, int>> local_hi;
+    auto& used = board != nullptr ? board->used : local_used;
+    auto& hi_tiles = board != nullptr ? board->hi_tiles : local_hi;
+
+    const auto is_near = [](std::pair<int, int> point, const std::vector<std::pair<int, int>>& list, int distance = 95) {
+        for (const auto& [x, y] : list) {
+            if (std::abs(point.first - x) <= distance && std::abs(point.second - y) <= distance) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        // 原实现：在备战席按下并竖直上移 180px 把干员拿起，只有拖拽态才会显示可部署绿格
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), bx, by);
+        std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+        drag_path(bx, by, bx, by - 180, 9);
+        sleep_sec(0.8);
+        const cv::Mat image = shot();
+        m_last_tier = yellow_ratio(image, std::array<int, 4> { 20, 328, 58, 362 }) > 0.08 ? 5 : 1;
+        const bool is_hi = hi || (m_last_tier >= 5);
+
+        const auto candidates = right3(green_tiles(image), image);
+        std::vector<std::pair<int, int>> free_tiles;
+        for (const auto& tile : candidates) {
+            if (!is_near(tile, used)) {
+                free_tiles.push_back(tile);
+            }
+        }
+
+        bool swap = false;
+        int tx = 0;
+        int ty = 0;
+        if (!free_tiles.empty()) {
+            const size_t index = std::min<size_t>(static_cast<size_t>(attempt), free_tiles.size() - 1);
+            std::tie(tx, ty) = free_tiles[index];
+        }
+        else {
+            std::vector<std::pair<int, int>> targets;
+            if (is_hi) {
+                for (const auto& tile : used) {
+                    if (!is_near(tile, hi_tiles)) {
+                        targets.push_back(tile);
+                    }
+                }
+                for (const auto& tile : candidates) {
+                    if (!is_near(tile, hi_tiles)) {
+                        targets.push_back(tile);
+                    }
+                }
+            }
+            std::stable_sort(targets.begin(), targets.end(), [](const auto& lhs, const auto& rhs) {
+                return (-lhs.first) < (-rhs.first);
+            });
+            if (targets.empty()) {
+                touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), bx, by - 180);
+                sleep_sec(0.8);
+                if (!quiet) {
+                    log_info("最右3列没有可用格");
+                }
+                return std::nullopt;
+            }
+            std::tie(tx, ty) = targets.front();
+            swap = true;
+        }
+
+        drag_path(bx, by - 180, tx, ty, 10);
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), tx, ty);
+        sleep_sec(1.0);
+        const cv::Mat placed = shot();
+        if (find(ocr(placed, std::array<int, 4> { 300, 0, 1700, 820 }), { "点击取消", "取消" }).has_value()) {
+            m_last_tile = { tx, ty };
+            set_facing(tx, ty);
+            const cv::Mat after = shot();
+            if (!is_near({ tx, ty }, used)) {
+                used.push_back({ tx, ty });
+            }
+            const auto slots_after = slots_left(after);
+            const bool swapped = slots_before.has_value() && slots_after.has_value() && *slots_after >= *slots_before;
+            if (swapped && !swap && !is_hi) {
+                log_info(
+                    "该格已有干员（发生交换），标记为占用 (" + std::to_string(tx) + ", " + std::to_string(ty) + ")");
+                return std::nullopt;
+            }
+            if (swapped) {
+                const auto out = new_bench_slot(before, after).value_or(std::make_pair(bx, by));
+                swipe(
+                    static_cast<double>(out.first),
+                    static_cast<double>(out.second),
+                    static_cast<double>(kSellPos.first),
+                    static_cast<double>(kSellPos.second),
+                    900,
+                    1.3);
+                log_info(
+                    "V/VI 替换低星干员 (" + std::to_string(tx) + ", " + std::to_string(ty) + ")，已卖出换下的干员");
+            }
+            if (is_hi) {
+                hi_tiles.push_back({ tx, ty });
+            }
+            log_info("部署到 (" + std::to_string(tx) + ", " + std::to_string(ty) + ") " + (is_hi ? "V/VI" : ""));
+            m_last_tile = { tx, ty };
+            return std::pair<int, int> { tx, ty };
+        }
+        log_info("放置失败，重试 (" + std::to_string(tx) + ", " + std::to_string(ty) + ")");
+    }
+    return std::nullopt;
+}
+
+std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench(
+    std::pair<int, int> bench_xy,
+    bool quiet,
+    Board* board,
+    bool hi)
+{
+    if (m_layout.loaded && board != nullptr) {
+        return deploy_layout(bench_xy, *board, "", hi ? 5 : 0, 0);
+    }
+    return deploy_from_bench_old(bench_xy, quiet, board, hi);
+}
+
+std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_from_bench_old(
+    std::pair<int, int> bench_xy,
     bool /*quiet*/,
     Board* board,
     bool hi)
@@ -1162,88 +1294,155 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
     int tier_hint,
     int depth)
 {
-    auto [bx, by] = bench_xy;
-    cv::Mat before = shot();
-    auto left0 = slots_left(before);
+    const auto [bx, by] = bench_xy;
+    const auto [lx, ly] = m_layout.lift;
 
-    // 点击备战席干员读取左侧干员面板信息
-    tap(bx, by, 0.5);
-    cv::Mat img = shot();
+    const cv::Mat before = shot();
+    const auto slots_before = slots_left(before);
+    log_info(
+        "部署起手: 备战席(" + std::to_string(bx) + "," + std::to_string(by) + ") 可放置=" +
+        (slots_before.has_value() ? std::to_string(*slots_before) : std::string("?")));
+
+    // 完全按原实现：直接按下 -> 上移 120 拿起 -> 移到 lift 避开目标格 -> 停顿
+    // -> 在「拖拽态」读左侧面板判定 -> 再拖到目标格。
+    // 注意：不能在拖拽前先 tap 选中，同一坐标再按下会被游戏当成取消选中，拿不起干员。
+    touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), bx, by);
+    std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
+    drag_path(bx, by, bx, by - 120, 6);
+    drag_path(bx, by - 120, lx, ly, 8);
+    sleep_sec(0.8);
+    const cv::Mat image = shot();
+
+    std::vector<std::pair<int, int>> all_points;
+    all_points.insert(all_points.end(), m_layout.safe.begin(), m_layout.safe.end());
+    all_points.insert(all_points.end(), m_layout.path.begin(), m_layout.path.end());
+    all_points.insert(all_points.end(), m_layout.rest.begin(), m_layout.rest.end());
+
     std::vector<std::string> tabs;
-    for (const auto& it : ocr(img, std::array<int, 4> { 0, 520, 700, 600 })) {
-        std::string t = trim_copy(it.text);
-        if (t == "特质" || t == "技能" || t == "特性" || t == "天赋") {
-            tabs.push_back(t);
+    for (const auto& item : ocr(image, std::array<int, 4> { 0, 520, 700, 600 })) {
+        const std::string text = trim_copy(item.text);
+        if (text == "特质" || text == "技能" || text == "特性" || text == "天赋") {
+            tabs.push_back(item.text);
         }
     }
-    std::string dname = drag_name(img);
-    bool picked = !tabs.empty()
-        || !dname.empty()
-        || find(ocr(img, std::array<int, 4> { 0, 262, 330, 380 }), { "LV" }).has_value();
-    if (!picked) {
-        tap(960, 100, 0.3);
-        return std::nullopt;
-    }
-    bool has_op_tab = false;
-    for (const auto& t : tabs) {
-        if (t == "特质" || t == "天赋") {
-            has_op_tab = true;
+
+    bool any_green = false;
+    for (const auto& point : all_points) {
+        if (is_green(image, point)) {
+            any_green = true;
             break;
         }
     }
-    if (!tabs.empty() && !has_op_tab) {
-        tap(960, 100, 0.3);
+
+    const std::string drag_label = drag_name(image);
+    const bool has_lv = find(ocr(image, std::array<int, 4> { 0, 262, 330, 380 }), { "LV" }).has_value();
+    const bool picked = !tabs.empty() || !drag_label.empty() || has_lv || any_green;
+    log_info(
+        "拿起判定: tabs=" + std::to_string(tabs.size()) + " 名称=" + (drag_label.empty() ? "-" : drag_label) +
+        " LV=" + (has_lv ? "1" : "0") + " 绿格=" + (any_green ? "1" : "0") + " -> " +
+        (picked ? "已拿起" : "未拿起"));
+    if (!picked) {
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), lx, ly);
+        sleep_sec(0.8);
         return std::nullopt;
     }
 
-    std::string name = !dname.empty() ? dname : name_hint;
-    int tier = (yellow_ratio(img, { 20, 328, 58, 362 }) > 0.08) ? 5 : 1;
+    bool has_operator_tab = false;
+    for (const auto& tab : tabs) {
+        const std::string text = trim_copy(tab);
+        if (text == "特质" || text == "天赋") {
+            has_operator_tab = true;
+            break;
+        }
+    }
+    // 原实现：名字以 “ " 「 『 开头也视为装备
+    const auto is_quote_prefix = [](const std::string& text) {
+        if (text.empty()) {
+            return false;
+        }
+        const auto c0 = static_cast<unsigned char>(text[0]);
+        if (c0 == '"') {
+            return true;
+        }
+        if (text.size() >= 3) {
+            const auto c1 = static_cast<unsigned char>(text[1]);
+            const auto c2 = static_cast<unsigned char>(text[2]);
+            if (c0 == 0xE2 && c1 == 0x80 && c2 == 0x9C) {
+                return true; // “
+            }
+            if (c0 == 0xE3 && c1 == 0x80 && c2 == 0x8C) {
+                return true; // 「
+            }
+            if (c0 == 0xE3 && c1 == 0x80 && c2 == 0x8E) {
+                return true; // 『
+            }
+        }
+        return false;
+    };
+    if (!has_operator_tab || is_quote_prefix(drag_label)) {
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), lx, ly);
+        sleep_sec(0.8);
+        log_info("拿起的是装备，放回: " + (drag_label.empty() ? std::string("?") : drag_label));
+        return std::nullopt;
+    }
+
+    const std::string name = !drag_label.empty() ? drag_label : name_hint;
+    int tier = yellow_ratio(image, std::array<int, 4> { 20, 328, 58, 362 }) > 0.08 ? 5 : 1;
     if (prio_index(name).has_value()) {
         tier = std::max(tier, 5);
     }
     if (depth >= 1 && tier < 5) {
-        sell_at(bx, by);
+        drag_path(lx, ly, kSellPos.first, kSellPos.second, 10);
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), kSellPos.first, kSellPos.second);
+        sleep_sec(1.0);
+        log_info("换下的是低星干员，卖掉: " + (name.empty() ? std::string("?") : name));
         return std::nullopt;
     }
-    tier = std::max(tier, (depth == 0) ? tier_hint : 0);
-    int my = rank(name, tier);
-    auto order = tile_order(name);
+    tier = std::max(tier, depth == 0 ? tier_hint : 0);
+    const int my_rank = rank(name, tier);
 
-    auto occupant = [&](const std::string& tn) -> std::optional<std::pair<std::string, int>> {
-        if (board.occ.count(tn)) {
-            return std::pair<std::string, int> { board.occ[tn].name, board.occ[tn].tier };
+    const auto occupant = [&](const std::string& tn) -> std::optional<std::pair<std::string, int>> {
+        const auto it = board.occ.find(tn);
+        if (it != board.occ.end()) {
+            return std::make_pair(it->second.name, it->second.tier);
         }
-        return std::nullopt;
+        if (is_green(image, tile_xy(tn))) {
+            return std::nullopt;
+        }
+        return std::make_pair(std::string("?"), 5);
     };
 
-    auto value = [&](const std::string& tn, const std::pair<std::string, int>& occ) -> int {
+    const auto value = [&](const std::string& tn, const std::pair<std::string, int>& occ) -> int {
         int r = rank(occ.first, occ.second);
-        if (tn.rfind("safe", 0) == 0 && is_safe_op(name) && !is_safe_op(occ.first)) {
+        if (tn.starts_with("safe") && is_safe_op(name) && !is_safe_op(occ.first)) {
             r -= 2000;
         }
         return r;
     };
 
-    std::vector<std::string> safe, other;
-    for (const auto& t : order) {
-        if (t.rfind("safe", 0) == 0) {
-            safe.push_back(t);
+    const std::vector<std::string> order = tile_order(name);
+    std::vector<std::string> safe_tiles;
+    std::vector<std::string> other_tiles;
+    for (const auto& tn : order) {
+        if (tn.starts_with("safe")) {
+            safe_tiles.push_back(tn);
         }
         else {
-            other.push_back(t);
+            other_tiles.push_back(tn);
         }
     }
-    std::vector<std::vector<std::string>> groups = is_safe_op(name)
-        ? std::vector<std::vector<std::string>> { safe, other }
-        : std::vector<std::vector<std::string>> { other, safe };
+    const std::vector<std::vector<std::string>> groups = is_safe_op(name)
+        ? std::vector<std::vector<std::string>> { safe_tiles, other_tiles }
+        : std::vector<std::vector<std::string>> { other_tiles, safe_tiles };
 
     std::string target;
     std::optional<std::pair<std::string, int>> swap_out;
-
-    for (const auto& grp : groups) {
+    for (const auto& group : groups) {
+        std::map<std::string, std::optional<std::pair<std::string, int>>> occupants;
         std::vector<std::string> free_tiles;
-        for (const auto& tn : grp) {
-            if (!occupant(tn).has_value()) {
+        for (const auto& tn : group) {
+            occupants[tn] = occupant(tn);
+            if (!occupants[tn].has_value()) {
                 free_tiles.push_back(tn);
             }
         }
@@ -1251,76 +1450,76 @@ std::optional<std::pair<int, int>> SPAFarmTaskPlugin::deploy_layout(
             target = free_tiles.front();
             break;
         }
-        struct Cand
-        {
-            int val;
-            size_t idx;
-            std::string tn;
-            std::pair<std::string, int> occ;
-        };
-        std::vector<Cand> cands;
-        for (size_t idx = 0; idx < grp.size(); ++idx) {
-            const auto& tn = grp[idx];
-            auto occ = occupant(tn);
-            if (occ.has_value()) {
-                int v = value(tn, *occ);
-                // 原实现是 and：等阶<5、不是未知占位、价值低于自己，三者必须同时满足。
-                // 写成 or 会导致只要格子是低星就被选中，把价值更高的干员换下场。
-                if (occ->second < 5 && occ->first != "?" && v < my) {
-                    cands.push_back(Cand { v, idx, tn, *occ });
-                }
+
+        std::vector<std::tuple<int, int, std::string>> candidates;
+        for (size_t index = 0; index < group.size(); ++index) {
+            const std::string& tn = group[index];
+            const auto& occ_opt = occupants[tn];
+            if (!occ_opt.has_value()) {
+                continue;
+            }
+            const auto& occ = *occ_opt;
+            // 原实现：等阶<5 且 不是未知占位 且 价值低于自己，三者必须同时满足
+            if (occ.second < 5 && occ.first != "?" && value(tn, occ) < my_rank) {
+                candidates.emplace_back(value(tn, occ), static_cast<int>(index), tn);
             }
         }
-        std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) {
-            return (a.val != b.val) ? (a.val < b.val) : (a.idx < b.idx);
-        });
-        if (!cands.empty()) {
-            target = cands.front().tn;
-            swap_out = cands.front().occ;
+        std::sort(candidates.begin(), candidates.end());
+        if (!candidates.empty()) {
+            target = std::get<2>(candidates.front());
+            swap_out = *occupants[target];
             break;
         }
     }
 
     if (target.empty()) {
-        tap(960, 100, 0.3);
+        touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), lx, ly);
+        sleep_sec(0.8);
+        log_info("没有可用位置，留在备战席: " + (name.empty() ? std::string("?") : name));
         return std::nullopt;
     }
+    log_info(
+        "目标格: " + target + " 换下=" + (swap_out.has_value() ? swap_out->first : std::string("-")) + " 可放置=" +
+        (slots_before.has_value() ? std::to_string(*slots_before) : std::string("?")));
 
-    auto [tx, ty] = tile_xy(target);
-    // 原实现 deploy_layout 的三段式拖拽：
-    //   按下 -> 竖直上移 120px「拿起」-> 移到 lift(760,650) 不挡目标格 -> 停顿
-    //   -> 从 lift 拖到目标格 -> 在目标格松手
-    // 一步到位的 swipe 容易被游戏判成「滑动」而不是「按住拖拽」，干员拿不起来。
-    touch_event(static_cast<int>(InputEvent::Type::TOUCH_DOWN), bx, by);
-    std::this_thread::sleep_for(std::chrono::milliseconds(DragDownHoldMs));
-    drag_path(bx, by, bx, by - 120, 6);
-    drag_path(bx, by - 120, m_layout.lift.first, m_layout.lift.second, 8);
-    sleep_sec(0.8);
-    drag_path(m_layout.lift.first, m_layout.lift.second, tx, ty, 10);
+    const auto [tx, ty] = tile_xy(target);
+    drag_path(lx, ly, tx, ty, 10);
     touch_event(static_cast<int>(InputEvent::Type::TOUCH_UP), tx, ty);
     sleep_sec(1.0);
     if (!find(ocr(shot(), std::array<int, 4> { 300, 0, 1700, 820 }), { "点击取消", "取消" }).has_value()) {
+        log_info("放置失败: " + name + " " + target);
         return std::nullopt;
     }
+
     m_last_tile = { tx, ty };
     set_facing(tx, ty);
-    cv::Mat after = shot();
+    const cv::Mat after = shot();
     board.occ[target] = OccupantInfo { name, tier, false };
-    auto left1 = slots_left(after);
-    if (!swap_out.has_value() && left0.has_value() && left1.has_value() && *left1 >= *left0) {
-        swap_out = std::pair<std::string, int> { "?", 5 };
+
+    const auto slots_after = slots_left(after);
+    if (!swap_out.has_value() && slots_before.has_value() && slots_after.has_value() &&
+        *slots_after >= *slots_before) {
+        log_info("意外交换: " + target + " 上原本有干员，重新安排被换下的干员");
+        swap_out = std::make_pair(std::string("?"), 5);
     }
+    log_info(
+        "部署 " + (name.empty() ? std::string("?") : name) + " T" + std::to_string(tier) + " -> " + target +
+        (swap_out.has_value() ? ("（换下 " + swap_out->first + "）") : std::string()));
+
     if (swap_out.has_value()) {
         board.pending = true;
-        if (auto out = new_bench_slot(before, after)) {
+        const auto out = new_bench_slot(before, after);
+        if (out.has_value()) {
             if (swap_out->second < 5) {
-                sell_at(out->first, out->second);
+                const bool ok = sell_at(out->first, out->second);
+                log_info("卖掉换下的干员 " + swap_out->first + (ok ? " 成功" : "（未确认）"));
             }
             else if (depth == 0) {
                 deploy_layout(*out, board, swap_out->first, swap_out->second, depth + 1);
             }
         }
     }
+
     m_last_tier = tier;
     m_last_name = name;
     m_last_tile = { tx, ty };
@@ -1362,7 +1561,11 @@ bool SPAFarmTaskPlugin::set_facing(int tx, int ty, int tries)
         if (!in_facing_mode()) {
             return true;
         }
+        log_info(
+            "设置朝向未生效，重试 (" + std::to_string(tx) + "," + std::to_string(ty) + ") 距离" +
+            std::to_string(dist));
     }
+    log_info("设置朝向多次失败 (" + std::to_string(tx) + "," + std::to_string(ty) + ")");
     return false;
 }
 
@@ -1518,6 +1721,13 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
         return;
     }
 
+    const auto opt_s = [](const std::optional<int>& v) {
+        return v.has_value() ? std::to_string(*v) : std::string("?");
+    };
+    log_info(
+        "回合" + std::to_string(rnd) + " 资金" + opt_s(gold) + " 升级费用" + opt_s(up_cost)
+        + " 满级" + (maxed ? "1" : "0"));
+
     if (board.round_done < 0 && rnd == 1) {
         int bought = 0;
         for (const auto& c : shop_cards(img)) {
@@ -1527,8 +1737,10 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
             }
             if (c.op && c.cost.has_value() && (!g.has_value() || *c.cost <= *g)) {
                 if (is_healer(c.name) && board.healers >= 1) {
+                    log_info("跳过第二个医疗干员: " + c.name);
                     continue;
                 }
+                log_info("首回合购买: " + c.name + " 费用" + opt_s(c.cost));
                 if (buy_and_deploy(board, c.i, c.hi ? 5 : 1, c.cost)) {
                     ++bought;
                     if (is_healer(c.name)) {
@@ -1548,6 +1760,8 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
                 break;
             }
             int ux0 = m_upx;
+            const int upx_click = m_upx;
+            log_info("点击升级 (UPX=" + std::to_string(upx_click) + ") 资金" + opt_s(g_cur) + " 费用" + opt_s(c_cur));
             tap(m_upx, 920, 0.6);
             tap(m_upx, 920, 1.0);
             auto [g2, c2, m2, __] = read_shop(shot());
@@ -1556,6 +1770,10 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
                 || (m_upx != ux0)
                 || (g_cur.has_value() && g2.has_value() && *g2 < *g_cur)
                 || (c_cur.has_value() && c2.has_value() && *c2 != *c_cur);
+            log_info(
+                "升级结果: 资金" + opt_s(g_cur) + "->" + opt_s(g2) + " 费用" + opt_s(c_cur) + "->"
+                + (maxed ? std::string("满级") : opt_s(c2)) + " UPX " + std::to_string(ux0) + "->"
+                + std::to_string(m_upx) + " -> " + (ok ? "成功" : "未生效"));
             if (!ok) {
                 break;
             }
@@ -1567,6 +1785,8 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
                 auto g = read_gold(&im);
                 auto sl = slots_left(im);
                 if ((g.has_value() && *g == 0) || (sl.has_value() && *sl == 0)) {
+                    log_info(
+                        std::string("停止补买: ") + ((g.has_value() && *g == 0) ? "资金为 0" : "部署位已满"));
                     break;
                 }
                 if (c.op && c.cost.has_value() && (!g.has_value() || *c.cost <= *g)) {
@@ -1603,6 +1823,7 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
                 if (sig == last_sig) {
                     ++same_count;
                     if (same_count >= 2) {
+                        log_info("停止刷新: 商店连续未变化（资金不足或刷新没点到）");
                         break;
                     }
                 }
@@ -1707,6 +1928,7 @@ void SPAFarmTaskPlugin::prep_phase(Board& board, const cv::Mat& img)
     board.round_done = rnd;
     board.prep_done = true;
     sleep_sec(1.5);
+    log_info("回合" + std::to_string(rnd) + " 准备就绪");
     tap(kReadyPos.first, kReadyPos.second, 1.5);
     board.last_ready = now_sec();
     handle_popups();
@@ -1740,6 +1962,7 @@ bool SPAFarmTaskPlugin::_run()
     double last_seen = now_sec();
     double last_progress = now_sec();
     int last_round = -999;
+    int idle = 0;
     int runs = 0;
     int attempts = 0;
     std::optional<std::string> current;
@@ -1774,6 +1997,11 @@ bool SPAFarmTaskPlugin::_run()
         }
 
         if (txt.find("点击取消") != std::string::npos && txt.find("准备就绪") != std::string::npos) {
+            log_info(
+                "检测到停在选择朝向界面，补设朝向: "
+                + (m_last_tile.has_value()
+                       ? ("(" + std::to_string(m_last_tile->first) + "," + std::to_string(m_last_tile->second) + ")")
+                       : std::string("无记录")));
             if (m_last_tile.has_value()) {
                 set_facing(m_last_tile->first, m_last_tile->second);
             }
@@ -1811,23 +2039,28 @@ bool SPAFarmTaskPlugin::_run()
                      && txt.find("极速模拟") != std::string::npos
                      && txt.find("回合") == std::string::npos)) {
             auto hit = find(items, { "开始模拟" });
+            log_info("界面: 选择模拟难度 -> 点击开始模拟");
             tap(hit ? hit->cx : 1700.0, hit ? hit->cy : 986.0, 3.0);
             board = Board();
         }
         else if (txt.find("确认准备") != std::string::npos || txt.find("资金将在") != std::string::npos) {
+            log_info("界面: 确认准备（本局不再提示 + 确认）");
             tap(860, 602, 0.5);
             tap(1410, 728, 2.0);
         }
         else if (txt.find("断线重连") != std::string::npos) {
             auto hit = find(items, { "断线重连" });
+            log_info("界面: 检测到未完成对局 -> 断线重连");
             tap(hit ? hit->cx : 1660.0, hit ? hit->cy : 970.0, 5.0);
             board = Board();
         }
         else if (txt.find("独立模拟") != std::string::npos && txt.find("极速模拟") != std::string::npos) {
             auto hit = find(items, { "极速模拟" });
+            log_info("界面: 卫戍协议主界面 -> 点击极速模拟");
             tap(hit ? hit->cx : 1280.0, hit ? hit->cy : 1000.0, 3.0);
         }
         else if (txt.find("确认本局信息") != std::string::npos) {
+            log_info("界面: 确认本局信息");
             tap(1686, 986, 3.0);
         }
         else if (txt.find("选择策略") != std::string::npos) {
@@ -1839,6 +2072,7 @@ bool SPAFarmTaskPlugin::_run()
             tap(1680, 990, 3.0);
         }
         else if (txt.find("确定自选编队") != std::string::npos) {
+            log_info("界面: 确定自选编队");
             pick_squad();
         }
         else if (txt.find("回合") != std::string::npos
@@ -1861,18 +2095,33 @@ bool SPAFarmTaskPlugin::_run()
         else if (txt.find("回合") != std::string::npos
                  || (txt.find("查看") != std::string::npos && txt.find("极速模拟") != std::string::npos)
                  || txt_upper.find("COUNTDOWN") != std::string::npos) {
+            if (board.prep_done) {
+                log_info("进入战斗/倒计时，等待本轮结束");
+            }
             board.prep_done = false;
             sleep_sec(4.0);
             continue;
         }
         else {
             if (seen_garrison) {
+                bool clicked = false;
                 for (const auto& gkw : kGenericKeywords) {
                     if (auto hit = find(items, { gkw })) {
+                        log_info("通用点击: " + hit->text);
                         tap(hit->cx, hit->cy, 2.0);
+                        clicked = true;
                         break;
                     }
                 }
+                if (!clicked) {
+                    ++idle;
+                    if (idle % 5 == 1) {
+                        log_info("未识别界面，OCR 片段: " + txt.substr(0, 120));
+                    }
+                }
+            }
+            else {
+                ++idle;
             }
             sleep_sec(2.0);
             continue;
