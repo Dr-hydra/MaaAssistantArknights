@@ -1651,38 +1651,65 @@ std::array<double, 9> SPAFarmTaskPlugin::adjust_homography(
 
 std::optional<std::tuple<double, double, int>> SPAFarmTaskPlugin::detect_marker_centroid(
     const cv::Mat& img,
-    const std::array<int, 4>& roi_xyxy,
+    const std::array<double, 2>& ref_pt,
+    int top_offset,
     std::string_view color_kind)
 {
-    // Exact 1:1 port of `Un(a, s, e, t)` in service.pretty.mjs lines 4487-4507
+    // 1:1 port of `Un(a, s, e, t, f = 110)` in service.pretty.mjs L4444-4478.
+    //
+    // 旧实现错用了 goal-only 兜底分支的固定 ROI（[450,415,740,610] 等）并自拟了颜色阈值。
+    // 1920x1080 实机实测：蓝点 E 只统计到 170 px（门限 0.5*2568=1284），必然被丢弃，
+    // 只剩两个红门参与拟合，角度偏差 -8.8° 被判失败 -> 整段部署被静默跳过。
+    // 此处按原实现重写：
+    //   ROI    = 参考质心 +/- 110（E 的上边界再收 60）
+    //   排除区 = di（顶部信息条、右侧面板）
+    //   颜色   = qn / hi
     if (img.empty()) {
         return std::nullopt;
     }
-    const int x0 = std::clamp(roi_xyxy[0], 0, img.cols);
-    const int y0 = std::clamp(roi_xyxy[1], 0, img.rows);
-    const int x1 = std::clamp(roi_xyxy[2], 0, img.cols);
-    const int y1 = std::clamp(roi_xyxy[3], 0, img.rows);
+    constexpr int kHalf = 110;
+    static constexpr std::array<std::array<int, 4>, 2> kExcludeZones = {
+        std::array<int, 4> { 0, 0, 1920, 110 },
+        std::array<int, 4> { 1680, 0, 1920, 1080 }
+    };
+
+    const int x0 = std::clamp(static_cast<int>(std::lround(ref_pt[0] - kHalf)), 0, img.cols);
+    const int x1 = std::clamp(static_cast<int>(std::lround(ref_pt[0] + kHalf)), 0, img.cols);
+    const int y0 = std::clamp(static_cast<int>(std::lround(ref_pt[1] - top_offset)), 0, img.rows);
+    const int y1 = std::clamp(static_cast<int>(std::lround(ref_pt[1] + kHalf)), 0, img.rows);
+
+    const bool is_blue = (color_kind == "blue");
     double sx = 0.0;
     double sy = 0.0;
     int n = 0;
-    const bool is_blue = (color_kind == "blue");
     for (int y = y0; y < y1; ++y) {
         const auto* row = img.ptr<cv::Vec3b>(y);
         for (int x = x0; x < x1; ++x) {
+            bool excluded = false;
+            for (const auto& zone : kExcludeZones) {
+                if (x >= zone[0] && y >= zone[1] && x < zone[2] && y < zone[3]) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (excluded) {
+                continue;
+            }
             const int B = row[x][0];
             const int G = row[x][1];
             const int R = row[x][2];
+            // `qn` / `hi` in service.pretty.mjs L4441-4442
             const bool match = is_blue
-                ? (B > 180 && G > 110 && R < 80 && (B - R) > 120)
-                : (R > 180 && G < 90 && B < 90 && (R - G) > 110 && (R - B) > 110);
+                ? (B > 220 && G > 140 && R < 150 && (B - R) > 90)
+                : (R > 200 && G < 110 && B < 110 && (R - G) > 120);
             if (match) {
+                ++n;
                 sx += x;
                 sy += y;
-                ++n;
             }
         }
     }
-    if (n < 20) {
+    if (n == 0) {
         return std::nullopt;
     }
     return std::make_tuple(sx / n, sy / n, n);
@@ -1755,87 +1782,321 @@ SPAFarmTaskPlugin::CameraDetectResult SPAFarmTaskPlugin::detect_camera(
     const cv::Mat& img,
     bool allow_goal_only) const
 {
-    // Exact 1:1 port of `Hn` + `Sr` in service.pretty.mjs lines 4562-4681
-    auto eval_calib = [&](const CameraCalibData& calib,
-                          const std::array<int, 4>& roi_E,
-                          const std::array<int, 4>& roi_S1,
-                          const std::array<int, 4>& roi_S2) -> CameraDetectResult {
-        CameraDetectResult out;
-        std::vector<std::pair<double, double>> src_pts;
-        std::vector<std::pair<double, double>> dst_pts;
+    // 1:1 port of `Hn` (service.pretty.mjs L4526-4557) + `Sr` (L4584-4684).
+    //
+    // 旧实现与原实现的三处偏离，均已改正：
+    //   1. marker 可用条件只有 `n >= max(150, 0.5 * markerRefN)`；没有 [0.35, 2.5] 区间，
+    //      也没有 allow_goal_only 时把 E 放宽到 0.2 的特例；
+    //   2. 三个 marker 都可用且残差 > 15 时，剔除残差最大的一个再重拟合；
+    //   3. 接受条件是 `|scale - 1| <= 0.025` 且 `|平移| <= 45px`
+    //      （不是 scale in [0.85,1.15] + |angle| <= 8 度 + 残差 <= 10）；
+    //      两个镜头都评估，取 |scale - 1| 最小的那个。
+    struct MarkerSlot
+    {
+        std::string_view id;
+        std::array<double, 2> ref = { 0.0, 0.0 };
+        int ref_n = 1;
+        int top = 110;
+        bool blue = false;
+    };
 
-        auto check_marker = [&](const std::array<int, 4>& roi,
-                                std::string_view kind,
-                                const std::array<double, 2>& ref_pt,
-                                int ref_n,
-                                bool is_E) {
-            auto det = detect_marker_centroid(img, roi, kind);
-            if (!det) {
-                return;
-            }
-            auto [cx, cy, n] = *det;
-            const double min_ratio = (is_E && allow_goal_only) ? 0.2 : 0.35;
-            const double ratio = static_cast<double>(n) / static_cast<double>(std::max(1, ref_n));
-            if (ratio >= min_ratio && ratio <= 2.5) {
-                src_pts.emplace_back(ref_pt[0], ref_pt[1]);
-                dst_pts.emplace_back(cx, cy);
-            }
+    auto eval_calib = [&](const CameraCalibData& calib) -> CameraDetectResult {
+        CameraDetectResult out;
+        out.camera = calib.camera;
+        const MarkerSlot slots[3] = {
+            { "E", calib.marker_E, calib.ref_n_E, 60, true },
+            { "S1", calib.marker_S1, calib.ref_n_S1, 110, false },
+            { "S2", calib.marker_S2, calib.ref_n_S2, 110, false }
         };
 
-        check_marker(roi_E, "blue", calib.marker_E, calib.ref_n_E, true);
-        check_marker(roi_S1, "red", calib.marker_S1, calib.ref_n_S1, false);
-        check_marker(roi_S2, "red", calib.marker_S2, calib.ref_n_S2, false);
+        std::vector<std::pair<double, double>> src_pts;
+        std::vector<std::pair<double, double>> dst_pts;
+        std::string detail = calib.camera + "[";
 
-        if (src_pts.size() >= 2) {
-            SimilarityFit fit = fit_similarity(src_pts, dst_pts);
-            if (fit.valid && fit.scale >= 0.85 && fit.scale <= 1.15
-                && std::abs(fit.angle_deg) <= 8.0 && fit.err <= 10.0) {
-                out.camera = calib.camera;
-                out.fit = fit;
-                out.H = adjust_homography(calib.base_H, fit);
-                return out;
+        for (const auto& slot : slots) {
+            auto det = detect_marker_centroid(img, slot.ref, slot.top, slot.blue ? "blue" : "red");
+            const int n = det ? std::get<2>(*det) : 0;
+            const double need = std::max(150.0, 0.5 * static_cast<double>(slot.ref_n));
+            const bool usable = det.has_value() && static_cast<double>(n) >= need;
+            detail += std::string(slot.id) + "=";
+            if (det) {
+                detail += "(" + std::to_string(static_cast<int>(std::lround(std::get<0>(*det)))) + ","
+                        + std::to_string(static_cast<int>(std::lround(std::get<1>(*det)))) + ")n"
+                        + std::to_string(n) + "/" + std::to_string(static_cast<int>(std::lround(need)));
+            }
+            else {
+                detail += "n0/" + std::to_string(static_cast<int>(std::lround(need)));
+            }
+            detail += usable ? " OK " : " XX ";
+            if (usable) {
+                src_pts.emplace_back(slot.ref[0], slot.ref[1]);
+                dst_pts.emplace_back(std::get<0>(*det), std::get<1>(*det));
             }
         }
-        else if (allow_goal_only && src_pts.size() == 1
-                 && std::abs(src_pts[0].first - calib.marker_E[0]) < 1.0) {
-            SimilarityFit fit;
-            fit.valid = true;
-            fit.matched_markers = 1;
-            fit.scale = 1.0;
-            fit.cos_a = 1.0;
-            fit.sin_a = 0.0;
-            fit.tx = dst_pts[0].first - calib.marker_E[0];
-            fit.ty = dst_pts[0].second - calib.marker_E[1];
-            fit.err = std::hypot(fit.tx, fit.ty);
-            if (fit.err <= 45.0) {
-                out.camera = calib.camera;
-                out.fit = fit;
-                out.H = adjust_homography(calib.base_H, fit);
-                return out;
-            }
+
+        if (src_pts.size() < 2) {
+            out.detail = detail + "] 可用标记不足(" + std::to_string(src_pts.size()) + ")";
+            return out;
         }
+
+        SimilarityFit fit = fit_similarity(src_pts, dst_pts);
+        if (src_pts.size() >= 3 && fit.err > 15.0) {
+            size_t worst = 0;
+            double worst_err = -1.0;
+            for (size_t i = 0; i < src_pts.size(); ++i) {
+                const double px = fit.scale * (fit.cos_a * src_pts[i].first - fit.sin_a * src_pts[i].second) + fit.tx;
+                const double py = fit.scale * (fit.sin_a * src_pts[i].first + fit.cos_a * src_pts[i].second) + fit.ty;
+                const double err_i = std::hypot(px - dst_pts[i].first, py - dst_pts[i].second);
+                if (err_i > worst_err) {
+                    worst_err = err_i;
+                    worst = i;
+                }
+            }
+            const auto at = static_cast<std::ptrdiff_t>(worst);
+            src_pts.erase(src_pts.begin() + at);
+            dst_pts.erase(dst_pts.begin() + at);
+            fit = fit_similarity(src_pts, dst_pts);
+            detail += "剔除残差点 ";
+        }
+
+        if (!fit.valid) {
+            out.detail = detail + "] 拟合失败";
+            return out;
+        }
+
+        out.fit = fit;
+        out.H = adjust_homography(calib.base_H, fit);
+        out.detail = detail + "] 用" + std::to_string(fit.matched_markers) + "点 scale="
+            + std::to_string(fit.scale) + " 平移="
+            + std::to_string(static_cast<int>(std::lround(std::hypot(fit.tx, fit.ty)))) + " 残差="
+            + std::to_string(static_cast<int>(std::lround(fit.err)));
         return out;
     };
 
-    CameraDetectResult exp_res = eval_calib(
-        m_calib_expanded,
-        { 450, 415, 740, 610 },
-        { 1260, 120, 1520, 320 },
-        { 1410, 310, 1690, 520 });
+    CameraDetectResult exp_res = eval_calib(m_calib_expanded);
+    CameraDetectResult col_res = eval_calib(m_calib_collapsed);
 
-    CameraDetectResult col_res = eval_calib(
-        m_calib_collapsed,
-        { 410, 520, 690, 770 },
-        { 1250, 230, 1500, 460 },
-        { 1400, 430, 1680, 690 });
-
-    if (!exp_res.camera.empty() && !col_res.camera.empty()) {
-        if (exp_res.fit.matched_markers != col_res.fit.matched_markers) {
-            return (exp_res.fit.matched_markers > col_res.fit.matched_markers) ? exp_res : col_res;
+    const CameraDetectResult* best = nullptr;
+    for (const auto* cand : { &exp_res, &col_res }) {
+        if (!cand->fit.valid) {
+            continue;
         }
-        return (exp_res.fit.err <= col_res.fit.err) ? exp_res : col_res;
+        if (best == nullptr || std::abs(cand->fit.scale - 1.0) < std::abs(best->fit.scale - 1.0)) {
+            best = cand;
+        }
     }
-    return !exp_res.camera.empty() ? exp_res : col_res;
+
+    CameraDetectResult out;
+    const std::string all = exp_res.detail + " || " + col_res.detail;
+
+    // `Sr` 的 goal-only 兜底分支（service.pretty.mjs L4591-4664）：
+    // 主路径失败时，用蓝色出生点的连通域像素块重做一次相似变换。
+    if (allow_goal_only) {
+        const bool need_fallback = (best == nullptr)
+            || std::abs(best->fit.scale - 1.0) > 0.025
+            || std::hypot(best->fit.tx, best->fit.ty) > 45.0;
+        if (need_fallback) {
+            if (auto fb = detect_goal_only_fallback(img); fb.has_value()) {
+                fb->detail = all + " -> goal-only " + fb->camera;
+                return *fb;
+            }
+        }
+    }
+
+    if (best == nullptr) {
+        out.detail = all + " -> 找不到蓝点/红门标记";
+        return out;
+    }
+
+    const double dev = std::abs(best->fit.scale - 1.0);
+    const double shift = std::hypot(best->fit.tx, best->fit.ty);
+    if (dev > 0.025 || shift > 45.0) {
+        out.detail = all + " -> 与所有已标定镜头都不符";
+        return out;
+    }
+
+    out.camera = best->camera;
+    out.H = best->H;
+    out.fit = best->fit;
+    out.detail = all + " -> " + best->camera;
+    if (allow_goal_only) {
+        out.detail += " (goal-only)";
+    }
+    return out;
+}
+
+std::optional<SPAFarmTaskPlugin::CameraDetectResult> SPAFarmTaskPlugin::detect_goal_only_fallback(
+    const cv::Mat& img) const
+{
+    // 1:1 port of the `allowGoalOnly` branch inside `Sr` (service.pretty.mjs L4591-4664).
+    //
+    // 只在「Boss 回合 / 最后一回合」且本局地图不是默认图时启用：此时画面可能只剩出生点
+    // 附近的棋盘，红门不在视野内。做法是在固定 ROI 里取蓝色像素，按 5x5 邻域做连通域标记，
+    // 丢掉碎块，用保留像素的 1% / 99% 分位点围成的矩形与标定 box 拟合相似变换。
+    struct GoalOnlySpec
+    {
+        std::string_view camera;
+        std::array<int, 4> roi;
+        std::array<double, 4> box;
+    };
+    static constexpr GoalOnlySpec kSpecs[2] = {
+        { "expanded",
+          std::array<int, 4> { 450, 415, 740, 610 },
+          std::array<double, 4> { 493.8044, 430.6554, 621.3322, 560.1759 } },
+        { "collapsed",
+          std::array<int, 4> { 410, 520, 690, 770 },
+          std::array<double, 4> { 459.5028, 544.5004, 615.0266, 700.0242 } }
+    };
+
+    if (img.empty()) {
+        return std::nullopt;
+    }
+
+    for (const auto& spec : kSpecs) {
+        const int roi_x0 = spec.roi[0];
+        const int roi_y0 = spec.roi[1];
+        const int roi_w = spec.roi[2] - spec.roi[0];
+        const int roi_h = spec.roi[3] - spec.roi[1];
+        if (roi_w <= 0 || roi_h <= 0
+            || spec.roi[3] > img.rows || spec.roi[2] > img.cols) {
+            continue;
+        }
+
+        const size_t total = static_cast<size_t>(roi_w) * static_cast<size_t>(roi_h);
+        std::vector<unsigned char> mask(total, 0);
+        int blue_count = 0;
+        for (int row = 0; row < roi_h; ++row) {
+            const auto* src = img.ptr<cv::Vec3b>(roi_y0 + row);
+            for (int col = 0; col < roi_w; ++col) {
+                const int B = src[roi_x0 + col][0];
+                const int G = src[roi_x0 + col][1];
+                const int R = src[roi_x0 + col][2];
+                if (B > 220 && G > 140 && R < 150 && (B - R) > 90) {
+                    mask[static_cast<size_t>(row) * static_cast<size_t>(roi_w) + static_cast<size_t>(col)] = 1;
+                    ++blue_count;
+                }
+            }
+        }
+        if (blue_count == 0) {
+            continue;
+        }
+
+        std::vector<int> labels(total, 0);
+        std::vector<unsigned char> keep; // 按 label 索引，0 = 背景
+        keep.push_back(0);
+        int next_label = 0;
+        std::vector<int> stack;
+        for (size_t seed = 0; seed < total; ++seed) {
+            if (mask[seed] == 0 || labels[seed] != 0) {
+                continue;
+            }
+            ++next_label;
+            keep.push_back(0);
+            labels[seed] = next_label;
+            stack.clear();
+            stack.push_back(static_cast<int>(seed));
+            int min_c = roi_w;
+            int max_c = 0;
+            int min_r = roi_h;
+            int max_r = 0;
+            while (!stack.empty()) {
+                const int cur = stack.back();
+                stack.pop_back();
+                const int col = cur % roi_w;
+                const int row = (cur - col) / roi_w;
+                min_c = std::min(min_c, col);
+                max_c = std::max(max_c, col);
+                min_r = std::min(min_r, row);
+                max_r = std::max(max_r, row);
+                for (int dr = -2; dr <= 2; ++dr) {
+                    for (int dc = -2; dc <= 2; ++dc) {
+                        const int nc = col + dc;
+                        const int nr = row + dr;
+                        if (nc < 0 || nr < 0 || nc >= roi_w || nr >= roi_h) {
+                            continue;
+                        }
+                        const int ni = nr * roi_w + nc;
+                        if (mask[ni] != 0 && labels[ni] == 0) {
+                            labels[ni] = next_label;
+                            stack.push_back(ni);
+                        }
+                    }
+                }
+            }
+            keep[static_cast<size_t>(next_label)] =
+                (max_c - min_c > 48 || max_r - min_r > 48) ? 1 : 0;
+        }
+
+        std::vector<int> xs;
+        std::vector<int> ys;
+        for (int row = 0; row < roi_h; ++row) {
+            for (int col = 0; col < roi_w; ++col) {
+                const size_t idx = static_cast<size_t>(row) * static_cast<size_t>(roi_w)
+                    + static_cast<size_t>(col);
+                const int lb = labels[idx];
+                if (lb > 0 && keep[static_cast<size_t>(lb)] != 0) {
+                    xs.push_back(col + roi_x0);
+                    ys.push_back(row + roi_y0);
+                }
+            }
+        }
+        if (xs.size() < 1000 || xs.size() > 7000) {
+            continue;
+        }
+        std::sort(xs.begin(), xs.end());
+        std::sort(ys.begin(), ys.end());
+
+        const size_t lo_x = static_cast<size_t>(static_cast<double>(xs.size()) * 0.01);
+        const size_t hi_x = static_cast<size_t>(static_cast<double>(xs.size()) * 0.99);
+        const size_t lo_y = static_cast<size_t>(static_cast<double>(ys.size()) * 0.01);
+        const size_t hi_y = static_cast<size_t>(static_cast<double>(ys.size()) * 0.99);
+        const std::array<double, 4> box_pts = {
+            static_cast<double>(xs[lo_x]),
+            static_cast<double>(ys[lo_y]),
+            static_cast<double>(xs[hi_x]),
+            static_cast<double>(ys[hi_y])
+        };
+
+        const double sx = (box_pts[2] - box_pts[0]) / (spec.box[2] - spec.box[0]);
+        const double sy = (box_pts[3] - box_pts[1]) / (spec.box[3] - spec.box[1]);
+        if (std::abs(sx - 1.0) > 0.04 || std::abs(sy - 1.0) > 0.04 || std::abs(sx - sy) > 0.04) {
+            continue;
+        }
+
+        const std::vector<std::pair<double, double>> src_pts = {
+            { spec.box[0], spec.box[1] },
+            { spec.box[2], spec.box[3] }
+        };
+        const std::vector<std::pair<double, double>> dst_pts = {
+            { box_pts[0], box_pts[1] },
+            { box_pts[2], box_pts[3] }
+        };
+        const SimilarityFit fit = fit_similarity(src_pts, dst_pts);
+        if (!fit.valid) {
+            continue;
+        }
+        if (std::abs(fit.scale - 1.0) <= 0.025 && std::abs(fit.tx) <= 85.0
+            && std::abs(fit.ty) <= 45.0 && fit.err <= 4.0) {
+            const CameraCalibData& base =
+                (spec.camera == "collapsed") ? m_calib_collapsed : m_calib_expanded;
+            CameraDetectResult out;
+            out.camera = std::string(spec.camera);
+            out.fit = fit;
+            out.fit.matched_markers = 0;
+            out.H = adjust_homography(base.base_H, fit);
+            return out;
+        }
+    }
+    return std::nullopt;
+}
+
+bool SPAFarmTaskPlugin::goal_only_allowed() const
+{
+    // `(!!info.boss || round === lastRound) && !!stageSource && stageSource !== "default"`
+    // `turns` 表共 9 回合，第 9 回合为 Boss 回合（resource/SPAFarm/farm-rules.json）。
+    constexpr int kLastRound = 9;
+    const bool boss_round = !m_current_boss.empty() || m_current_round >= kLastRound;
+    return boss_round && !m_stage_source.empty() && m_stage_source != "default";
 }
 
 std::array<double, 9> SPAFarmTaskPlugin::active_board_homography(const CameraDetectResult& cam) const
@@ -1865,8 +2126,7 @@ std::optional<SPAFarmTaskPlugin::StableBoardState> SPAFarmTaskPlugin::wait_stabl
         }
         cv::Mat Me = shot();
         if (!Me.empty() && !is_detail_panel_open(Me)) {
-            const bool allow_goal_only = (!m_current_boss.empty() || m_current_round >= 9)
-                && (m_stage_source != "default");
+            const bool allow_goal_only = goal_only_allowed();
             CameraDetectResult we = detect_camera(Me, allow_goal_only);
             if (!we.camera.empty()) {
                 auto [x1, y1] = project_point(we.H, 2.5, 1.5);
@@ -5847,7 +6107,7 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
         if (auto exp_btn = find_ocr(full_ocr, { "展开" })) {
             tap(exp_btn->cx, exp_btn->cy, 450);
             cur_img = shot();
-            cur_cam = detect_camera(cur_img, true);
+            cur_cam = detect_camera(cur_img, goal_only_allowed());
         }
     }
 
@@ -5924,7 +6184,8 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
 
     // Collapse shop if needed to get clear view of board/bench for unit inspection & placement
     cur_img = shot();
-    cur_cam = detect_camera(cur_img, true);
+    cur_cam = detect_camera(cur_img, goal_only_allowed());
+    log_info(std::string(cur_cam.camera.empty() ? "校准失败（跳过部署/装备/召唤）: " : "校准: ") + cur_cam.detail);
     if (!cur_cam.camera.empty()) {
         refresh_board_snapshot(cur_img, cur_cam, false);
         inspect_unknown_units(cur_cam, true);
@@ -5943,6 +6204,22 @@ void SPAFarmTaskPlugin::run_prep_phase(const cv::Mat& img, const CameraDetectRes
         run_auto_place(cur_cam, false);
         try_use_mob_skill(cur_cam, m_current_gold);
         deploy_summons(cur_cam);
+    }
+
+    // 收尾前重读一次商店头：升级/购买后等级与资金已经变了，
+    // 沿用循环里最后一次成功的旧值会让「整备完成」日志整体滞后一档。
+    {
+        cv::Mat tail_img = shot();
+        if (!tail_img.empty()) {
+            auto tail_items = ocr(tail_img);
+            ShopHeaderState tail_hdr = read_shop_header(tail_img, tail_items);
+            if (tail_hdr.level.has_value()) {
+                m_current_shop_level = *tail_hdr.level;
+            }
+            if (tail_hdr.gold.has_value()) {
+                m_current_gold = *tail_hdr.gold;
+            }
+        }
     }
 
     // Click Ready (`准备就绪` `[1780, 170]`)
@@ -6057,7 +6334,7 @@ SPAFarmTaskPlugin::ScreenState SPAFarmTaskPlugin::classify_screen(
         return ScreenState::Shop;
     }
 
-    auto cam = detect_camera(img, true);
+    auto cam = detect_camera(img, goal_only_allowed());
     if (!cam.camera.empty()) {
         auto [rnd, is_prep] = read_round_and_prep(img, items);
         (void)rnd;
@@ -6740,7 +7017,7 @@ bool SPAFarmTaskPlugin::_run()
             else if (m_current_round <= 0) {
                 m_current_round = 1;
             }
-            auto cam = detect_camera(img, true);
+            auto cam = detect_camera(img, goal_only_allowed());
             if (cam.camera.empty()) {
                 cam.camera = "expanded";
                 cam.H = m_calib_expanded.base_H;
@@ -6756,7 +7033,7 @@ bool SPAFarmTaskPlugin::_run()
                 last_progress_time = now_sec();
             }
             if (is_prep) {
-                auto cam = detect_camera(img, true);
+                auto cam = detect_camera(img, goal_only_allowed());
                 if (!cam.camera.empty()) {
                     run_prep_phase(img, cam);
                     last_progress_time = now_sec();

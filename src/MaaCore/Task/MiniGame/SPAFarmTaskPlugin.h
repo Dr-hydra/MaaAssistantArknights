@@ -242,6 +242,7 @@ public:
         std::string camera; // "expanded", "collapsed", or ""
         std::array<double, 9> H = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
         SimilarityFit fit;
+        std::string detail; // 诊断信息：每个 marker 的像素数与拟合参数
     };
 
     struct StableBoardState
@@ -514,12 +515,15 @@ private:
     static std::array<double, 9> adjust_homography(const std::array<double, 9>& H, const SimilarityFit& fit);
     static std::optional<std::tuple<double, double, int>> detect_marker_centroid(
         const cv::Mat& img,
-        const std::array<int, 4>& roi_xyxy,
+        const std::array<double, 2>& ref_pt,
+        int top_offset,
         std::string_view color_kind);
     static SimilarityFit fit_similarity(
         const std::vector<std::pair<double, double>>& src_pts,
         const std::vector<std::pair<double, double>>& dst_pts);
     CameraDetectResult detect_camera(const cv::Mat& img, bool allow_goal_only = false) const;
+    std::optional<CameraDetectResult> detect_goal_only_fallback(const cv::Mat& img) const;
+    bool goal_only_allowed() const;
     std::array<double, 9> active_board_homography(const CameraDetectResult& cam) const;
     std::optional<StableBoardState> wait_stable_board(
         int timeout_ms = 5000,
